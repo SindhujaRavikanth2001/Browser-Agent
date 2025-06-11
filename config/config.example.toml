@@ -1,0 +1,22 @@
+# Global LLM configuration
+[llm]
+model = "Qwen/Qwen2.5-72B-Instruct"
+base_url = ""
+api_key = ""
+api_type = "huggingface"
+max_tokens = 4096
+temperature = 0.0
+
+# Optional configuration for vision model
+[llm.vision]
+model = "Salesforce/blip2-flan-t5-xl"
+base_url = ""
+api_key = ""
+api_type = "huggingface"
+
+# Browser configuration
+[browser]
+headless = true
+disable_security = true
+extra_chromium_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-web-security"]
+max_content_length = 10000

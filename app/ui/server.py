@@ -5,6 +5,9 @@ from asyncio import TimeoutError as AsyncTimeoutError
 import json
 from typing import Dict, List, Optional
 from contextvars import ContextVar
+import requests
+from bs4 import BeautifulSoup
+import re
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -32,52 +35,76 @@ from app.exceptions import TokenLimitExceeded
 g = ContextVar('g', default=None)
 
 
-class UserMessage(BaseModel):
-    content: str
-
-
-# Global helper functions (moved outside the class)
-async def process_message_with_better_timeout(agent, message: str, max_timeout: int = 300):
-    """Process message with better timeout handling and response saving"""
+def scrape_page_content(url: str) -> str:
+    """
+    Scrape complete page content using BeautifulSoup.
+    Returns clean text content of the entire page.
+    """
     try:
-        # Increase timeout to 5 minutes for HuggingFace models
-        response = await asyncio.wait_for(
-            agent.run(message, max_steps=8),  # Reduced max_steps for faster completion
-            timeout=max_timeout
-        )
+        print(f"🔍 Scraping page content from: {url}")
         
-        # Ensure response is saved
-        if response:
-            save_response_to_file(message, response)
-            
-        return response
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
         
-    except AsyncTimeoutError:
-        print(f"Agent execution timed out after {max_timeout} seconds")
-        # Try to get partial results
-        if hasattr(agent, 'memory') and agent.memory.messages:
-            partial_response = "PARTIAL RESPONSE (Timed out):\n"
-            for msg in agent.memory.messages[-5:]:  # Last 5 messages
-                if hasattr(msg, 'content') and msg.content:
-                    partial_response += f"{msg.role}: {str(msg.content)[:200]}...\n"
-            
-            # Save partial response
-            save_response_to_file(message, partial_response, is_partial=True)
-            return partial_response
-        else:
-            error_msg = "Agent timed out and no partial response available"
-            save_response_to_file(message, error_msg, is_error=True)
-            return error_msg
-    
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Remove script and style elements
+        for script in soup(["script", "style", "nav", "header", "footer"]):
+            script.decompose()
+        
+        # Get text content
+        text = soup.get_text()
+        
+        # Clean up text
+        lines = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        text = ' '.join(chunk for chunk in chunks if chunk)
+        
+        # Remove extra whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        print(f"✅ Successfully scraped {len(text)} characters from page")
+        print(f"📄 COMPLETE PAGE CONTENT:\n{'-'*80}\n{text}\n{'-'*80}")
+        
+        return text
+        
     except Exception as e:
-        error_msg = f"Error during agent execution: {e}"
-        print(error_msg)
-        save_response_to_file(message, error_msg, is_error=True)
-        return error_msg
+        print(f"❌ Error scraping page: {e}")
+        return f"Error scraping page: {e}"
 
 
-def save_response_to_file(query: str, response: str, is_partial: bool = False, is_error: bool = False):
-    """Save agent response to file"""
+def chunk_content(content: str, chunk_size: int = 4000) -> List[str]:
+    """
+    Split content into chunks for processing.
+    """
+    chunks = []
+    words = content.split()
+    
+    current_chunk = []
+    current_length = 0
+    
+    for word in words:
+        if current_length + len(word) + 1 > chunk_size and current_chunk:
+            chunks.append(' '.join(current_chunk))
+            current_chunk = [word]
+            current_length = len(word)
+        else:
+            current_chunk.append(word)
+            current_length += len(word) + 1
+    
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+    
+    return chunks
+
+
+# Enhanced response saving with better formatting
+def save_comprehensive_response(query: str, agent_response: str, agent_messages: List = None, is_partial: bool = False, is_error: bool = False):
+    """Save comprehensive agent response with full conversation history and extracted content."""
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
@@ -97,12 +124,157 @@ def save_response_to_file(query: str, response: str, is_partial: bool = False, i
             f.write(f"Timestamp: {timestamp}\n")
             f.write(f"Status: {'ERROR' if is_error else 'PARTIAL' if is_partial else 'COMPLETE'}\n")
             f.write("="*80 + "\n\n")
-            f.write(response)
+            
+            # Write the main response
+            f.write("AGENT RESPONSE:\n")
+            f.write(agent_response)
+            f.write("\n\n")
+            
+            # If we have agent messages, extract and format them nicely
+            if agent_messages:
+                f.write("="*80 + "\n")
+                f.write("DETAILED CONVERSATION HISTORY:\n")
+                f.write("="*80 + "\n\n")
+                
+                extracted_content_sections = []
+                user_goal_responses = []
+                
+                for i, msg in enumerate(agent_messages):
+                    if hasattr(msg, 'role') and hasattr(msg, 'content') and msg.content:
+                        f.write(f"{msg.role.upper()}: {msg.content}\n\n")
+                        
+                        # Look for extracted content
+                        if "extracted from page" in msg.content.lower() or "extraction" in msg.content.lower():
+                            extracted_content_sections.append(msg.content)
+                        
+                        # Look for responses to user goals (survey questions, etc.)
+                        if any(keyword in msg.content.lower() for keyword in [
+                            "survey questions", "questions:", "questionnaire", "1.", "2.", "3."
+                        ]) and len(msg.content) > 200:
+                            user_goal_responses.append(msg.content)
+                
+                # Add special sections for extracted content and goal responses
+                if extracted_content_sections:
+                    f.write("="*80 + "\n")
+                    f.write("EXTRACTED CONTENT SECTIONS:\n")
+                    f.write("="*80 + "\n\n")
+                    for section in extracted_content_sections:
+                        f.write(section)
+                        f.write("\n" + "-"*40 + "\n")
+                
+                if user_goal_responses:
+                    f.write("="*80 + "\n")
+                    f.write("RESPONSES TO USER GOALS:\n")
+                    f.write("="*80 + "\n\n")
+                    for response in user_goal_responses:
+                        f.write(response)
+                        f.write("\n" + "-"*40 + "\n")
         
-        print(f"Response saved to {filename}")
+        print(f"Comprehensive response saved to {filename}")
         
     except Exception as e:
-        print(f"Error saving response: {e}")
+        print(f"Error saving comprehensive response: {e}")
+
+
+class UserMessage(BaseModel):
+    content: str
+
+
+# Enhanced timeout handling with direct scraping and chunked processing
+async def process_message_with_direct_scraping(agent, message: str, max_timeout: int = 720):
+    """Process message with direct scraping and chunked LLM processing."""
+    try:
+        # Check if message contains a URL
+        url_pattern = r'https?://[^\s]+'
+        urls = re.findall(url_pattern, message)
+        
+        if urls:
+            url = urls[0]  # Use first URL found
+            print(f"🔗 URL detected: {url}")
+            
+            # Scrape complete content directly
+            scraped_content = scrape_page_content(url)
+            
+            if scraped_content and not scraped_content.startswith("Error"):
+                # Chunk the content
+                chunks = chunk_content(scraped_content, chunk_size=4000)
+                print(f"📦 Content split into {len(chunks)} chunks")
+                
+                # Process with LLM using chunked content
+                enhanced_message = f"""
+{message}
+
+I have scraped the complete content from the webpage. Here is the full content divided into chunks:
+
+COMPLETE SCRAPED CONTENT ({len(chunks)} chunks):
+
+"""
+                for i, chunk in enumerate(chunks, 1):
+                    enhanced_message += f"\n--- CHUNK {i}/{len(chunks)} ---\n{chunk}\n"
+                
+                enhanced_message += f"""
+
+Please process this complete content to address the user's request. All the content from the webpage is provided above - no need to browse or scroll.
+"""
+                
+                response = await asyncio.wait_for(
+                    agent.run(enhanced_message, max_steps=12),
+                    timeout=max_timeout
+                )
+            else:
+                # Fall back to original message if scraping failed
+                response = await asyncio.wait_for(
+                    agent.run(message, max_steps=12),
+                    timeout=max_timeout
+                )
+        else:
+            # No URL detected, process normally
+            response = await asyncio.wait_for(
+                agent.run(message, max_steps=12),
+                timeout=max_timeout
+            )
+        
+        # Save comprehensive response
+        if response:
+            agent_messages = getattr(agent, 'messages', []) or []
+            save_comprehensive_response(message, response, agent_messages)
+            
+        return response
+        
+    except AsyncTimeoutError:
+        print(f"Agent execution timed out after {max_timeout} seconds")
+        if hasattr(agent, 'memory') and agent.memory.messages:
+            partial_sections = []
+            
+            for msg in agent.memory.messages:
+                if hasattr(msg, 'content') and msg.content:
+                    content = str(msg.content)
+                    
+                    if "extracted from page" in content.lower():
+                        partial_sections.append(f"EXTRACTED CONTENT:\n{content}\n")
+                    elif any(keyword in content.lower() for keyword in [
+                        "survey questions", "questions:", "questionnaire"
+                    ]) and len(content) > 100:
+                        partial_sections.append(f"GOAL RESPONSE:\n{content}\n")
+                    elif "tool" in content.lower() and len(content) > 50:
+                        partial_sections.append(f"TOOL RESULT:\n{content[:500]}...\n")
+            
+            partial_response = "PARTIAL RESPONSE (Timed out):\n\n"
+            partial_response += "\n".join(partial_sections[-10:])
+            
+            save_comprehensive_response(message, partial_response, agent.memory.messages, is_partial=True)
+            return partial_response
+        else:
+            error_msg = "Agent timed out and no partial response available"
+            save_comprehensive_response(message, error_msg, is_error=True)
+            return error_msg
+    
+    except Exception as e:
+        error_msg = f"Error during agent execution: {e}"
+        print(error_msg)
+        agent_messages = getattr(agent, 'messages', []) if hasattr(agent, 'messages') else []
+        save_comprehensive_response(message, error_msg, agent_messages, is_error=True)
+        return error_msg
 
 
 class OpenManusUI:
@@ -133,8 +305,8 @@ class OpenManusUI:
                 
                 # Explicitly create the LLM instance here and pass it to Manus and other tools
                 llm_instance = LLM(
-                    model_name="Qwen/Qwen2.5-72B-Instruct", # Or use config.llm.get("huggingface_llm_config_name").model if applicable
-                    api_type="huggingface" # Ensure this matches your config for HuggingFaceClient
+                    model_name="Qwen/Qwen2.5-72B-Instruct",
+                    api_type="huggingface"
                 )
 
                 # Instantiate individual tools with the config
@@ -160,7 +332,6 @@ class OpenManusUI:
                 logger.info("Manus agent initialized successfully on startup.")
             except Exception as e:
                 logger.error(f"Error initializing Manus agent on startup: {str(e)}")
-                # Re-raise the exception to prevent the server from starting with a broken agent
                 raise
 
         # Set up routes
@@ -215,7 +386,7 @@ class OpenManusUI:
 
         @self.app.post("/api/message")
         async def handle_message(request: UserMessage):
-            """Handle POST message requests."""
+            """Handle POST message requests with enhanced response formatting."""
             try:
                 if not self.agent:
                     return JSONResponse(
@@ -223,22 +394,23 @@ class OpenManusUI:
                         content={"response": "Agent not initialized", "status": "error"}
                     )
 
-                # Use the improved timeout handler with the class instance agent
-                response = await process_message_with_better_timeout(
-                    self.agent,  # Use self.agent instead of undefined 'agent'
-                    request.content,  # Use request.content instead of request.message
-                    max_timeout=300  # 5 minutes
+                # Use direct scraping approach
+                response = await process_message_with_direct_scraping(
+                    self.agent,
+                    request.content,
+                    max_timeout=720  # 12 minutes
                 )
                 
                 return JSONResponse({
                     "response": response, 
-                    "status": "success"
+                    "status": "success",
+                    "message": "Response has been saved to the responses/ directory with full conversation history."
                 })
                 
             except Exception as e:
                 logger.error(f"Error in handle_message: {str(e)}", exc_info=True)
                 error_response = f"Server error: {str(e)}"
-                save_response_to_file(request.content, error_response, is_error=True)
+                save_comprehensive_response(request.content, error_response, is_error=True)
                 return JSONResponse(
                     status_code=500,
                     content={"response": error_response, "status": "error"}
@@ -265,11 +437,11 @@ class OpenManusUI:
                 "details": f"Starting to process: {user_message}"
             })
 
-            # Use the improved timeout handler
-            response = await process_message_with_better_timeout(
+            # Use direct scraping approach
+            response = await process_message_with_direct_scraping(
                 self.agent,
                 user_message,
-                max_timeout=300
+                max_timeout=720  # 12 minutes
             )
 
             # Broadcast the final response

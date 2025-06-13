@@ -154,18 +154,32 @@ class HuggingFaceClient:
         """Get the local path of the model."""
         # Use the ephemeral directory for model storage
         cache_dir = "/ephemeral/.cache/huggingface"
-        model_path = os.path.join(
+        model_dir = os.path.join(
             cache_dir,
-            "hub",
-            f"models--{self.model_name.replace('/', '--')}",
-            "snapshots",
-            "495f39366efef23836d0cfae4fbe635880d2be31"  # Specific commit hash
+            f"models--{self.model_name.replace('/', '--')}"
         )
         
-        if not os.path.exists(model_path):
-            raise ValueError(f"Model path does not exist: {model_path}")
+        if not os.path.exists(model_dir):
+            raise ValueError(f"Model directory does not exist: {model_dir}")
             
-        return model_path
+        # Look for model files in the snapshots directory
+        snapshots_dir = os.path.join(model_dir, "snapshots")
+        if not os.path.exists(snapshots_dir):
+            raise ValueError(f"Snapshots directory does not exist: {snapshots_dir}")
+            
+        # Get the first snapshot directory (there should only be one)
+        snapshot_dirs = [d for d in os.listdir(snapshots_dir) if os.path.isdir(os.path.join(snapshots_dir, d))]
+        if not snapshot_dirs:
+            raise ValueError(f"No snapshot directories found in {snapshots_dir}")
+            
+        snapshot_path = os.path.join(snapshots_dir, snapshot_dirs[0])
+        
+        # Verify there are model files in the snapshot directory
+        model_files = glob.glob(os.path.join(snapshot_path, "*.safetensors"))
+        if not model_files:
+            raise ValueError(f"No model files found in {snapshot_path}")
+            
+        return snapshot_path
 
     def generate_text(self, prompt: str, max_length: int = 2048, temperature: float = 0.7) -> str:
         """Generate text from the model (synchronous version)."""

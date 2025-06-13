@@ -1,6 +1,6 @@
 import os
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor, AutoModelForVision2Seq
 from app.logger import logger
 
 def download_models():
@@ -21,33 +21,49 @@ def download_models():
         "bnb_4bit_use_double_quant": True
     }
     
-    # List of models to download
+    # List of models to download with their types
     models = [
-        "Qwen/Qwen2.5-72B-Instruct",
-        "Salesforce/blip2-flan-t5-xl"
+        {
+            "name": "Qwen/Qwen2.5-72B-Instruct",
+            "type": "causal"
+        },
+        {
+            "name": "Salesforce/blip2-flan-t5-xl",
+            "type": "vision"
+        }
     ]
     
-    for model_name in models:
+    for model_info in models:
+        model_name = model_info["name"]
+        model_type = model_info["type"]
         logger.info(f"Downloading model: {model_name}")
         try:
-            # Download and cache the model
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                cache_dir=cache_dir,
-                quantization_config=quantization_config,
-                device_map="auto",
-                trust_remote_code=True
-            )
-            
-            # Download and cache the tokenizer
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_name,
-                cache_dir=cache_dir,
-                trust_remote_code=True
-            )
-            
-            # For BLIP2 model, also download the processor
-            if "blip2" in model_name.lower():
+            if model_type == "causal":
+                # Download and cache the causal model
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    cache_dir=cache_dir,
+                    quantization_config=quantization_config,
+                    device_map="auto",
+                    trust_remote_code=True
+                )
+                
+                # Download and cache the tokenizer
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    cache_dir=cache_dir,
+                    trust_remote_code=True
+                )
+            elif model_type == "vision":
+                # Download and cache the vision model
+                model = AutoModelForVision2Seq.from_pretrained(
+                    model_name,
+                    cache_dir=cache_dir,
+                    device_map="auto",
+                    trust_remote_code=True
+                )
+                
+                # Download and cache the processor
                 processor = AutoProcessor.from_pretrained(
                     model_name,
                     cache_dir=cache_dir,

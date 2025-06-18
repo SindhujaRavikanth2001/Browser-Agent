@@ -184,9 +184,24 @@ function App() {
         .then(response => response.json())
         .then(data => {
           console.log('API response:', data);
+          if (data && data.response) {
+            setMessages(prev => [
+              ...prev,
+              {
+                role: 'assistant',
+                content: data.response,
+                timestamp: Date.now()
+              }
+            ]);
+          }
+          if (data.base64_image) {
+            setBrowserState(data.base64_image);
+          }
+          setIsLoading(false);
         })
         .catch(error => {
           console.error('Error sending message:', error);
+          setIsLoading(false);
         });
     }
 
@@ -227,7 +242,7 @@ function App() {
             alt="Fireworks"
             sx={{ width: 32, height: 32, mr: 1.5 }}
           />
-          <Typography variant="h6" fontWeight="600">Fireworks Manus</Typography>
+          <Typography variant="h6" fontWeight="600">Browser AI Agent</Typography>
           <Box sx={{
             ml: 2,
             px: 1.5,

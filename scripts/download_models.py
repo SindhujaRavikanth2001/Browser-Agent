@@ -5,26 +5,24 @@ from app.logger import logger
 
 def download_models():
     """Download and cache the required HuggingFace models."""
-    # Set environment variables for offline mode
-    os.environ["TRANSFORMERS_OFFLINE"] = "0"  # Enable downloads
+    # Enable downloads & set cache location
+    os.environ["TRANSFORMERS_OFFLINE"] = "0"
     os.environ["HF_HOME"] = "/ephemeral/.cache/huggingface"
     
-    # Create cache directory if it doesn't exist
     cache_dir = "/ephemeral/.cache/huggingface"
     os.makedirs(cache_dir, exist_ok=True)
     
-    # Configure 4-bit quantization
+    # 4-bit quantization settings
     quantization_config = {
         "load_in_4bit": True,
         "bnb_4bit_compute_dtype": torch.float16,
         "bnb_4bit_quant_type": "nf4",
-        "bnb_4bit_use_double_quant": True
+        "bnb_4bit_use_double_quant": True,
     }
     
-    # List of models to download with their types
     models = [
         {
-            "name": "Qwen/Qwen2.5-72B-Instruct",
+            "name": "Qwen/Qwen-7B-Chat",    
             "type": "causal"
         },
         {
@@ -33,48 +31,42 @@ def download_models():
         }
     ]
     
-    for model_info in models:
-        model_name = model_info["name"]
-        model_type = model_info["type"]
+    for info in models:
+        model_name = info["name"]
+        model_type = info["type"]
         logger.info(f"Downloading model: {model_name}")
         try:
             if model_type == "causal":
-                # Download and cache the causal model
-                model = AutoModelForCausalLM.from_pretrained(
+                # Download & quantize the chat model
+                AutoModelForCausalLM.from_pretrained(
                     model_name,
                     cache_dir=cache_dir,
                     quantization_config=quantization_config,
                     device_map="auto",
                     trust_remote_code=True
                 )
-                
-                # Download and cache the tokenizer
-                tokenizer = AutoTokenizer.from_pretrained(
+                AutoTokenizer.from_pretrained(
                     model_name,
                     cache_dir=cache_dir,
                     trust_remote_code=True
                 )
-            elif model_type == "vision":
-                # Download and cache the vision model
-                model = AutoModelForVision2Seq.from_pretrained(
+            else:  # vision
+                AutoModelForVision2Seq.from_pretrained(
                     model_name,
                     cache_dir=cache_dir,
                     device_map="auto",
                     trust_remote_code=True
                 )
-                
-                # Download and cache the processor
-                processor = AutoProcessor.from_pretrained(
+                AutoProcessor.from_pretrained(
                     model_name,
                     cache_dir=cache_dir,
                     trust_remote_code=True
                 )
             
             logger.info(f"Successfully downloaded and cached {model_name}")
-            
         except Exception as e:
-            logger.error(f"Error downloading {model_name}: {str(e)}")
+            logger.error(f"Error downloading {model_name}: {e}")
             raise
 
 if __name__ == "__main__":
-    download_models() 
+    download_models()

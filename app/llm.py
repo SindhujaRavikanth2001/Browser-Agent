@@ -48,7 +48,7 @@ MULTIMODAL_MODELS = [
 
 # Add HuggingFace models
 HUGGINGFACE_MODELS = [
-    "Qwen/Qwen2.5-72B-Instruct",
+    "Qwen/Qwen-7B-Chat",
     "Salesforce/blip2-flan-t5-xl"
 ]
 
@@ -409,13 +409,16 @@ class LLM:
         ),  # Don't retry TokenLimitExceeded
     )
     async def ask(
-        self,
-        messages: List[Message],
+       self,
+        messages: Union[str, List[Message]],
         system_msgs: Optional[List[Message]] = None,
         stream: bool = False,
         temperature: Optional[float] = None,
         stream_callback=None,
     ) -> str:
+       # allow callers to pass a single string
+        if isinstance(messages, str):
+            messages = [Message(role="user", content=messages)]
         try:
             if self.model in HUGGINGFACE_MODELS:
                 # Format messages for HuggingFace model

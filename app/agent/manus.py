@@ -26,10 +26,14 @@ class Manus(BrowserAgent):
 
     # Enhanced system prompt with better task completion logic
     system_prompt: str = f"""
+You are a helpful assistant.  
+- Always respond in English only (no other languages).  
+- When citing, use “Source:” not “来源:”.  
 {SYSTEM_PROMPT.format(directory=config.workspace_root)}
 
 CRITICAL TASK COMPLETION INSTRUCTIONS:
 - You must FULLY COMPLETE the user's request before terminating
+- You must give the full reponse in English. Don't include any other language.
 - For multi-part requests (like "extract content AND generate something"), complete BOTH parts
 - Only use 'terminate' after you have completely addressed all aspects of the user's request
 - If you've extracted content but haven't used it to complete the requested task, CONTINUE WORKING

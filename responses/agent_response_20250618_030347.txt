@@ -1,0 +1,16 @@
+================================================================================
+QUERY: Please scrape https://www.unicef.org/reports/state-worlds-children-2019 and then produce 8 survey questions about youth well-being and education access based on that report.
+================================================================================
+
+RESPONSE:
+1. According to the United Nations Children's Fund (UNICEF) report, what is the global average rate of out-of-school children in primary school age?
+  2. How has the number of out-of-school children in primary school age changed globally since 2015?
+  3. What percentage of girls are enrolled in secondary education globally?
+  4. In which region of the world is the highest percentage of girls enrolled in secondary education?
+  5. According to the UNICEF report, how many countries have achieved gender parity in primary education?
+  6. What percentage of children under the age of five do not have access to basic services such as water and sanitation?
+  7. In which country was the largest increase in the number of children accessing basic services such as water and sanitation observed between 2015 and 2019?
+  8. What percentage of children under the age of five live in households with inadequate food security?
+ifice
+'t
+

@@ -1,0 +1,17 @@
+================================================================================
+QUERY: Go to https://www.pewresearch.org/politics/2025/06/17/americans-have-mixed-to-negative-views-of-trump-administration-immigration-actions/ and summarize the content in 10 points.
+================================================================================
+
+RESPONSE:
+1. How do Americans feel about the Trump administration's immigration policies?
+  2. What is the public's view on the use of state and local law enforcement in deportation efforts?
+  3. What is the public's view on the suspension of most asylum applications?
+  4. What is the public's view on ending Temporary Protected Status (TPS) for immigrants?
+  5. What is the public's view on increasing Immigration and Customs Enforcement (ICE) raids on workplaces where people who are in the U.S. illegally may be working?
+  6. How does the public perceive the economic impact of the Trump administration's immigration policies?
+  7. How does the public perceive the impact of the Trump administration's immigration policies on crime rates in the U.S.?
+  8. How should the country handle undocumented immigrants who are already living in the U.S.?
+  9. What is the public's view on federal deportation efforts?
+  10. What is the public's view on expanding the wall along the U.S.-Mexico border?
+
+

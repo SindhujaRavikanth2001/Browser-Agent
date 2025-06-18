@@ -1,3 +1,9 @@
+BROWSER_NEXT_STEP_PROMPT = """
+You are a helpful assistant.  
+- Always respond in English only (no other languages).  
+-When citing, use “Source:” not “来源:”.  
+"""
+
 SYSTEM_PROMPT = """\
 You are an AI agent designed to automate browser tasks. Your goal is to accomplish the ultimate task following the rules.
 

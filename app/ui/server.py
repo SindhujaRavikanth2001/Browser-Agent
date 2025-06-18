@@ -34,6 +34,37 @@ from app.exceptions import TokenLimitExceeded
 # Define a global context variable for the Manus agent
 g = ContextVar('g', default=None)
 
+import re, requests
+
+def remove_chinese_and_punct(text):
+    """
+    Returns the part of the text before the first Chinese character.
+    If no Chinese character is found, returns the whole text.
+    """
+    match = re.search(r'[\u4e00-\u9fff]', text)
+    if match:
+        return text[:match.start()]
+    return text
+
+def annotate_invalid_links(text: str) -> str:
+    """
+    Finds all markdown links [label](url) in `text`, does a HEAD request
+    to each `url`, and if it’s 4xx/5xx (or errors), appends ⚠️ to the link.
+    """
+    def check(url):
+        try:
+            r = requests.head(url, allow_redirects=True, timeout=5)
+            return r.status_code < 400
+        except:
+            return False
+
+    def repl(m):
+        label, url = m.group(1), m.group(2)
+        ok = check(url)
+        return f"[{label}]({url})" + ("" if ok else " ⚠️(broken)")
+
+    return re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', repl, text)
+
 
 def scrape_page_content(url: str) -> str:
     """
@@ -68,7 +99,6 @@ def scrape_page_content(url: str) -> str:
         text = re.sub(r'\s+', ' ', text).strip()
         
         print(f"✅ Successfully scraped {len(text)} characters from page")
-        print(f"📄 COMPLETE PAGE CONTENT:\n{'-'*80}\n{text}\n{'-'*80}")
         
         return text
         
@@ -102,179 +132,167 @@ def chunk_content(content: str, chunk_size: int = 4000) -> List[str]:
     return chunks
 
 
-# Enhanced response saving with better formatting
 def save_comprehensive_response(query: str, agent_response: str, agent_messages: List = None, is_partial: bool = False, is_error: bool = False):
-    """Save comprehensive agent response with full conversation history and extracted content."""
+    """Save only the final response to file."""
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"responses/agent_response_{timestamp}.txt"
         
-        # Determine filename based on response type
-        if is_error:
-            filename = f"responses/agent_error_{timestamp}.txt"
-        elif is_partial:
-            filename = f"responses/agent_partial_{timestamp}.txt"
-        else:
-            filename = f"responses/agent_response_{timestamp}.txt"
-        
-        # Create directory if it doesn't exist
+        # Ensure responses directory exists
         os.makedirs("responses", exist_ok=True)
         
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(f"Query: {query}\n")
-            f.write(f"Timestamp: {timestamp}\n")
-            f.write(f"Status: {'ERROR' if is_error else 'PARTIAL' if is_partial else 'COMPLETE'}\n")
+        with open(filename, "w", encoding="utf-8") as f:
+            # Write header
+            f.write("="*80 + "\n")
+            f.write(f"QUERY: {query}\n")
             f.write("="*80 + "\n\n")
             
-            # Write the main response
-            f.write("AGENT RESPONSE:\n")
-            f.write(agent_response)
-            f.write("\n\n")
+            # Write status if partial or error
+            if is_partial:
+                f.write("⚠️ PARTIAL RESPONSE (Timed out)\n\n")
+            elif is_error:
+                f.write("❌ ERROR RESPONSE\n\n")
             
-            # If we have agent messages, extract and format them nicely
-            if agent_messages:
-                f.write("="*80 + "\n")
-                f.write("DETAILED CONVERSATION HISTORY:\n")
-                f.write("="*80 + "\n\n")
-                
-                extracted_content_sections = []
-                user_goal_responses = []
-                
-                for i, msg in enumerate(agent_messages):
-                    if hasattr(msg, 'role') and hasattr(msg, 'content') and msg.content:
-                        f.write(f"{msg.role.upper()}: {msg.content}\n\n")
-                        
-                        # Look for extracted content
-                        if "extracted from page" in msg.content.lower() or "extraction" in msg.content.lower():
-                            extracted_content_sections.append(msg.content)
-                        
-                        # Look for responses to user goals (survey questions, etc.)
-                        if any(keyword in msg.content.lower() for keyword in [
-                            "survey questions", "questions:", "questionnaire", "1.", "2.", "3."
-                        ]) and len(msg.content) > 200:
-                            user_goal_responses.append(msg.content)
-                
-                # Add special sections for extracted content and goal responses
-                if extracted_content_sections:
-                    f.write("="*80 + "\n")
-                    f.write("EXTRACTED CONTENT SECTIONS:\n")
-                    f.write("="*80 + "\n\n")
-                    for section in extracted_content_sections:
-                        f.write(section)
-                        f.write("\n" + "-"*40 + "\n")
-                
-                if user_goal_responses:
-                    f.write("="*80 + "\n")
-                    f.write("RESPONSES TO USER GOALS:\n")
-                    f.write("="*80 + "\n\n")
-                    for response in user_goal_responses:
-                        f.write(response)
-                        f.write("\n" + "-"*40 + "\n")
+            # Write only the final response
+            f.write("RESPONSE:\n")
+            f.write(str(agent_response))
+            f.write("\n\n")
         
-        print(f"Comprehensive response saved to {filename}")
+        print(f"Response saved to {filename}")
         
     except Exception as e:
-        print(f"Error saving comprehensive response: {e}")
+        print(f"Error saving response: {e}")
 
 
 class UserMessage(BaseModel):
     content: str
 
 
-# Enhanced timeout handling with direct scraping and chunked processing
-async def process_message_with_direct_scraping(agent, message: str, max_timeout: int = 720):
+async def process_message_with_direct_scraping(agent, message: str, max_timeout: int = 400):
     """Process message with direct scraping and chunked LLM processing."""
+    screenshot_base64 = None
     try:
-        # Check if message contains a URL
-        url_pattern = r'https?://[^\s]+'
-        urls = re.findall(url_pattern, message)
+        # Enhanced URL detection
+        urls = []
+        full_url_pattern = r'https?://[^\s]+'
+        full_urls = re.findall(full_url_pattern, message)
+        urls.extend(full_urls)
+        
+        if not urls:
+            words = message.split()
+            for word in words:
+                word = word.rstrip('.,!?;')
+                if ('.' in word and 
+                    not word.startswith('.') and 
+                    not word.endswith('.') and
+                    len(word.split('.')[-1]) >= 2 and
+                    not word.startswith('http') and
+                    ' ' not in word):
+                    urls.append(word)
+        
+        print(f"🔍 Found URLs: {urls}")
         
         if urls:
-            url = urls[0]  # Use first URL found
-            print(f"🔗 URL detected: {url}")
-            
-            # Scrape complete content directly
+            url = urls[0]
+            if not url.startswith(('http://', 'https://')):
+                url = 'https://' + url
+            print(f"🔗 URL detected and normalized: {url}")
             scraped_content = scrape_page_content(url)
             
             if scraped_content and not scraped_content.startswith("Error"):
-                # Chunk the content
                 chunks = chunk_content(scraped_content, chunk_size=4000)
                 print(f"📦 Content split into {len(chunks)} chunks")
-                
-                # Process with LLM using chunked content
                 enhanced_message = f"""
+Please respond in English only. Use 'Source:' instead of '来源:', if the user asks for sources/references. Format URLs as markdown links.
 {message}
 
-I have scraped the complete content from the webpage. Here is the full content divided into chunks:
+I have scraped the complete content from the webpage. Here is the full content:
 
-COMPLETE SCRAPED CONTENT ({len(chunks)} chunks):
+COMPLETE SCRAPED CONTENT:
+{scraped_content[:8000]}
 
+Based on this content, address the user's prompt in English only. Strictly do not include any other language.
 """
-                for i, chunk in enumerate(chunks, 1):
-                    enhanced_message += f"\n--- CHUNK {i}/{len(chunks)} ---\n{chunk}\n"
-                
-                enhanced_message += f"""
-
-Please process this complete content to address the user's request. All the content from the webpage is provided above - no need to browse or scroll.
-"""
-                
-                response = await asyncio.wait_for(
-                    agent.run(enhanced_message, max_steps=12),
+                raw = await asyncio.wait_for(
+                    agent.llm.ask(enhanced_message,
+                    temperature=0.7),
                     timeout=max_timeout
                 )
+                response = annotate_invalid_links(str(raw))
+                response = remove_chinese_and_punct(response)
             else:
-                # Fall back to original message if scraping failed
-                response = await asyncio.wait_for(
-                    agent.run(message, max_steps=12),
+                print(f"❌ Scraping failed: {scraped_content}")
+                raw = await asyncio.wait_for(
+                    agent.llm.ask(message,
+                    temperature=0.7),
                     timeout=max_timeout
                 )
+                response = annotate_invalid_links(str(raw))
+                response = remove_chinese_and_punct(response)
         else:
-            # No URL detected, process normally
-            response = await asyncio.wait_for(
-                agent.run(message, max_steps=12),
-                timeout=max_timeout
+            print("ℹ️ No URL detected in message, processing with direct response")
+            # Use direct response generation
+            response_data = await process_message_with_direct_scraping(
+                self.agent,
+                user_message,
+                max_timeout=60
             )
         
-        # Save comprehensive response
+        # Save response
         if response:
-            agent_messages = getattr(agent, 'messages', []) or []
-            save_comprehensive_response(message, response, agent_messages)
-            
-        return response
+            agent_messages = getattr(agent, 'memory', None)
+            if agent_messages and hasattr(agent_messages, 'messages'):
+                agent_messages = agent_messages.messages
+            else:
+                agent_messages = []
+            save_comprehensive_response(message, str(response), agent_messages)
+        
+        return {
+            "response": str(response) if response else "No response generated",
+            "base64_image": screenshot_base64
+        }
         
     except AsyncTimeoutError:
         print(f"Agent execution timed out after {max_timeout} seconds")
-        if hasattr(agent, 'memory') and agent.memory.messages:
-            partial_sections = []
-            
+        
+        # Extract the best available response from memory
+        best_response = "Request timed out while processing."
+        
+        if hasattr(agent, 'memory') and hasattr(agent.memory, 'messages'):
+            assistant_responses = []
             for msg in agent.memory.messages:
-                if hasattr(msg, 'content') and msg.content:
+                if hasattr(msg, 'role') and msg.role == 'assistant' and hasattr(msg, 'content'):
                     content = str(msg.content)
-                    
-                    if "extracted from page" in content.lower():
-                        partial_sections.append(f"EXTRACTED CONTENT:\n{content}\n")
-                    elif any(keyword in content.lower() for keyword in [
-                        "survey questions", "questions:", "questionnaire"
-                    ]) and len(content) > 100:
-                        partial_sections.append(f"GOAL RESPONSE:\n{content}\n")
-                    elif "tool" in content.lower() and len(content) > 50:
-                        partial_sections.append(f"TOOL RESULT:\n{content[:500]}...\n")
+                    if len(content) > 100:  # Only consider substantial responses
+                        assistant_responses.append(content)
             
-            partial_response = "PARTIAL RESPONSE (Timed out):\n\n"
-            partial_response += "\n".join(partial_sections[-10:])
-            
-            save_comprehensive_response(message, partial_response, agent.memory.messages, is_partial=True)
-            return partial_response
-        else:
-            error_msg = "Agent timed out and no partial response available"
-            save_comprehensive_response(message, error_msg, is_error=True)
-            return error_msg
+            if assistant_responses:
+                # Get the longest response or combine multiple if needed
+                longest_response = max(assistant_responses, key=len)
+                
+                if len(longest_response) > 300:
+                    best_response = f"Partial response (timed out):\n\n{longest_response}"
+                elif len(assistant_responses) > 1:
+                    # Combine multiple responses
+                    combined = "\n\n---\n\n".join(assistant_responses[-2:])
+                    best_response = f"Partial response (timed out):\n\n{combined}"
+                else:
+                    best_response = f"Partial response (timed out):\n\n{longest_response}"
+        
+        save_comprehensive_response(message, best_response, is_partial=True)
+        return {
+            "response": best_response,
+            "base64_image": screenshot_base64
+        }
     
     except Exception as e:
         error_msg = f"Error during agent execution: {e}"
         print(error_msg)
-        agent_messages = getattr(agent, 'messages', []) if hasattr(agent, 'messages') else []
-        save_comprehensive_response(message, error_msg, agent_messages, is_error=True)
-        return error_msg
+        save_comprehensive_response(message, error_msg, is_error=True)
+        return {
+            "response": error_msg,
+            "base64_image": screenshot_base64
+        }
 
 
 class OpenManusUI:
@@ -301,23 +319,21 @@ class OpenManusUI:
             logger.info("Application startup: Initializing Manus agent...")
             try:
                 config_instance = Config()
-                config = config_instance._config # Access the internal _config attribute which holds the AppConfig
+                config = config_instance._config
                 
-                # Explicitly create the LLM instance here and pass it to Manus and other tools
                 llm_instance = LLM(
-                    model_name="Qwen/Qwen2.5-72B-Instruct",
-                    api_type="huggingface"
+                    model_name="Qwen/Qwen-7B-Chat",  # switched to chat model
+                    api_type="huggingface",
+                    use_auth_token=True
                 )
 
-                # Instantiate individual tools with the config
                 bash_tool = Bash(config=config)
-                browser_use_tool = BrowserUseTool(llm=llm_instance) # Pass the existing LLM instance
+                browser_use_tool = BrowserUseTool(llm=llm_instance)
                 create_chat_completion_tool = CreateChatCompletion()
                 planning_tool = PlanningTool()
                 str_replace_editor_tool = StrReplaceEditor()
                 terminate_tool = Terminate()
 
-                # Create a ToolCollection instance with the instantiated tools
                 manus_tools = ToolCollection(
                     bash_tool,
                     browser_use_tool,
@@ -334,10 +350,8 @@ class OpenManusUI:
                 logger.error(f"Error initializing Manus agent on startup: {str(e)}")
                 raise
 
-        # Set up routes
         self.setup_routes()
 
-        # Mount static files if directory exists
         if os.path.exists(self.frontend_dir):
             self.app.mount("/", StaticFiles(directory=self.frontend_dir, html=True), name="static")
 
@@ -350,11 +364,9 @@ class OpenManusUI:
             self.active_websockets.append(websocket)
 
             try:
-                # Send initial connection success
                 await websocket.send_json({"type": "connect", "status": "success"})
                 logger.info("Client connected via WebSocket")
 
-                # Handle messages
                 while True:
                     data = await websocket.receive_json()
                     logger.info(f"Received WebSocket message: {data}")
@@ -362,8 +374,6 @@ class OpenManusUI:
                     if "content" in data:
                         user_message = data["content"]
                         logger.info(f"Processing message: {user_message}")
-
-                        # Process the message
                         asyncio.create_task(self.process_message(user_message))
 
             except WebSocketDisconnect:
@@ -378,7 +388,6 @@ class OpenManusUI:
 
         @self.app.get("/api/status")
         async def get_status():
-            """Check if the server is running."""
             return JSONResponse({
                 "status": "online",
                 "agent_initialized": self.agent is not None
@@ -386,7 +395,6 @@ class OpenManusUI:
 
         @self.app.post("/api/message")
         async def handle_message(request: UserMessage):
-            """Handle POST message requests with enhanced response formatting."""
             try:
                 if not self.agent:
                     return JSONResponse(
@@ -394,18 +402,28 @@ class OpenManusUI:
                         content={"response": "Agent not initialized", "status": "error"}
                     )
 
-                # Use direct scraping approach
-                response = await process_message_with_direct_scraping(
+                response_data = await process_message_with_direct_scraping(
                     self.agent,
                     request.content,
-                    max_timeout=720  # 12 minutes
+                    max_timeout=60
                 )
                 
-                return JSONResponse({
-                    "response": response, 
-                    "status": "success",
-                    "message": "Response has been saved to the responses/ directory with full conversation history."
-                })
+                if isinstance(response_data, dict):
+                    response_content = response_data.get("response", "")
+                    screenshot = response_data.get("base64_image", None)
+                else:
+                    response_content = str(response_data)
+                    screenshot = None
+                
+                result = {
+                    "response": response_content,
+                    "status": "success"
+                }
+                
+                if screenshot:
+                    result["base64_image"] = screenshot
+                
+                return JSONResponse(result)
                 
             except Exception as e:
                 logger.error(f"Error in handle_message: {str(e)}", exc_info=True)
@@ -418,7 +436,6 @@ class OpenManusUI:
 
         @self.app.get("/")
         async def get_index():
-            """Serve the index.html file."""
             index_path = os.path.join(self.frontend_dir, "index.html")
             if os.path.exists(index_path):
                 return FileResponse(index_path)
@@ -431,23 +448,61 @@ class OpenManusUI:
                 await self.broadcast_message("error", {"message": "Agent not initialized"})
                 return
 
-            # Broadcast that we're starting to process
             await self.broadcast_message("agent_action", {
                 "action": "Processing",
-                "details": f"Starting to process: {user_message}"
+                "details": f"Generating response for: {user_message}"
             })
 
-            # Use direct scraping approach
-            response = await process_message_with_direct_scraping(
-                self.agent,
-                user_message,
-                max_timeout=720  # 12 minutes
-            )
+            # Use direct response generation - NO AGENT.RUN
+            try:
+                # Check if this is a simple question
+                is_simple_request = True  # Treat all requests as simple for direct response
+                
+                if is_simple_request and 'http' not in user_message:
+                    prefix = (
+                        "Please respond in English only. "
+                        "Use 'Source:' instead of '来源:', if the user asks for sources/references."
+                        "Format URLs as markdown links (e.g. [text](url)).\n\n"
+                    )
+                    raw = await self.agent.llm.ask(prefix + user_message, temperature=0.7)
+                    response = annotate_invalid_links(str(raw))
+                    response = remove_chinese_and_punct(response)
 
-            # Broadcast the final response
-            await self.broadcast_message("agent_response", {
-                "response": response
-            })
+                    await self.broadcast_message("agent_message", {
+                        "content": str(response)
+                    })
+                    return
+                else:
+                    # For complex requests, use the processing function
+                    response_data = await asyncio.wait_for(
+                        process_message_with_direct_scraping(
+                            self.agent,
+                            user_message,
+                            max_timeout=60
+                        ),
+                        timeout=90
+                    )
+
+                    if isinstance(response_data, dict):
+                        response_content = response_data.get("response", "")
+                        screenshot = response_data.get("base64_image", None)
+                    else:
+                        response_content = str(response_data)
+                        screenshot = None
+
+                    await self.broadcast_message("agent_message", {
+                        "content": response_content
+                    })
+
+                    if screenshot:
+                        await self.broadcast_message("browser_state", {
+                            "base64_image": screenshot
+                        })
+
+            except asyncio.TimeoutError:
+                await self.broadcast_message("agent_message", {
+                    "content": "I apologize, but the request timed out. Please try a simpler question."
+                })
 
         except Exception as e:
             logger.error(f"Error processing message: {str(e)}", exc_info=True)
@@ -459,118 +514,73 @@ class OpenManusUI:
         """Broadcast a message to all connected WebSocket clients."""
         message = {"type": message_type, **data}
 
-        # Add extra logging for browser state messages
-        if message_type == "browser_state" and "base64_image" in data:
-            image_data = data["base64_image"]
-            logger.info(f"Broadcasting browser image: {len(image_data) if image_data else 0} bytes")
-
         for websocket in self.active_websockets:
             try:
                 await websocket.send_json(message)
             except Exception as e:
                 logger.error(f"Error sending message to client: {str(e)}")
-                # Remove broken connections
                 if websocket in self.active_websockets:
                     self.active_websockets.remove(websocket)
 
     def patch_agent_methods(self):
-        """Patch the agent methods to intercept and broadcast relevant information."""
+        """Patch the agent methods to capture responses immediately."""
         if not self.agent:
             return
 
-        # Store reference to self for use in closures
-        server_self = self
+        ui = self
+        agent = self.agent
 
-        # Patch browser state method
-        if hasattr(self.agent, "get_browser_state"):
-            original_get_browser_state = self.agent.get_browser_state
-
-            async def patched_get_browser_state(*args, **kwargs):
-                result = await original_get_browser_state(*args, **kwargs)
-
-                # If browser has a screenshot, broadcast it
-                if hasattr(self.agent, "_current_base64_image") and self.agent._current_base64_image:
-                    # Explicitly capture and send the screenshot to the UI
-                    await server_self.broadcast_message("browser_state", {
-                        "base64_image": self.agent._current_base64_image
-                    })
-                    logger.info("Browser screenshot captured and broadcasted")
-
-                return result
-
-            self.agent.get_browser_state = patched_get_browser_state
-
-        # Patch think method
-        if hasattr(self.agent, "think"):
-            original_think = self.agent.think
-
-            async def patched_think(*args, **kwargs):
-                # Log thinking step
-                await server_self.broadcast_message("agent_action", {
-                    "action": "Agent Thinking",
-                    "details": "Analyzing current state and deciding next actions..."
-                })
-
-                result = await original_think(*args, **kwargs)
-                return result
-
-            self.agent.think = patched_think
-
-        # Patch execute_tool method
-        if hasattr(self.agent, "execute_tool"):
-            original_execute_tool = self.agent.execute_tool
+        if hasattr(agent, "execute_tool"):
+            original_execute = agent.execute_tool
 
             async def patched_execute_tool(command, *args, **kwargs):
                 tool_name = command.function.name
                 arguments = command.function.arguments
 
-                # Log the tool execution
-                await server_self.broadcast_message("agent_action", {
+                # 1) Announce which tool is running
+                await ui.broadcast_message("agent_action", {
                     "action": f"Tool: {tool_name}",
                     "details": f"Arguments: {arguments}"
                 })
 
-                # Special handling for browser_use tool
-                is_browser_tool = tool_name in ["browser_use", "browser"]
+                # 2) Run the original tool
+                result = await original_execute(command, *args, **kwargs)
 
-                # Execute the tool
-                result = await original_execute_tool(command, *args, **kwargs)
+                # 3) If it's the terminate tool, gather and broadcast the best response
+                if tool_name == "terminate":
+                    msgs = getattr(agent.memory, "messages", [])
+                    replies = [
+                        str(m.content)
+                        for m in msgs
+                        if getattr(m, "role", None) == "assistant"
+                           and hasattr(m, "content")
+                           and len(str(m.content)) > 50
+                    ]
+                    best = ""
+                    if replies:
+                        best = max(replies, key=len)
+                        if len(best) < 800 and len(replies) > 1:
+                            combo = "\n\n".join(replies[-3:])
+                            if len(combo) > len(best):
+                                best = combo
 
-                # If it's a browser tool, wait for the screenshot
-                if is_browser_tool and hasattr(self.agent, "_current_base64_image"):
-                    await server_self.broadcast_message("browser_state", {
-                        "base64_image": self.agent._current_base64_image
+                    await ui.broadcast_message("agent_message", {
+                        "content": best or
+                                   "I've finished processing. Please check above or rephrase your request."
                     })
+
+                # 4) For browser_use extraction, broadcast a content preview
+                if tool_name == "browser_use" and hasattr(result, "output"):
+                    out = str(result.output)
+                    if len(out) > 200:
+                        preview = out[:2000] + ("…" if len(out) > 2000 else "")
+                        await ui.broadcast_message("agent_message", {
+                            "content": f"Extracted content:\n\n{preview}"
+                        })
 
                 return result
 
-            self.agent.execute_tool = patched_execute_tool
-
-        # Patch memory methods
-        if hasattr(self.agent, "memory"):
-            from app.schema import Memory
-            original_add_message = Memory.add_message
-
-            def patched_add_message(self, message, *args, **kwargs):
-                # Call the original method
-                original_add_message(self, message, *args, **kwargs)
-                
-                # If the message has an image, broadcast it
-                if hasattr(message, "base64_image") and message.base64_image:
-                    asyncio.create_task(server_self.broadcast_message("message", {
-                        "role": message.role,
-                        "content": message.content,
-                        "base64_image": message.base64_image
-                    }))
-                else:
-                    # Broadcast the message without image
-                    asyncio.create_task(server_self.broadcast_message("message", {
-                        "role": message.role,
-                        "content": message.content
-                    }))
-
-            # Patch the method at the class level
-            Memory.add_message = patched_add_message
+            agent.execute_tool = patched_execute_tool
 
     def run(self, host: str = "0.0.0.0", port: int = 8000):
         """Run the UI server."""
@@ -578,7 +588,6 @@ class OpenManusUI:
         uvicorn.run(self.app, host=host, port=port)
 
 
-# Entry point to run the server directly
 if __name__ == "__main__":
     ui_server = OpenManusUI()
     ui_server.run()

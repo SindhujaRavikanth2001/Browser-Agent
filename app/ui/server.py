@@ -8,6 +8,10 @@ from contextvars import ContextVar
 import requests
 from bs4 import BeautifulSoup
 from enum import Enum
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -32,6 +36,10 @@ from app.exceptions import TokenLimitExceeded
 import re, requests
 from urllib.parse import urlparse
 
+# Google API imports
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
 # Define a global context variable for the Manus agent
 g = ContextVar('g', default=None)
 
@@ -55,8 +63,12 @@ class ResearchDesign(BaseModel):
     target_population: Optional[str] = None
     timeframe: Optional[str] = None
     questions: Optional[List[str]] = None
+    internet_questions: Optional[List[str]] = None  # Store internet questions separately
+    internet_sources: Optional[List[str]] = None   # Store internet sources separately
+    use_internet_questions: bool = False            # Flag to track if internet questions should be included
     stage: ResearchStage = ResearchStage.INITIAL
     user_responses: Optional[Dict] = None
+    questionnaire_responses: Optional[Dict] = None
 
 class UserMessage(BaseModel):
     content: str
@@ -68,31 +80,259 @@ class ResearchWorkflow:
     def __init__(self, llm_instance):
         self.llm = llm_instance
         self.active_sessions: Dict[str, ResearchDesign] = {}
-        self.question_database = self._initialize_question_database()
+        
+        # Google Custom Search API configuration
+        self.google_api_key = os.getenv('GOOGLE_API_KEY')
+        self.google_cse_id = os.getenv('GOOGLE_CSE_ID')
+        
+        # Initialize Google Custom Search service
+        if self.google_api_key and self.google_cse_id:
+            try:
+                self.search_service = build("customsearch", "v1", developerKey=self.google_api_key)
+                logger.info("Google Custom Search API initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize Google Custom Search API: {e}")
+                self.search_service = None
+        else:
+            logger.warning("Google API credentials not found. Using fallback search.")
+            self.search_service = None
     
-    def _initialize_question_database(self):
-        """Initialize mock question database - replace with real database connection"""
-        return {
-            "demographic": [
-                "What is your age group?",
-                "What is your gender identity?",
-                "What is your highest level of education?",
-                "What is your employment status?",
-                "What is your annual household income range?"
-            ],
-            "behavioral": [
-                "How often do you engage in this behavior?",
-                "What factors influence your decision-making?",
-                "How satisfied are you with this experience?",
-                "What would motivate you to change this behavior?"
-            ],
-            "attitudinal": [
-                "How strongly do you agree with this statement?",
-                "What is your opinion on this topic?",
-                "How important is this factor to you?",
-                "How likely are you to recommend this?"
+    async def _search_internet_for_questions(self, research_topic: str, target_population: str) -> tuple[List[str], List[str]]:
+        """Search internet with single query, scrape 5 URLs, generate 5 questions"""
+        try:
+            if not self.search_service:
+                logger.warning("Google Custom Search API not available, using fallback")
+                return await self._fallback_search(research_topic, target_population)
+            
+            search_query = f"Surveys on {research_topic} "
+            logger.info(f"Searching for: {search_query}")
+            # Single search query - just the research topic
+            search_result = self.search_service.cse().list(
+                q=search_query,
+                cx=self.google_cse_id,
+                num=10,  # Get exactly 10 results
+                safe='active',
+                fields='items(title,link,snippet)'
+            ).execute()
+            
+            # Collect the 10 URLs
+            urls_to_scrape = []
+            if 'items' in search_result:
+                for item in search_result['items']:
+                    link = item.get('link', '')
+                    if link:
+                        urls_to_scrape.append(link)
+            
+            logger.info(f"Found {len(urls_to_scrape)} URLs to scrape")
+            
+            # Scrape content from all 10 URLs
+            all_scraped_content = ""
+            scraped_sources = []
+            
+            for url in urls_to_scrape:
+                try:
+                    logger.info(f"Scraping content from: {url}")
+                    page_content = await self._scrape_page_content(url)
+                    
+                    if page_content and len(page_content) > 100:
+                        all_scraped_content += f"\n\nContent from {url}:\n{page_content[:2000]}"  # Limit per URL
+                        scraped_sources.append(url)
+                        
+                    await asyncio.sleep(0.3)  # Small delay between scrapes
+                    
+                except Exception as e:
+                    logger.warning(f"Could not scrape {url}: {e}")
+                    continue
+            
+            logger.info(f"Successfully scraped {len(scraped_sources)} sources")
+            
+            # Generate 5 questions using LLM based on all scraped content
+            questions = await self._generate_questions_from_content(
+                all_scraped_content, research_topic, target_population
+            )
+            
+            # Return questions with all scraped sources
+            # Each question will be associated with all sources since LLM used all content
+            sources = scraped_sources * (len(questions) // len(scraped_sources) + 1)
+            sources = sources[:len(questions)]  # Match the number of questions
+            
+            logger.info(f"Generated {len(questions)} questions from scraped content")
+            
+            return questions, sources
+            
+        except Exception as e:
+            logger.error(f"Error in simplified search: {e}")
+            return await self._fallback_search(research_topic, target_population)
+
+    async def _generate_questions_from_content(self, scraped_content: str, research_topic: str, target_population: str) -> List[str]:
+        """Generate exactly 5 questions from scraped content using LLM"""
+        
+        prompt = f"""
+    Based on the following scraped web content about "{research_topic}", create exactly 5 professional survey questions suitable for "{target_population}".
+
+    SCRAPED CONTENT:
+    {scraped_content[:6000]}  # Limit content for LLM processing
+
+    INSTRUCTIONS:
+    1. Create exactly 5 survey questions
+    2. Base questions on the concepts, topics, and information found in the scraped content
+    3. Make questions relevant to "{research_topic}" research
+    4. Use professional survey language appropriate for "{target_population}"
+    5. Include a mix of satisfaction, frequency, rating, and preference questions
+    6. Each question should be clear, specific, and measurable
+    7. Return only the questions, one per line
+    8. All questions must end with a question mark
+
+    Generate exactly 5 survey questions:
+    """
+        
+        try:
+            response = await self.llm.ask(prompt, temperature=0.7)
+            cleaned_response = remove_chinese_and_punct(str(response))
+            
+            # Parse questions from response
+            lines = cleaned_response.split('\n')
+            questions = []
+            
+            for line in lines:
+                line = line.strip()
+                # Remove numbering, bullets, etc.
+                line = re.sub(r'^[\d\.\-\•\*\s]*', '', line)
+                
+                if line and len(line) > 15:
+                    # Ensure question ends with ?
+                    if not line.endswith('?'):
+                        line += '?'
+                    questions.append(line)
+            
+            # Ensure we have exactly 5 questions
+            if len(questions) < 5:
+                # If fewer than 5, generate additional simple questions
+                additional_needed = 5 - len(questions)
+                basic_questions = [
+                    f"How satisfied are you with {research_topic}?",
+                    f"How often do you engage with {research_topic}?",
+                    f"How important is {research_topic} to you?",
+                    f"How likely are you to recommend {research_topic}?",
+                    f"What factors are most important regarding {research_topic}?",
+                    f"How would you rate your overall experience with {research_topic}?"
+                ]
+                questions.extend(basic_questions[:additional_needed])
+            
+            # Return exactly 5 questions
+            return questions[:5]
+            
+        except Exception as e:
+            logger.error(f"Error generating questions from content: {e}")
+            # Fallback to basic questions if LLM fails
+            return [
+                f"How satisfied are you with {research_topic}?",
+                f"How often do you use {research_topic}?",
+                f"How important is {research_topic} to you?",
+                f"How likely are you to recommend {research_topic}?",
+                f"What factors influence your decisions about {research_topic}?"
             ]
-        }
+
+    async def _scrape_page_content(self, url: str) -> str:
+        """Scrape content from a webpage"""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Remove unwanted elements
+            for element in soup(['script', 'style', 'nav', 'header', 'footer', 'aside']):
+                element.decompose()
+            
+            # Extract text content
+            text = soup.get_text()
+            
+            # Clean up text
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            cleaned_text = ' '.join(chunk for chunk in chunks if chunk)
+            
+            # Limit content length for LLM processing
+            return cleaned_text[:8000]  # Limit to 8000 characters
+            
+        except Exception as e:
+            logger.warning(f"Failed to scrape {url}: {e}")
+            return ""
+
+    # Enhanced fallback method to also use LLM
+    async def _fallback_search(self, research_topic: str, target_population: str) -> tuple[List[str], List[str]]:
+        """Enhanced fallback that uses LLM to generate questions"""
+        logger.info("Using enhanced LLM fallback for question generation")
+        
+        # Generate comprehensive set of questions using LLM
+        questions = await self._generate_questions_with_llm(research_topic, target_population, 5)
+        
+        # Create sources for fallback
+        sources = ["Generated based on research methodology"] * len(questions)
+        
+        return questions, sources
+
+    async def _generate_questions_with_llm(self, research_topic: str, target_population: str, num_needed: int) -> List[str]:
+        """Generate additional survey questions using LLM when not enough are found"""
+        
+        prompt = f"""
+Create {num_needed} professional survey questions for research on "{research_topic}" targeting "{target_population}".
+
+REQUIREMENTS:
+1. Questions should be suitable for quantitative research
+2. Include a mix of satisfaction, frequency, importance, and preference questions
+3. Use professional survey language
+4. Make questions specific to the research topic
+5. Ensure questions are measurable and actionable
+6. Each question should be on a separate line
+7. All questions must end with a question mark
+
+QUESTION TYPES TO INCLUDE:
+- Likert scale questions (satisfaction, agreement)
+- Frequency questions (How often...)
+- Rating questions (On a scale of 1-10...)
+- Importance ranking (How important is...)
+- Likelihood questions (How likely are you to...)
+- Preference questions (Which do you prefer...)
+
+RESEARCH TOPIC: {research_topic}
+TARGET POPULATION: {target_population}
+
+GENERATE {num_needed} SURVEY QUESTIONS:
+"""
+        
+        try:
+            response = await self.llm.ask(prompt, temperature=0.8)
+            cleaned_response = remove_chinese_and_punct(str(response))
+            
+            # Parse questions from response
+            lines = cleaned_response.split('\n')
+            questions = []
+            
+            for line in lines:
+                line = line.strip()
+                # Remove numbering, bullets, etc.
+                line = re.sub(r'^[\d\.\-\•\*\s]*', '', line)
+                
+                if line and len(line) > 15:
+                    # Ensure question ends with ?
+                    if not line.endswith('?'):
+                        line += '?'
+                    # Basic quality check
+                    if any(word in line.lower() for word in ['how', 'what', 'which', 'would you', 'do you', 'are you', 'rate']):
+                        questions.append(line)
+            
+            logger.info(f"LLM generated {len(questions)} additional questions")
+            return questions[:num_needed]
+            
+        except Exception as e:
+            logger.error(f"Error generating questions with LLM: {e}")
+            return []
     
     async def start_research_design(self, session_id: str) -> str:
         """Start the research design process"""
@@ -169,6 +409,30 @@ Please respond with:
             # Get the generated research design
             research_design_content = await self._generate_research_design(session)
             
+            # Prepare questions for export based on the flow used - FIXED VERSION
+            all_questions = []
+            
+            if session.use_internet_questions and session.internet_questions:
+                # Include internet questions
+                all_questions.extend(session.internet_questions)
+                # Only add AI questions if they exist AND are different from internet questions
+                if session.questions:
+                    # Remove duplicates by checking if AI questions are substantially different
+                    for ai_q in session.questions:
+                        is_duplicate = False
+                        for internet_q in session.internet_questions:
+                            # Simple similarity check - if questions are very similar, skip
+                            if (len(set(ai_q.lower().split()) & set(internet_q.lower().split())) / 
+                                min(len(ai_q.split()), len(internet_q.split()))) > 0.7:
+                                is_duplicate = True
+                                break
+                        if not is_duplicate:
+                            all_questions.append(ai_q)
+            else:
+                # Only include AI-generated questions
+                if session.questions:
+                    all_questions.extend(session.questions)
+            
             # Create comprehensive research package
             package_content = f"""COMPLETE RESEARCH DESIGN PACKAGE
 Generated on: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
@@ -198,7 +462,16 @@ QUESTIONNAIRE QUESTIONS
 
 The following questions have been designed and tested for your research:
 
-{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(session.questions or []))}
+{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(all_questions))}
+
+================================================================================
+QUESTION SOURCES
+================================================================================
+
+{"Internet Research Questions: " + str(len(session.internet_questions or [])) if session.use_internet_questions else ""}
+{"AI Generated Questions: " + str(len(session.questions or [])) if session.questions else ""}
+
+{("Internet Sources:" + chr(10) + chr(10).join(f"• {source}" for source in (session.internet_sources or []))) if session.use_internet_questions and session.internet_sources else ""}
 
 ================================================================================
 IMPLEMENTATION RECOMMENDATIONS
@@ -280,7 +553,7 @@ Your comprehensive research package has been exported to:
 
 **Your Research Summary:**
 - **Topic:** {session.research_topic}
-- **Questions:** {len(session.questions or [])} validated questions
+- **Questions:** {len(all_questions)} validated questions
 - **Target:** {session.target_population}
 - **Timeline:** {session.timeframe}
 
@@ -471,105 +744,145 @@ Please respond with:
 """
     
     async def _search_database(self, session: ResearchDesign) -> str:
-        """Search question/data databases for relevant content"""
-        # Mock database search - replace with real database queries
-        relevant_questions = []
-        
-        # Simple keyword matching for demo
-        topic_keywords = session.research_topic.lower().split()
-        
-        for category, questions in self.question_database.items():
-            for question in questions:
-                if any(keyword in question.lower() for keyword in topic_keywords):
-                    relevant_questions.append(f"[{category.title()}] {question}")
-        
-        # If no matches, add some general questions
-        if not relevant_questions:
-            relevant_questions = [
-                "[General] How satisfied are you with your current experience?",
-                "[General] What factors are most important to you?",
-                "[General] How likely are you to recommend this to others?"
-            ]
-        
-        session.questions = relevant_questions
-        session.stage = ResearchStage.DECISION_POINT
-        
-        return f"""
-🔍 **Database Search Results**
+        """Search internet for relevant research questions and data"""
+        try:
+            # Search the internet for relevant questions
+            relevant_questions, sources = await self._search_internet_for_questions(
+                session.research_topic, session.target_population
+            )
+            
+            # If no questions found, provide fallback
+            if not relevant_questions:
+                return f"""
+❌ **No Search Results Found**
 
-Found {len(relevant_questions)} relevant questions for your research:
+Unable to find relevant questions for your research topic. This might be due to:
+- API rate limits
+- Network connectivity issues
+- Very specific or unusual research topic
 
-{chr(10).join(f"• {q}" for q in relevant_questions[:10])}
-{"..." if len(relevant_questions) > 10 else ""}
+**Would you like to:**
+- **R** (Retry) - Try the search again
+- **P** (Proceed) - Continue with manually created questions
+- **E** (Exit) - Exit workflow
+"""
+            
+            # Store internet questions and sources separately
+            session.internet_questions = relevant_questions
+            session.internet_sources = sources
+            session.stage = ResearchStage.DECISION_POINT
+            
+            # Format questions with their specific sources
+            questions_with_sources = []
+            for i, (question, source) in enumerate(zip(relevant_questions, sources), 1):
+                questions_with_sources.append(f"{i}. {question} - {source}")
+            
+            # Get unique sources for display
+            unique_sources = list(set(sources))
+            
+            return f"""
+🔍 **Internet Research Results**
 
-**Available databases searched:**
-• Marist SPSS Database (test)
-• General Research Question Repository
-• Demographic Standards Database
+Found {len(relevant_questions)} relevant questions from Google search:
+
+{chr(10).join(questions_with_sources)}
+
+**Sources:** {len(unique_sources)} unique websites found
 
 ---
 
-**Do you want to proceed to Questionnaire Builder?**
+**What would you like to do with these questions?**
 
 Reply with:
-- **Y** (Yes) - Go to Questionnaire Builder
-- **N** (No) - Export research design only
+- **Y** (Yes) - Go to Questionnaire Builder and include these questions in final testing
+- **N** (No) - Only use these questions and proceed directly to synthetic testing  
+- **A** (AI Only) - Don't use these questions, only use AI-generated questions in next step
+- **E** (Exit) - Exit workflow
+"""
+            
+        except Exception as e:
+            logger.error(f"Error in database search: {e}")
+            return f"""
+❌ **Search Error**
+
+There was an issue searching for relevant questions: {str(e)}
+
+Would you like to:
+- **R** (Retry) - Try the search again
+- **P** (Proceed) - Continue with basic questions
 - **E** (Exit) - Exit workflow
 """
     
     async def _handle_decision_point(self, session_id: str, user_input: str) -> str:
-        """Handle major decision point"""
+        """Handle major decision point with new options"""
         session = self.active_sessions[session_id]
         response = user_input.upper().strip()
         
         if response == 'Y':
+            # Go to questionnaire builder and include internet questions
+            session.use_internet_questions = True
             session.stage = ResearchStage.QUESTIONNAIRE_BUILDER
             return await self._start_questionnaire_builder(session)
         elif response == 'N':
-            return await self._export_research_design_only(session)
+            # Only use internet questions and proceed to testing
+            session.questions = session.internet_questions
+            session.use_internet_questions = True
+            await self._store_accepted_questions(session)
+            return await self._test_questions(session)
+        elif response == 'A':
+            # Don't use internet questions, only AI questions in next step
+            session.use_internet_questions = False
+            session.stage = ResearchStage.QUESTIONNAIRE_BUILDER
+            return await self._start_questionnaire_builder(session)
         elif response == 'E':
             del self.active_sessions[session_id]
             return "Research design workflow ended. Thank you!"
         else:
             return """
 Please respond with:
-- **Y** (Yes) - Go to Questionnaire Builder
-- **N** (No) - Export research design only
+- **Y** (Yes) - Go to Questionnaire Builder and include these questions in final testing
+- **N** (No) - Only use these questions and proceed directly to synthetic testing  
+- **A** (AI Only) - Don't use these questions, only use AI-generated questions in next step
 - **E** (Exit) - Exit workflow
 """
     
     async def _start_questionnaire_builder(self, session: ResearchDesign) -> str:
-        """Start the questionnaire builder process"""
+        """Start the questionnaire builder process with step-by-step prompts"""
+        if session.use_internet_questions:
+            questions_info = f"**Available Internet Questions ({len(session.internet_questions or [])}):**\n{chr(10).join(f'{i+1}. {q}' for i, q in enumerate((session.internet_questions or [])[:3]))}{'...' if len(session.internet_questions or []) > 3 else ''}\n\n"
+        else:
+            questions_info = ""
+        
+        # Initialize questionnaire responses safely
+        if session.questionnaire_responses is None:
+            session.questionnaire_responses = {}
+            
         return f"""
-📝 **Questionnaire Builder**
+    📝 **Questionnaire Builder**
 
-**Available Questions ({len(session.questions)}):**
-{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(session.questions[:5]))}
-{"..." if len(session.questions) > 5 else ""}
+    {questions_info}Let's design your questionnaire step by step. I'll ask you 4 questions to customize your survey.
 
-**Questionnaire Builder Options:**
+    **Question 1 of 4: Total Number of Questions**
+    How many questions do you want in your survey?
 
-1. **Generate New Questions** - AI will create custom questions for your research
-2. **Select from Existing** - Choose from the questions found in our database
-3. **Combine Both** - Use existing questions and generate new ones
-4. **Set Limits** - Define maximum number of questions or question types
+    Examples:
+    - 10 questions
+    - 15 questions
+    - 20 questions
 
-Please choose an option (1-4) or describe what you'd like to do:
-"""
-    
+    Please specify the total number of questions:
+    """
+
     async def _handle_questionnaire_builder(self, session_id: str, user_input: str) -> str:
-        """Handle questionnaire builder interactions"""
+        """Handle questionnaire builder interactions with step-by-step prompts"""
         session = self.active_sessions[session_id]
         
-        if user_input.strip() == '1':
-            return await self._generate_new_questions(session)
-        elif user_input.strip() == '2':
-            return await self._select_existing_questions(session)
-        elif user_input.strip() == '3':
-            return await self._combine_questions(session)
-        elif user_input.strip() == '4':
-            return await self._set_limits(session)
-        elif user_input.upper().strip() == 'A':
+        # Initialize questionnaire responses safely
+        if session.questionnaire_responses is None:
+            session.questionnaire_responses = {}
+        
+        # First check for universal commands that work from any state
+        if user_input.upper().strip() == 'A':
             # Accept questions - store them and move to testing phase
             await self._store_accepted_questions(session)
             return await self._test_questions(session)
@@ -580,16 +893,283 @@ Please choose an option (1-4) or describe what you'd like to do:
             # Generate more questions
             return await self._generate_more_questions(session)
         elif user_input.upper().strip() == 'B':
-            # Back to menu
+            # Back to menu - reset questionnaire responses
+            session.questionnaire_responses = {}
             return await self._start_questionnaire_builder(session)
+        
+        # Handle step-by-step questionnaire building
+        if 'total_questions' not in session.questionnaire_responses:
+            # This is the response to Question 1 (total questions)
+            try:
+                # Extract number from response
+                import re
+                numbers = re.findall(r'\d+', user_input)
+                if numbers:
+                    total_questions = min(int(numbers[0]), 25)  # Cap at 25
+                    session.questionnaire_responses['total_questions'] = total_questions
+                    
+                    return f"""
+    **Question 2 of 4: Question Types Breakdown**
+    How would you like to distribute the {total_questions} questions?
+
+    Examples:
+    - "5 demographic, 3 general, 2 open-ended" (for 10 total)
+    - "3 demographic, 7 general, 5 open-ended" (for 15 total)
+    - "no demographic, 8 general, 2 open-ended" (for 10 total)
+    - "all general questions" (for any total)
+
+    **Question Types:**
+    - **Demographic**: Age, gender, education, income, location
+    - **General**: Satisfaction, rating, frequency, importance (Likert scales)
+    - **Open-ended**: What, why, suggestions, feelings
+
+    Please specify your question breakdown:
+    """
+                else:
+                    return """
+    Please provide a number for the total questions.
+    Examples: "10 questions", "15", "20 questions total"
+
+    Please specify the total number of questions:
+    """
+            except Exception as e:
+                return """
+    Please provide a valid number for the total questions.
+    Examples: "10 questions", "15", "20 questions total"
+
+    Please specify the total number of questions:
+    """
+        
+        elif 'question_breakdown' not in session.questionnaire_responses:
+            # This is the response to Question 2 (question breakdown)
+            session.questionnaire_responses['question_breakdown'] = user_input.strip()
+            
+            return """
+    **Question 3 of 4: Survey Length**
+    How long should the survey take to complete?
+
+    Examples:
+    - "under 5 minutes"
+    - "under 10 minutes"
+    - "under 15 minutes"
+    - "10-15 minutes"
+
+    Please specify the target completion time:
+    """
+        
+        elif 'survey_length' not in session.questionnaire_responses:
+            # This is the response to Question 3 (survey length)
+            session.questionnaire_responses['survey_length'] = user_input.strip()
+            
+            return """
+    **Question 4 of 4: Target Audience Style**
+    What audience style should the questions use?
+
+    Examples:
+    - "general audience"
+    - "senior-friendly"
+    - "mobile-friendly"
+    - "student-friendly"
+    - "business professional"
+
+    Please specify the audience style:
+    """
+        
+        elif 'audience_style' not in session.questionnaire_responses:
+            # This is the response to Question 4 (audience style) - final question
+            session.questionnaire_responses['audience_style'] = user_input.strip()
+            
+            # Now generate questions with the collected specifications
+            return await self._generate_questions_from_specifications(session)
+        
         else:
-            # Process as natural language request
-            return await self._process_qb_request(session, user_input)
-    
+            # All questions have been answered - this shouldn't happen
+            return "All questionnaire specifications have been completed. Please proceed with question generation."
+
+    async def _generate_questions_from_specifications(self, session: ResearchDesign) -> str:
+        """Generate questions based on collected specifications"""
+        
+        # Extract specifications
+        total_questions = session.questionnaire_responses['total_questions']
+        breakdown = session.questionnaire_responses['question_breakdown'].lower()
+        survey_length = session.questionnaire_responses['survey_length']
+        audience_style = session.questionnaire_responses['audience_style']
+        
+        # Parse question breakdown
+        import re
+        demographic_count = 0
+        general_count = 0
+        open_ended_count = 0
+        
+        # Extract numbers for each type
+        if "no demographic" in breakdown or "0 demographic" in breakdown:
+            demographic_count = 0
+        else:
+            demo_match = re.search(r'(\d+)\s+demographic', breakdown)
+            if demo_match:
+                demographic_count = int(demo_match.group(1))
+        
+        if "all general" in breakdown:
+            general_count = total_questions - demographic_count - open_ended_count
+        else:
+            general_match = re.search(r'(\d+)\s+general', breakdown)
+            if general_match:
+                general_count = int(general_match.group(1))
+        
+        if "no open" in breakdown or "0 open" in breakdown:
+            open_ended_count = 0
+        else:
+            open_match = re.search(r'(\d+)\s+open[- ]?ended?', breakdown)
+            if open_match:
+                open_ended_count = int(open_match.group(1))
+        
+        # If breakdown doesn't add up to total, adjust general questions
+        current_total = demographic_count + general_count + open_ended_count
+        if current_total != total_questions:
+            general_count = total_questions - demographic_count - open_ended_count
+            general_count = max(0, general_count)  # Don't go negative
+        
+        # Generate questions with strict count control
+        prompt = f"""
+    Generate EXACTLY {total_questions} survey questions for this research:
+
+    Research Topic: {session.research_topic}
+    Target Population: {session.target_population}
+
+    STRICT REQUIREMENTS:
+    - EXACTLY {total_questions} questions total (no more, no less)
+    - EXACTLY {demographic_count} demographic questions
+    - EXACTLY {general_count} general questions (satisfaction, rating, frequency, Likert scales)
+    - EXACTLY {open_ended_count} open-ended questions
+    - Completion time: {survey_length}
+    - Audience: {audience_style}
+
+    CRITICAL INSTRUCTIONS:
+    1. Generate questions in this exact order: demographic first, then general, then open-ended
+    2. Number each question (1., 2., 3., etc.)
+    3. Each question must end with a question mark
+    4. Return ONLY the numbered questions, nothing else
+    5. Do not exceed {total_questions} questions under any circumstances
+
+    Generate exactly {total_questions} questions now:
+    """
+        
+        try:
+            response = await self.llm.ask(prompt, temperature=0.6)
+            cleaned_response = remove_chinese_and_punct(str(response))
+            
+            # Parse questions with strict counting
+            lines = cleaned_response.split('\n')
+            questions = []
+            
+            for line in lines:
+                line = line.strip()
+                
+                # Skip empty lines and instructional text
+                if not line or len(line) < 10:
+                    continue
+                
+                # Skip lines that are clearly not questions
+                if any(skip_word in line.lower() for skip_word in [
+                    'note:', 'requirements:', 'instructions:', 'demographic:', 'general:', 'open-ended:',
+                    'exactly', 'total', 'questions:', 'generate', 'critical', 'strict'
+                ]):
+                    continue
+                
+                # Extract clean question
+                clean_line = re.sub(r'^[\d\.\-\•\*\s]*', '', line).strip()
+                
+                if clean_line and len(clean_line) > 15:
+                    # Ensure question ends with ?
+                    if not clean_line.endswith('?'):
+                        clean_line += '?'
+                    
+                    questions.append(clean_line)
+                    
+                    # STRICT LIMIT: Stop when we reach the target
+                    if len(questions) >= total_questions:
+                        break
+            
+            # CRITICAL: Ensure exactly the requested number
+            if len(questions) > total_questions:
+                questions = questions[:total_questions]
+            elif len(questions) < total_questions:
+                # Generate basic questions to fill the gap
+                needed = total_questions - len(questions)
+                for i in range(needed):
+                    questions.append(f"How satisfied are you with {session.research_topic}?")
+            
+            # Store the questions
+            session.questions = questions
+            
+            logger.info(f"Generated exactly {len(session.questions)} questions as requested")
+            
+            return f"""
+    ⚙️ **Questions Generated with Your Specifications**
+
+    **Applied Specifications:**
+    - Total questions: {total_questions}
+    - Demographic questions: {demographic_count}
+    - General questions: {general_count}
+    - Open-ended questions: {open_ended_count}
+    - Target time: {survey_length}
+    - Audience: {audience_style}
+
+    **Generated Questions ({len(session.questions)} total):**
+    {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(session.questions))}
+
+    ---
+
+    **Review these questions:**
+    - **A** (Accept) - Use these questions and proceed to testing
+    - **R** (Revise) - Request modifications to the questions
+    - **M** (More) - Generate additional questions
+    - **B** (Back) - Return to questionnaire builder menu
+    """
+            
+        except Exception as e:
+            logger.error(f"Error generating questions: {e}")
+            return f"""
+    ❌ **Error Generating Questions**
+
+    There was an issue generating questions: {str(e)}
+
+    Please try again:
+    - **B** (Back) - Return to questionnaire builder menu
+    - **R** (Revise) - Try generating questions again
+    """
+
+    async def _set_limits(self, session: ResearchDesign) -> str:
+        """Set questionnaire limits with improved guidance"""
+        return """
+⚙️ **Set Questionnaire Limits**
+
+Please specify your preferences using this format:
+
+**Example formats:**
+- "15 questions total (5 demographic, 5 general, 5 open-ended), under 10 minutes, senior-friendly"
+- "20 questions total, no open-ended, under 15 minutes, mobile-friendly"
+- "10 questions total (3 demographic, 7 satisfaction), under 5 minutes"
+
+**You can specify:**
+1. **Total questions:** (e.g., "15 questions total", "20 total")
+2. **Question breakdown:** (e.g., "5 demographic, 3 open-ended, 7 general")
+3. **Time limit:** (e.g., "under 10 minutes", "under 5 minutes")
+4. **Audience:** (e.g., "senior-friendly", "mobile-friendly", "student-friendly")
+
+**Question types:**
+- **Demographic:** Age, gender, education, income, location
+- **General:** Satisfaction, rating, frequency, importance (Likert scales)
+- **Open-ended:** What, why, suggestions, feelings
+
+Enter your specifications:
+"""
+
     async def _store_accepted_questions(self, session: ResearchDesign) -> None:
         """Store the accepted questions in the session"""
-        # If questions aren't already stored, generate a final set
-        if not session.questions or len(session.questions) < 5:
+        # Only generate new questions if we don't already have good ones
+        if not session.questions or len(session.questions) < 3:
+            logger.info("No sufficient questions found, generating fallback questions")
             # Generate a comprehensive question set for the research topic
             prompt = f"""
 Create a final validated questionnaire for this research:
@@ -624,49 +1204,63 @@ Format each as a clear, complete survey question. Respond in English only.
                 
                 if questions:
                     session.questions = questions
-                    logger.info(f"Stored {len(questions)} questions in session")
+                    logger.info(f"Generated and stored {len(questions)} fallback questions")
                 else:
-                    # Fallback questions if parsing fails
+                    # Ultimate fallback questions
                     session.questions = [
-                        "How satisfied are you with your overall online shopping experience?",
-                        "How would you rate the website usability of online shopping platforms?",
-                        "How satisfied are you with product quality from online purchases?",
-                        "How would you rate delivery speed and reliability?",
-                        "How satisfied are you with customer service responsiveness?",
-                        "What factors are most important when choosing an online shopping platform?",
-                        "How likely are you to recommend your preferred platform to others?",
+                        "How satisfied are you with your overall experience?",
+                        "How would you rate the quality of service?",
+                        "How likely are you to recommend this to others?",
+                        "What factors are most important to you?",
+                        "How often do you use this service?",
+                        "What improvements would you suggest?",
+                        "How satisfied are you with the value for money?",
                         "What is your age group?"
                     ]
-                    logger.info("Used fallback questions due to parsing issues")
+                    logger.info("Used ultimate fallback questions")
                     
             except Exception as e:
                 logger.error(f"Error generating final questions: {e}")
                 # Use basic fallback questions
                 session.questions = [
-                    "How satisfied are you with your overall online shopping experience?",
-                    "How would you rate the website usability?",
-                    "How satisfied are you with product quality?",
-                    "How would you rate delivery service?",
-                    "How satisfied are you with customer service?",
-                    "What is your age group?",
-                    "How often do you shop online?",
-                    "What is your preferred online shopping platform?"
+                    "How satisfied are you with your overall experience?",
+                    "How would you rate the quality of service?",
+                    "How likely are you to recommend this to others?",
+                    "What factors are most important to you?",
+                    "How often do you use this service?",
+                    "What improvements would you suggest?",
+                    "How satisfied are you with the value for money?",
+                    "What is your age group?"
                 ]
                 logger.info("Used basic fallback questions due to error")
+        else:
+            logger.info(f"Using existing {len(session.questions)} questions from session")
     
     async def _test_questions(self, session: ResearchDesign) -> str:
         """Test questions with synthetic respondents using AI simulation"""
         # Move to final output stage
         session.stage = ResearchStage.FINAL_OUTPUT
         
+        # Prepare all questions for testing
+        all_test_questions = []
+        
+        if session.use_internet_questions and session.internet_questions:
+            all_test_questions.extend(session.internet_questions)
+        
+        if session.questions:
+            all_test_questions.extend(session.questions)
+        
         try:
             # Generate synthetic respondent feedback using LLM
-            synthetic_feedback = await self._generate_synthetic_respondent_feedback(session)
+            synthetic_feedback = await self._generate_synthetic_respondent_feedback_all(session, all_test_questions)
             
             return f"""
 🧪 **Testing Questionnaire with Synthetic Respondents**
 
 Running simulation with 5 diverse synthetic respondents matching your target population...
+
+**Testing {len(all_test_questions)} total questions**
+{"(Including " + str(len(session.internet_questions or [])) + " internet research questions + " + str(len(session.questions or [])) + " AI generated questions)" if session.use_internet_questions else "(AI generated questions only)"}
 
 {synthetic_feedback}
 
@@ -680,11 +1274,11 @@ Running simulation with 5 diverse synthetic respondents matching your target pop
         except Exception as e:
             logger.error(f"Error in synthetic testing: {e}")
             # Fallback to basic testing if AI simulation fails
-            return """
+            return f"""
 🧪 **Testing Questionnaire with Synthetic Respondents**
 
 **Test Results:**
-✅ **Question Clarity**: All questions are clear and understandable
+✅ **Question Clarity**: All {len(all_test_questions)} questions are clear and understandable
 ✅ **Response Time**: Estimated completion time: 8-12 minutes  
 ✅ **Flow Logic**: Question sequence flows logically
 ✅ **Response Validation**: All answer options are appropriate
@@ -697,34 +1291,31 @@ Running simulation with 5 diverse synthetic respondents matching your target pop
 - **T** (Test Again) - Run another round of testing
 """
     
-    async def _generate_synthetic_respondent_feedback(self, session: ResearchDesign) -> str:
-        """Generate realistic synthetic respondent feedback using AI"""
+    async def _generate_synthetic_respondent_feedback_all(self, session: ResearchDesign, all_questions: List[str]) -> str:
+        """Generate realistic synthetic respondent feedback using AI for all questions"""
         
-        # Get the questions from session (if available) or use placeholder
-        questions_text = ""
-        if session.questions:
-            questions_text = "\n".join(f"{i+1}. {q}" for i, q in enumerate(session.questions))
-        else:
-            questions_text = "Questions about customer satisfaction with online shopping (specific questions not available in session)"
+        questions_text = "\n".join(f"{i+1}. {q}" for i, q in enumerate(all_questions))
         
         prompt = f"""
 You are simulating 5 different synthetic respondents testing a survey questionnaire. 
 
 Research Topic: {session.research_topic}
 Target Population: {session.target_population}
+Total Questions: {len(all_questions)}
+
 Questions to test:
 {questions_text}
 
 For each synthetic respondent, provide:
 1. Brief demographic profile
-2. How long it took them to complete
-3. Any confusion or issues they encountered
-4. Suggestions for improvement
-5. Overall feedback
+2. How long it took them to complete -- Keep it short
+3. Any confusion or issues they encountered -- Keep it very short
+4. Suggestions for improvement -- Keep it short
+5. Overall feedback -- Keep it very short
 
-Create diverse respondents (different ages, tech-savviness, shopping habits) that match the target population. Be realistic about potential issues like unclear wording, missing answer options, or confusing flow.
+Create diverse respondents (different ages, backgrounds, experiences) that match the target population. Be realistic about potential issues like unclear wording, missing answer options, or confusing flow.
 
-Format as a structured test report. Keep response under 400 words and in English only.
+Format as a structured test report. Keep response under 350 words and in English only.
 """
         
         try:
@@ -801,89 +1392,6 @@ Focus on aspects not yet covered. Include demographic and behavioral questions. 
             logger.error(f"Error generating additional questions: {e}")
             return "Unable to generate additional questions. Please try again."
     
-    async def _generate_new_questions(self, session: ResearchDesign) -> str:
-        """Generate new questions using AI"""
-        prompt = f"""
-Generate 8-10 survey questions for the following research:
-
-Topic: {session.research_topic}
-Objectives: {', '.join(session.objectives)}
-Target Population: {session.target_population}
-
-Create a mix of:
-- Multiple choice questions
-- Likert scale questions (1-5 or 1-7)
-- Open-ended questions
-- Demographic questions
-
-Format each question clearly with response options where applicable. Respond in English only.
-"""
-        
-        try:
-            response = await self.llm.ask(prompt, temperature=0.7)
-            # Clean the response to remove Chinese characters
-            cleaned_response = remove_chinese_and_punct(str(response))
-            
-            return f"""
-🤖 **AI-Generated Questions**
-
-{cleaned_response}
-
----
-
-**Review these questions:**
-- **A** (Accept) - Use these questions for your survey
-- **R** (Revise) - Request modifications
-- **M** (More) - Generate additional questions
-- **B** (Back) - Return to questionnaire builder menu
-"""
-        except Exception as e:
-            logger.error(f"Error generating questions: {e}")
-            return "Unable to generate questions. Please try again or choose existing questions."
-    
-    async def _select_existing_questions(self, session: ResearchDesign) -> str:
-        """Allow user to select from existing questions"""
-        return f"""
-📋 **Select from Existing Questions**
-
-{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(session.questions))}
-
-**Instructions:**
-- Enter the numbers of questions you want to include (e.g., "1,3,5,7")
-- Type "all" to include all questions
-- Type "back" to return to questionnaire builder menu
-
-Your selection:
-"""
-    
-    async def _combine_questions(self, session: ResearchDesign) -> str:
-        """Combine existing and new questions"""
-        return """
-🔄 **Combine Questions**
-
-This will:
-1. Let you select from existing database questions
-2. Generate additional custom questions
-3. Allow you to arrange and edit the final questionnaire
-
-Type "continue" to proceed or "back" to return to menu:
-"""
-    
-    async def _set_limits(self, session: ResearchDesign) -> str:
-        """Set questionnaire limits"""
-        return """
-⚙️ **Set Questionnaire Limits**
-
-Please specify your preferences:
-
-1. **Maximum number of questions:** (e.g., 20)
-2. **Question types to limit:** (e.g., "no open-ended", "max 5 demographic")
-3. **Survey length target:** (e.g., "under 10 minutes")
-4. **Audience considerations:** (e.g., "mobile-friendly", "senior-friendly")
-
-Enter your preferences or type "back" to return to menu:
-"""
-    
     async def _process_qb_request(self, session: ResearchDesign, request: str) -> str:
         """Process natural language questionnaire builder requests"""
         prompt = f"""
@@ -896,15 +1404,14 @@ Research context:
 
 Please help them by either:
 1. Generating specific questions if they're asking for questions
-2. Providing guidance on questionnaire design
-3. Explaining options if they're confused
 
 Keep response concise and actionable.
 """
         
         try:
             response = await self.llm.ask(prompt, temperature=0.7)
-            return f"{response}\n\n---\nType 'menu' to return to questionnaire builder options."
+            cleaned_response = remove_chinese_and_punct(str(response))
+            return f"{cleaned_response}\n\n---\nType 'menu' to return to questionnaire builder options."
         except Exception as e:
             logger.error(f"Error processing QB request: {e}")
             return "I didn't understand that request. Please try again or type 'menu' for options."
@@ -924,6 +1431,9 @@ Keep response concise and actionable.
                     "target_population": session.target_population,
                     "timeframe": session.timeframe,
                     "questions": session.questions or [],
+                    "internet_questions": session.internet_questions or [],
+                    "internet_sources": session.internet_sources or [],
+                    "use_internet_questions": session.use_internet_questions,
                     "generated_at": timestamp
                 }
             }

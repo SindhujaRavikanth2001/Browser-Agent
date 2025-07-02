@@ -69,6 +69,7 @@ class ResearchDesign(BaseModel):
     stage: ResearchStage = ResearchStage.INITIAL
     user_responses: Optional[Dict] = None
     questionnaire_responses: Optional[Dict] = None
+    chat_history: Optional[List[Dict]] = None
 
 class UserMessage(BaseModel):
     content: str
@@ -336,24 +337,102 @@ GENERATE {num_needed} SURVEY QUESTIONS:
     
     async def start_research_design(self, session_id: str) -> str:
         """Start the research design process"""
-        self.active_sessions[session_id] = ResearchDesign(stage=ResearchStage.DESIGN_INPUT)
+        self.active_sessions[session_id] = ResearchDesign(
+            stage=ResearchStage.DESIGN_INPUT,
+            chat_history=[]  # Initialize empty chat history
+        )
         
-        return """
-🔬 **Research Design Workflow Started**
+        initial_response = """
+    🔬 **Research Design Workflow Started**
 
-Let's design your research study step by step. I'll ask you a series of questions to help create a comprehensive research design.
+    Let's design your research study step by step. I'll ask you a series of questions to help create a comprehensive research design.
 
-**Question 1 of 4: Research Topic**
-What are you looking to find out? Please describe your research topic or area of interest.
+    **Question 1 of 4: Research Topic**
+    What are you looking to find out? Please describe your research topic or area of interest.
 
-Examples:
-- Consumer preferences for sustainable products
-- Impact of remote work on employee productivity
-- Student attitudes toward online learning
-- Healthcare access in rural communities
+    Examples:
+    - Consumer preferences for sustainable products
+    - Impact of remote work on employee productivity
+    - Student attitudes toward online learning
+    - Healthcare access in rural communities
 
-Please provide your research topic:
-"""
+    Please provide your research topic:
+    """
+        
+        # Log the initial bot message
+        session = self.active_sessions[session_id]
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session.chat_history.append({
+            "timestamp": timestamp,
+            "type": "system",
+            "content": "Research Design Workflow Started",
+            "stage": session.stage.value
+        })
+        session.chat_history.append({
+            "timestamp": timestamp,
+            "type": "assistant",
+            "content": initial_response,
+            "stage": session.stage.value
+        })
+        
+        return initial_response
+
+    def _export_chat_history(self, session: ResearchDesign, timestamp: str) -> str:
+        """Export chat history for the research session"""
+        if not session.chat_history:
+            return "No chat history available for this session."
+        
+        chat_filename = f"research_chat_history_{timestamp}.txt"
+        
+        try:
+            # Format chat history for export
+            chat_content = f"""RESEARCH DESIGN WORKFLOW CHAT HISTORY
+    Generated on: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+    Research Topic: {session.research_topic or 'Not specified'}
+    Target Population: {session.target_population or 'Not specified'}
+
+    ================================================================================
+    COMPLETE CHAT CONVERSATION
+    ================================================================================
+
+    """
+            
+            for i, interaction in enumerate(session.chat_history, 1):
+                role = interaction['type'].upper()
+                timestamp = interaction['timestamp']
+                content = interaction['content']
+                stage = interaction['stage']
+                
+                chat_content += f"""
+    [{timestamp}] [{stage.upper()}] {role}:
+    {content}
+
+    {'='*80}
+
+    """
+            
+            chat_content += f"""
+    CONVERSATION SUMMARY:
+    - Total interactions: {len(session.chat_history)}
+    - Start time: {session.chat_history[0]['timestamp'] if session.chat_history else 'Unknown'}
+    - End time: {session.chat_history[-1]['timestamp'] if session.chat_history else 'Unknown'}
+    - Workflow stages covered: {', '.join(set(interaction['stage'] for interaction in session.chat_history))}
+
+    ================================================================================
+    """
+            
+            # Save chat history file
+            chat_filepath = f"research_outputs/{chat_filename}"
+            with open(chat_filepath, "w", encoding="utf-8") as f:
+                f.write(chat_content)
+            
+            logger.info(f"Chat history exported to {chat_filepath}")
+            return chat_filepath
+            
+        except Exception as e:
+            logger.error(f"Error exporting chat history: {e}")
+            return None
 
     async def process_research_input(self, session_id: str, user_input: str) -> str:
         """Process user input during research design phase"""
@@ -362,18 +441,24 @@ Please provide your research topic:
         
         session = self.active_sessions[session_id]
         
+        # Process the input based on current stage
         if session.stage == ResearchStage.DESIGN_INPUT:
-            return await self._handle_design_input(session_id, user_input)
+            response = await self._handle_design_input(session_id, user_input)
         elif session.stage == ResearchStage.DESIGN_REVIEW:
-            return await self._handle_design_review(session_id, user_input)
+            response = await self._handle_design_review(session_id, user_input)
         elif session.stage == ResearchStage.DECISION_POINT:
-            return await self._handle_decision_point(session_id, user_input)
+            response = await self._handle_decision_point(session_id, user_input)
         elif session.stage == ResearchStage.QUESTIONNAIRE_BUILDER:
-            return await self._handle_questionnaire_builder(session_id, user_input)
+            response = await self._handle_questionnaire_builder(session_id, user_input)
         elif session.stage == ResearchStage.FINAL_OUTPUT:
-            return await self._handle_final_output(session_id, user_input)
+            response = await self._handle_final_output(session_id, user_input)
         else:
-            return "Invalid session stage."
+            response = "Invalid session stage."
+        
+        # Log this interaction
+        self._log_chat_interaction(session_id, user_input, response)
+        
+        return response
     
     async def _handle_final_output(self, session_id: str, user_input: str) -> str:
         """Handle final output and export"""
@@ -399,7 +484,7 @@ Please respond with:
 """
     
     async def _export_complete_research_package(self, session: ResearchDesign) -> str:
-        """Export complete research package including questionnaire"""
+        """Export complete research package including questionnaire and chat history"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"complete_research_package_{timestamp}.txt"
         
@@ -433,95 +518,109 @@ Please respond with:
                 if session.questions:
                     all_questions.extend(session.questions)
             
+            # Export chat history first
+            chat_filepath = self._export_chat_history(session, timestamp)
+            
             # Create comprehensive research package
             package_content = f"""COMPLETE RESEARCH DESIGN PACKAGE
-Generated on: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    Generated on: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
-================================================================================
-RESEARCH DESIGN SUMMARY
-================================================================================
+    ================================================================================
+    RESEARCH DESIGN SUMMARY
+    ================================================================================
 
-Research Topic: {session.research_topic}
+    Research Topic: {session.research_topic}
 
-Research Objectives:
-{chr(10).join(f"• {obj}" for obj in (session.objectives or []))}
+    Research Objectives:
+    {chr(10).join(f"• {obj}" for obj in (session.objectives or []))}
 
-Target Population: {session.target_population}
+    Target Population: {session.target_population}
 
-Research Timeframe: {session.timeframe}
+    Research Timeframe: {session.timeframe}
 
-================================================================================
-METHODOLOGY AND APPROACH
-================================================================================
+    ================================================================================
+    METHODOLOGY AND APPROACH
+    ================================================================================
 
-{research_design_content}
+    {research_design_content}
 
-================================================================================
-QUESTIONNAIRE QUESTIONS
-================================================================================
+    ================================================================================
+    QUESTIONNAIRE QUESTIONS
+    ================================================================================
 
-The following questions have been designed and tested for your research:
+    The following questions have been designed and tested for your research:
 
-{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(all_questions))}
+    {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(all_questions))}
 
-================================================================================
-QUESTION SOURCES
-================================================================================
+    ================================================================================
+    QUESTION SOURCES
+    ================================================================================
 
-{"Internet Research Questions: " + str(len(session.internet_questions or [])) if session.use_internet_questions else ""}
-{"AI Generated Questions: " + str(len(session.questions or [])) if session.questions else ""}
+    {"Internet Research Questions: " + str(len(session.internet_questions or [])) if session.use_internet_questions else ""}
+    {"AI Generated Questions: " + str(len(session.questions or [])) if session.questions else ""}
 
-{("Internet Sources:" + chr(10) + chr(10).join(f"• {source}" for source in (session.internet_sources or []))) if session.use_internet_questions and session.internet_sources else ""}
+    {("Internet Sources:" + chr(10) + chr(10).join(f"• {source}" for source in (session.internet_sources or []))) if session.use_internet_questions and session.internet_sources else ""}
 
-================================================================================
-IMPLEMENTATION RECOMMENDATIONS
-================================================================================
+    ================================================================================
+    EXPORTED FILES
+    ================================================================================
 
-1. SURVEY DISTRIBUTION:
-   - Use online survey platforms (SurveyMonkey, Qualtrics, Google Forms)
-   - Target distribution through social media, email lists, or partner organizations
-   - Consider incentives to improve response rates
+    This research package includes the following exported files:
+    • Research Package: {filename}
+    {f"• Chat History: {chat_filepath.split('/')[-1] if chat_filepath else 'Chat export failed'}" if chat_filepath else ""}
 
-2. DATA COLLECTION:
-   - Collect responses over 4-6 weeks
-   - Monitor response rates weekly
-   - Send reminder emails to improve participation
+    ================================================================================
+    IMPLEMENTATION RECOMMENDATIONS
+    ================================================================================
 
-3. DATA ANALYSIS:
-   - Use statistical software (SPSS, R, or Excel) for analysis
-   - Calculate descriptive statistics for all variables
-   - Perform correlation analysis between satisfaction factors
-   - Consider regression analysis to identify key drivers
+    1. SURVEY DISTRIBUTION:
+    - Use online survey platforms (SurveyMonkey, Qualtrics, Google Forms)
+    - Target distribution through social media, email lists, or partner organizations
+    - Consider incentives to improve response rates
 
-4. REPORTING:
-   - Create visual dashboards with charts and graphs
-   - Provide executive summary with key findings
-   - Include recommendations based on results
+    2. DATA COLLECTION:
+    - Collect responses over 4-6 weeks
+    - Monitor response rates weekly
+    - Send reminder emails to improve participation
 
-================================================================================
-RESEARCH ETHICS AND CONSIDERATIONS
-================================================================================
+    3. DATA ANALYSIS:
+    - Use statistical software (SPSS, R, or Excel) for analysis
+    - Calculate descriptive statistics for all variables
+    - Perform correlation analysis between satisfaction factors
+    - Consider regression analysis to identify key drivers
 
-- Obtain informed consent from all participants
-- Ensure participant anonymity and data privacy
-- Store data securely and follow GDPR/privacy regulations
-- Provide participants with option to withdraw at any time
+    4. REPORTING:
+    - Create visual dashboards with charts and graphs
+    - Provide executive summary with key findings
+    - Include recommendations based on results
 
-================================================================================
-EXPECTED TIMELINE
-================================================================================
+    ================================================================================
+    RESEARCH ETHICS AND CONSIDERATIONS
+    ================================================================================
 
-Week 1-2: Finalize questionnaire and setup survey platform
-Week 3-8: Data collection period
-Week 9-10: Data analysis and preliminary results
-Week 11-12: Final report preparation and presentation
+    - Obtain informed consent from all participants
+    - Ensure participant anonymity and data privacy
+    - Store data securely and follow GDPR/privacy regulations
+    - Provide participants with option to withdraw at any time
 
-================================================================================
+    ================================================================================
+    EXPECTED TIMELINE
+    ================================================================================
 
-This research package is ready for implementation. All questions have been
-tested and validated. The methodology is sound and appropriate for your
-research objectives.
-"""
+    Week 1-2: Finalize questionnaire and setup survey platform
+    Week 3-8: Data collection period
+    Week 9-10: Data analysis and preliminary results
+    Week 11-12: Final report preparation and presentation
+
+    ================================================================================
+
+    This research package is ready for implementation. All questions have been
+    tested and validated. The methodology is sound and appropriate for your
+    research objectives.
+
+    For the complete conversation history that led to this research design,
+    see the exported chat history file.
+    """
             
             filepath = f"research_outputs/{filename}"
             with open(filepath, "w", encoding="utf-8") as f:
@@ -538,33 +637,70 @@ research objectives.
             for key in session_keys_to_remove:
                 del self.active_sessions[key]
             
+            # Enhanced response with chat export info
+            chat_info = f"\nChat file: `{chat_filepath.split('/')[-1] if chat_filepath else 'Export failed'}`" if chat_filepath else "\n⚠️ Chat history export failed"
+            
             return f"""
-🎉 **Research Package Complete!**
+    🎉 **Research Package Complete!**
 
-Your comprehensive research package has been exported to:
-**`{filepath}`**
+    Your comprehensive research package has been exported to:
+    **`{filepath}`**{chat_info}
 
-**Package Contents:**
-✅ Complete research design and methodology
-✅ Tested and validated questionnaire questions  
-✅ Implementation recommendations and timeline
-✅ Data analysis guidelines
-✅ Ethics and privacy considerations
+    **Package Contents:**
+    ✅ Complete research design and methodology
+    ✅ Tested and validated questionnaire questions  
+    ✅ Implementation recommendations and timeline
+    ✅ Data analysis guidelines
+    ✅ Ethics and privacy considerations
+    ✅ Complete conversation history exported
 
-**Your Research Summary:**
-- **Topic:** {session.research_topic}
-- **Questions:** {len(all_questions)} validated questions
-- **Target:** {session.target_population}
-- **Timeline:** {session.timeframe}
+    **Your Research Summary:**
+    - **Topic:** {session.research_topic}
+    - **Questions:** {len(all_questions)} validated questions
+    - **Target:** {session.target_population}
+    - **Timeline:** {session.timeframe}
+    - **Chat interactions:** {len(session.chat_history) if session.chat_history else 0} recorded
 
-The file is ready for download from the research_outputs directory.
-Session completed successfully!
-"""
+    Both files are ready for download from the research_outputs directory.
+    Session completed successfully!
+    """
             
         except Exception as e:
             logger.error(f"Error exporting research package: {str(e)}", exc_info=True)
             return f"Error creating research package: {str(e)}. Please check logs and try again."
     
+    def _log_chat_interaction(self, session_id: str, user_message: str, bot_response: str):
+        """Log chat interaction for the specific session"""
+        if session_id not in self.active_sessions:
+            return
+            
+        session = self.active_sessions[session_id]
+        
+        # Initialize chat history if not exists
+        if session.chat_history is None:
+            session.chat_history = []
+        
+        # Add timestamp for this interaction
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Log user message
+        session.chat_history.append({
+            "timestamp": timestamp,
+            "type": "user",
+            "content": user_message,
+            "stage": session.stage.value
+        })
+        
+        # Log bot response
+        session.chat_history.append({
+            "timestamp": timestamp,
+            "type": "assistant", 
+            "content": bot_response,
+            "stage": session.stage.value
+        })
+        
+        logger.info(f"Logged chat interaction for session {session_id}, total interactions: {len(session.chat_history)}")
+
     async def _handle_design_input(self, session_id: str, user_input: str) -> str:
         """Handle user input during design input phase"""
         session = self.active_sessions[session_id]
@@ -2129,7 +2265,7 @@ class OpenManusUI:
                 })
 
             else:
-                # Handle URL research or general research
+                # Handle URL research or general research (these don't need chat logging)
                 if action_type == UserAction.URL_RESEARCH.value or 'http' in user_message:
                     # URL-based research
                     response_data = await asyncio.wait_for(

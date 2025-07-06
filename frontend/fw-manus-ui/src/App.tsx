@@ -10,13 +10,86 @@ import {
   Tabs,
   Tab,
   Avatar,
-  useTheme
+  useTheme,
+  IconButton,
+  Tooltip,
+  Alert,
+  Snackbar
 } from '@mui/material';
 import { alpha } from '@mui/material/styles';
 import SendIcon from '@mui/icons-material/Send';
 import OpenInFullIcon from '@mui/icons-material/OpenInFull';
 import CloseIcon from '@mui/icons-material/Close';
+import MicIcon from '@mui/icons-material/Mic';
+import MicOffIcon from '@mui/icons-material/MicOff';
+import CheckIcon from '@mui/icons-material/Check';
+import ClearIcon from '@mui/icons-material/Clear';
 import './App.css';
+
+// TypeScript declarations for Speech Recognition API
+interface SpeechRecognitionEvent extends Event {
+  resultIndex: number;
+  results: SpeechRecognitionResultList;
+}
+
+interface SpeechRecognitionErrorEvent extends Event {
+  error: 'network' | 'not-allowed' | 'no-speech' | 'aborted' | 'audio-capture' | 'service-not-allowed';
+  message: string;
+}
+
+interface SpeechRecognitionResultList {
+  readonly length: number;
+  item(index: number): SpeechRecognitionResult;
+  [index: number]: SpeechRecognitionResult;
+}
+
+interface SpeechRecognitionResult {
+  readonly length: number;
+  item(index: number): SpeechRecognitionAlternative;
+  [index: number]: SpeechRecognitionAlternative;
+  isFinal: boolean;
+}
+
+interface SpeechRecognitionAlternative {
+  transcript: string;
+  confidence: number;
+}
+
+interface SpeechRecognition extends EventTarget {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  maxAlternatives: number;
+  serviceURI: string;
+  grammars: any;
+  
+  start(): void;
+  stop(): void;
+  abort(): void;
+  
+  onstart: ((this: SpeechRecognition, ev: Event) => any) | null;
+  onresult: ((this: SpeechRecognition, ev: SpeechRecognitionEvent) => any) | null;
+  onerror: ((this: SpeechRecognition, ev: SpeechRecognitionErrorEvent) => any) | null;
+  onend: ((this: SpeechRecognition, ev: Event) => any) | null;
+  onspeechstart: ((this: SpeechRecognition, ev: Event) => any) | null;
+  onspeechend: ((this: SpeechRecognition, ev: Event) => any) | null;
+  onsoundstart: ((this: SpeechRecognition, ev: Event) => any) | null;
+  onsoundend: ((this: SpeechRecognition, ev: Event) => any) | null;
+  onaudiostart: ((this: SpeechRecognition, ev: Event) => any) | null;
+  onaudioend: ((this: SpeechRecognition, ev: Event) => any) | null;
+  onnomatch: ((this: SpeechRecognition, ev: SpeechRecognitionEvent) => any) | null;
+}
+
+interface SpeechRecognitionStatic {
+  new(): SpeechRecognition;
+}
+
+declare global {
+  interface Window {
+    SpeechRecognition: SpeechRecognitionStatic;
+    webkitSpeechRecognition: SpeechRecognitionStatic;
+  }
+}
 
 // Define types for our application
 type ChatMessage = {
@@ -44,16 +117,235 @@ function App() {
   const [streamingMessage, setStreamingMessage] = useState<string>('');
   const [isStreaming, setIsStreaming] = useState(false);
 
+  // Voice-to-text state
+  const [isListening, setIsListening] = useState(false);
+  const [speechSupported, setSpeechSupported] = useState(false);
+  const [voiceInput, setVoiceInput] = useState('');
+  const [showVoiceReview, setShowVoiceReview] = useState(false);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [isInitializing, setIsInitializing] = useState(false);
+  const recognitionRef = useRef<any>(null);
+  const isListeningRef = useRef(false);
+  const voiceInputRef = useRef('');
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const actionsEndRef = useRef<HTMLDivElement>(null);
   const browserEndRef = useRef<HTMLDivElement>(null);
 
+  // Update voiceInputRef whenever voiceInput changes
+  useEffect(() => {
+    voiceInputRef.current = voiceInput;
+  }, [voiceInput]);
+
+  // Initialize Speech Recognition
+  useEffect(() => {
+    // Check if Speech Recognition is supported
+    const SpeechRecognitionClass = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    
+    if (SpeechRecognitionClass) {
+      setSpeechSupported(true);
+      console.log('Speech Recognition is supported');
+      
+      // Pre-request microphone permission on component mount
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        navigator.mediaDevices.getUserMedia({ audio: true })
+          .then(() => {
+            console.log('Microphone permission pre-granted');
+          })
+          .catch((error) => {
+            console.log('Microphone permission not granted yet:', error);
+          });
+      }
+    } else {
+      console.warn('Speech Recognition not supported in this browser');
+      setSpeechSupported(false);
+    }
+  }, []);
+
+  // Create recognition instance when needed
+  const createRecognition = () => {
+    const SpeechRecognitionClass = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    
+    if (!SpeechRecognitionClass) return null;
+    
+    const recognition = new SpeechRecognitionClass() as SpeechRecognition;
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.lang = 'en-US';
+
+    recognition.onstart = () => {
+      console.log('Speech recognition started');
+      setIsListening(true);
+      setIsInitializing(false);
+      setVoiceError(null);
+      isListeningRef.current = true;
+    };
+
+    recognition.onresult = (event: SpeechRecognitionEvent) => {
+      let finalTranscript = '';
+      
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        if (result.isFinal) {
+          finalTranscript += result[0].transcript;
+        }
+      }
+      
+      if (finalTranscript) {
+        console.log('Final transcript:', finalTranscript);
+        const newVoiceInput = voiceInputRef.current + finalTranscript + ' ';
+        setVoiceInput(newVoiceInput);
+        voiceInputRef.current = newVoiceInput;
+      }
+    };
+
+    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+      console.error('Speech recognition error:', event.error);
+      setIsListening(false);
+      setIsInitializing(false);
+      isListeningRef.current = false;
+      
+      switch (event.error) {
+        case 'network':
+          setVoiceError('Network error. Please check your internet connection.');
+          break;
+        case 'not-allowed':
+          setVoiceError('Microphone access denied. Please allow microphone access and try again.');
+          break;
+        case 'no-speech':
+          setVoiceError('No speech detected. Please try speaking again.');
+          break;
+        case 'audio-capture':
+          setVoiceError('Microphone not found. Please check your microphone.');
+          break;
+        case 'service-not-allowed':
+          setVoiceError('Speech recognition service not allowed. Please check browser settings.');
+          break;
+        case 'aborted':
+          console.log('Speech recognition was aborted');
+          break;
+        default:
+          setVoiceError(`Speech recognition error: ${event.error}. Please try again.`);
+      }
+    };
+
+    recognition.onend = () => {
+      console.log('Speech recognition ended');
+      setIsListening(false);
+      setIsInitializing(false);
+      isListeningRef.current = false;
+      
+      // Use a small delay to ensure state updates are complete
+      setTimeout(() => {
+        const currentVoiceInput = voiceInputRef.current;
+        console.log('Checking voice input on end:', currentVoiceInput);
+        
+        if (currentVoiceInput && currentVoiceInput.trim()) {
+          console.log('Showing voice review panel');
+          setShowVoiceReview(true);
+        } else {
+          console.log('No voice input to review');
+        }
+      }, 100);
+    };
+
+    return recognition;
+  };
+
+  // Start voice recognition
+  const startListening = async () => {
+    if (isListening || isInitializing) {
+      console.log('Already listening or initializing');
+      return;
+    }
+    
+    console.log('Starting voice recognition...');
+    setVoiceInput('');
+    voiceInputRef.current = '';
+    setVoiceError(null);
+    setShowVoiceReview(false);
+    setIsInitializing(true);
+    
+    // Clean up any existing recognition
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.abort();
+      } catch (e) {
+        console.log('Error aborting previous recognition:', e);
+      }
+      recognitionRef.current = null;
+    }
+    
+    try {
+      const recognition = createRecognition();
+      if (!recognition) {
+        setVoiceError('Speech recognition not available');
+        setIsInitializing(false);
+        return;
+      }
+      
+      recognitionRef.current = recognition;
+      
+      // Check microphone permission
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        try {
+          await navigator.mediaDevices.getUserMedia({ audio: true });
+          console.log('Microphone permission granted, starting recognition immediately');
+          recognition.start();
+        } catch (error) {
+          console.error('Microphone permission denied:', error);
+          setVoiceError('Microphone access is required for voice input. Please allow microphone access.');
+          setIsInitializing(false);
+        }
+      } else {
+        console.log('Using fallback, starting recognition immediately');
+        recognition.start();
+      }
+    } catch (error) {
+      console.error('Error in startListening:', error);
+      setVoiceError('Failed to start speech recognition. Please try again.');
+      setIsInitializing(false);
+    }
+  };
+
+  // Stop voice recognition
+  const stopListening = () => {
+    if (!isListeningRef.current && !isInitializing) return;
+    
+    setIsInitializing(false);
+    
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch (error) {
+        console.log('Error stopping recognition:', error);
+      }
+    }
+  };
+
+  // Accept voice input and put it in the text field
+  const acceptVoiceInput = () => {
+    setInput(voiceInput);
+    setShowVoiceReview(false);
+    setVoiceInput('');
+    voiceInputRef.current = '';
+  };
+
+  // Reject voice input
+  const rejectVoiceInput = () => {
+    setShowVoiceReview(false);
+    setVoiceInput('');
+    voiceInputRef.current = '';
+  };
+
+  // Clear voice error
+  const clearVoiceError = () => {
+    setVoiceError(null);
+  };
+
   // Connect to WebSocket server when component mounts
   useEffect(() => {
-    // Create WebSocket connection
-    // In development, connect directly to the backend
     const socketUrl = 'ws://localhost:8000/ws';
-
     console.log('Connecting to WebSocket at:', socketUrl);
 
     const newSocket = new WebSocket(socketUrl);
@@ -86,13 +378,10 @@ function App() {
           timestamp: Date.now()
         }]);
         setIsLoading(false);
-        // Switch to chat tab when receiving messages
         setActiveTab(0);
       } else if (data.type === 'agent_message_stream_start') {
-        // Initialize streaming state
         setIsStreaming(true);
         setStreamingMessage('');
-        // Add an empty message that will be updated
         setMessages(prev => [...prev, {
           role: 'assistant',
           content: '',
@@ -100,9 +389,7 @@ function App() {
         }]);
         setActiveTab(0);
       } else if (data.type === 'agent_message_stream_chunk') {
-        // Update the streaming message with new chunk
         setStreamingMessage(prev => prev + data.content);
-        // Update the last message with current accumulated text
         setMessages(prev => {
           const newMessages = [...prev];
           if (newMessages.length > 0) {
@@ -114,7 +401,6 @@ function App() {
           return newMessages;
         });
       } else if (data.type === 'agent_message_stream_end') {
-        // Finalize streaming
         setIsStreaming(false);
         setIsLoading(false);
       } else if (data.type === 'agent_action') {
@@ -137,7 +423,6 @@ function App() {
 
     setSocket(newSocket);
 
-    // Cleanup on unmount
     return () => {
       newSocket.close();
     };
@@ -152,11 +437,6 @@ function App() {
     actionsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [agentActions]);
 
-  // Remove auto-scroll for browser view
-  useEffect(() => {
-    // Only update state, don't auto-scroll
-  }, [browserState]);
-
   // Handle sending messages
   const sendMessage = () => {
     if (!input.trim()) return;
@@ -169,12 +449,10 @@ function App() {
 
     setMessages(prev => [...prev, newMessage]);
 
-    // Try to send via WebSocket if connected
     if (socket && socket.readyState === WebSocket.OPEN) {
       console.log('Sending message via WebSocket:', input);
       socket.send(JSON.stringify({ content: input }));
     } else {
-      // Fallback to HTTP API
       console.log('Sending message via HTTP API:', input);
       fetch('/api/message', {
         method: 'POST',
@@ -262,6 +540,18 @@ function App() {
         </Toolbar>
       </Paper>
 
+      {/* Voice Error Snackbar */}
+      <Snackbar
+        open={!!voiceError}
+        autoHideDuration={6000}
+        onClose={clearVoiceError}
+        anchorOrigin={{ vertical: 'top', horizontal: 'center' }}
+      >
+        <Alert onClose={clearVoiceError} severity="error" sx={{ width: '100%' }}>
+          {voiceError}
+        </Alert>
+      </Snackbar>
+
       {/* Main Content Area */}
       <Box sx={{ flexGrow: 1, overflow: 'hidden', display: 'flex', gap: 0 }}>
         <PanelGroup direction="horizontal" autoSaveId="panel-group-settings">
@@ -284,7 +574,7 @@ function App() {
                 borderBottom: 1,
                 borderColor: 'divider',
                 backgroundColor: alpha(theme.palette.background.paper, 0.6),
-                flexShrink: 0 // Prevent tabs from shrinking
+                flexShrink: 0
               }}>
                 <Tabs
                   value={activeTab}
@@ -327,7 +617,7 @@ function App() {
                     flexDirection: 'column',
                     gap: 2,
                     backgroundColor: alpha(theme.palette.background.default, 0.3),
-                    height: 0, // Ensure container uses flex sizing to enable scrolling
+                    height: 0,
                     minHeight: 0
                   }}
                   className="bubble-container"
@@ -379,17 +669,102 @@ function App() {
                   p: 2,
                   backgroundColor: alpha(theme.palette.background.paper, 0.3),
                   backdropFilter: 'blur(10px)',
-                  flexShrink: 0 // Prevent input area from shrinking
+                  flexShrink: 0
                 }}>
-                  <Box sx={{ display: 'flex', gap: 1 }}>
+                  {/* Voice status indicator */}
+                  {(isListening || isInitializing) && (
+                    <Box sx={{ 
+                      mb: 1, 
+                      p: 1.5, 
+                      backgroundColor: alpha(theme.palette.primary.main, 0.1),
+                      borderRadius: 2,
+                      border: `1px solid ${alpha(theme.palette.primary.main, 0.3)}`,
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 1
+                    }}>
+                      <MicIcon color="primary" sx={{ fontSize: 20 }} />
+                      <Typography variant="body2" color="primary" sx={{ fontWeight: 500 }}>
+                        {isInitializing ? 'Initializing...' : 'Listening... Speak now'}
+                      </Typography>
+                      <Box sx={{ 
+                        width: 8, 
+                        height: 8, 
+                        borderRadius: '50%', 
+                        backgroundColor: theme.palette.primary.main,
+                        animation: 'pulse 1.5s infinite'
+                      }} />
+                    </Box>
+                  )}
+
+                  {/* Voice Review Panel */}
+                  {showVoiceReview && (
+                    <Paper
+                      elevation={0}
+                      className="glass-effect"
+                      sx={{
+                        borderRadius: 2,
+                        p: 2,
+                        mb: 1,
+                        border: `2px solid ${theme.palette.primary.main}`,
+                        backgroundColor: alpha(theme.palette.primary.main, 0.1)
+                      }}
+                    >
+                      <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 600 }}>
+                        Review Voice Input
+                      </Typography>
+                      <TextField
+                        fullWidth
+                        multiline
+                        rows={3}
+                        value={voiceInput}
+                        onChange={(e) => setVoiceInput(e.target.value)}
+                        placeholder="Your voice input will appear here..."
+                        variant="outlined"
+                        size="small"
+                        sx={{
+                          mb: 2,
+                          '& .MuiOutlinedInput-root': {
+                            borderRadius: 2,
+                            backgroundColor: alpha(theme.palette.background.paper, 0.7)
+                          }
+                        }}
+                      />
+                      <Box sx={{ display: 'flex', gap: 1, justifyContent: 'flex-end' }}>
+                        <Button
+                          variant="outlined"
+                          startIcon={<ClearIcon />}
+                          onClick={rejectVoiceInput}
+                          size="small"
+                          sx={{ textTransform: 'none' }}
+                        >
+                          Cancel
+                        </Button>
+                        <Button
+                          variant="contained"
+                          startIcon={<CheckIcon />}
+                          onClick={acceptVoiceInput}
+                          size="small"
+                          sx={{ textTransform: 'none' }}
+                          disabled={!voiceInput.trim()}
+                        >
+                          Use This Text
+                        </Button>
+                      </Box>
+                    </Paper>
+                  )}
+
+                  <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-end' }}>
                     <TextField
                       fullWidth
                       variant="outlined"
-                      placeholder="Type your message..."
+                      placeholder="Type your message or use voice input..."
                       value={input}
                       onChange={(e) => setInput(e.target.value)}
-                      onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
+                      onKeyPress={(e) => e.key === 'Enter' && !e.shiftKey && sendMessage()}
                       disabled={isLoading}
+                      multiline
+                      maxRows={4}
                       size="small"
                       sx={{
                         '& .MuiOutlinedInput-root': {
@@ -398,6 +773,43 @@ function App() {
                         }
                       }}
                     />
+                    
+                    {/* Voice Input Button */}
+                    {speechSupported && (
+                      <Tooltip title={isListening ? "Stop listening" : isInitializing ? "Initializing..." : "Start voice input"}>
+                        <span>
+                          <IconButton
+                            onClick={isListening ? stopListening : startListening}
+                            disabled={isLoading || showVoiceReview || isInitializing}
+                            sx={{
+                              backgroundColor: isListening 
+                                ? alpha(theme.palette.error.main, 0.1)
+                                : alpha(theme.palette.primary.main, 0.1),
+                              border: isListening
+                                ? `1px solid ${alpha(theme.palette.error.main, 0.3)}`
+                                : `1px solid ${alpha(theme.palette.primary.main, 0.3)}`,
+                              '&:hover': {
+                                backgroundColor: isListening
+                                  ? alpha(theme.palette.error.main, 0.2)
+                                  : alpha(theme.palette.primary.main, 0.2)
+                              },
+                              '&:disabled': {
+                                opacity: 0.6
+                              }
+                            }}
+                          >
+                            {isInitializing ? (
+                              <MicIcon color="primary" sx={{ animation: 'pulse 1s infinite' }} />
+                            ) : isListening ? (
+                              <MicOffIcon color="error" />
+                            ) : (
+                              <MicIcon color="primary" />
+                            )}
+                          </IconButton>
+                        </span>
+                      </Tooltip>
+                    )}
+
                     <Button
                       variant="contained"
                       color="primary"
@@ -426,7 +838,7 @@ function App() {
                   p: 2,
                   gap: 1,
                   backgroundColor: alpha(theme.palette.background.default, 0.3),
-                  height: 0, // Ensure container uses flex sizing to enable scrolling
+                  height: 0,
                   minHeight: 0
                 }}
                 className="bubble-container"
@@ -537,7 +949,7 @@ function App() {
                     pl: 3,
                     borderBottom: `1px solid ${theme.palette.divider}`,
                     backgroundColor: alpha(theme.palette.background.paper, 0.6),
-                    flexShrink: 0 // Prevent header from shrinking
+                    flexShrink: 0
                   }}>
                     <Typography variant="h6" sx={{ fontSize: '1.1rem', fontWeight: 500 }}>
                       Browser View
@@ -577,7 +989,7 @@ function App() {
                     position: 'relative',
                     backgroundColor: alpha(theme.palette.background.default, 0.3),
                     p: 3,
-                    height: 0, // Ensure container uses flex sizing to enable scrolling
+                    height: 0,
                     minHeight: 0
                   }}>
                     <Paper
@@ -600,7 +1012,6 @@ function App() {
                           display: 'block'
                         }}
                         onError={(e) => {
-                          // If JPEG fails, try PNG
                           const target = e.target as HTMLImageElement;
                           if (target.src.includes('image/jpeg')) {
                             console.log('Trying PNG format instead');

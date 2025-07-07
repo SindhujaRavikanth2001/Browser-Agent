@@ -3,12 +3,17 @@ import os
 import json
 from datetime import datetime
 from asyncio import TimeoutError as AsyncTimeoutError
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Any
 from contextvars import ContextVar
 import requests
 from bs4 import BeautifulSoup
 from enum import Enum
 from dotenv import load_dotenv
+import base64
+import urllib.parse
+import pytesseract
+from PIL import Image
+import io
 
 # Load environment variables
 load_dotenv()
@@ -63,13 +68,17 @@ class ResearchDesign(BaseModel):
     target_population: Optional[str] = None
     timeframe: Optional[str] = None
     questions: Optional[List[str]] = None
-    internet_questions: Optional[List[str]] = None  # Store internet questions separately
-    internet_sources: Optional[List[str]] = None   # Store internet sources separately
-    use_internet_questions: bool = False            # Flag to track if internet questions should be included
+    internet_questions: Optional[List[str]] = None
+    internet_sources: Optional[List[str]] = None
+    screenshots: Optional[List[Dict]] = None
+    use_internet_questions: bool = False
+    selected_internet_questions: bool = False
     stage: ResearchStage = ResearchStage.INITIAL
     user_responses: Optional[Dict] = None
     questionnaire_responses: Optional[Dict] = None
     chat_history: Optional[List[Dict]] = None
+    selected_internet_questions: bool = False  # S option flag
+    include_all_internet_questions: bool = False  # Y option flag
 
 class UserMessage(BaseModel):
     content: str
@@ -81,6 +90,7 @@ class ResearchWorkflow:
     def __init__(self, llm_instance):
         self.llm = llm_instance
         self.active_sessions: Dict[str, ResearchDesign] = {}
+        self.browser_tool = None  # Will be set by UI server
         
         # Google Custom Search API configuration
         self.google_api_key = os.getenv('GOOGLE_API_KEY')
@@ -97,85 +107,176 @@ class ResearchWorkflow:
         else:
             logger.warning("Google API credentials not found. Using fallback search.")
             self.search_service = None
-    
-    async def _search_internet_for_questions(self, research_topic: str, target_population: str) -> tuple[List[str], List[str]]:
-        """Search internet with single query, scrape 5 URLs, generate 5 questions"""
+
+    async def _search_internet_for_questions(self, research_topic: str, target_population: str) -> tuple[List[str], List[str], List[str]]:
+        """Search internet with deep URL filtering and screenshot validation"""
         try:
             if not self.search_service:
                 logger.warning("Google Custom Search API not available, using fallback")
                 return await self._fallback_search(research_topic, target_population)
             
-            search_query = f"Surveys on {research_topic} "
+            search_query = f"Surveys on {research_topic}"
             logger.info(f"Searching for: {search_query}")
-            # Single search query - just the research topic
-            search_result = self.search_service.cse().list(
-                q=search_query,
-                cx=self.google_cse_id,
-                num=10,  # Get exactly 10 results
-                safe='active',
-                fields='items(title,link,snippet)'
-            ).execute()
             
-            # Collect the 10 URLs
-            urls_to_scrape = []
+            try:
+                # Get more results since we'll filter many out
+                search_result = self.search_service.cse().list(
+                    q=search_query,
+                    cx=self.google_cse_id,
+                    num=10,  # Get exactly 10 results
+                    safe='active',
+                    fields='items(title,link,snippet)'
+                ).execute()
+                
+            except Exception as api_error:
+                logger.error(f"Google Search API error: {api_error}")
+                return await self._fallback_search(research_topic, target_population)
+            
+            # Extract and filter URLs
+            all_urls = []
+            deep_urls = []
+            
             if 'items' in search_result:
                 for item in search_result['items']:
                     link = item.get('link', '')
+                    title = item.get('title', '')
                     if link:
-                        urls_to_scrape.append(link)
+                        all_urls.append(link)
+                        if self._is_valid_url(link):  # This now includes deep URL check
+                            deep_urls.append(link)
+                            logger.info(f"✅ Deep URL found: {title}")
+                        else:
+                            logger.info(f"❌ Filtered out: {title} - {link}")
             
-            logger.info(f"Found {len(urls_to_scrape)} URLs to scrape")
+            logger.info(f"URL filtering results:")
+            logger.info(f"  - Total URLs found: {len(all_urls)}")
+            logger.info(f"  - Deep URLs kept: {len(deep_urls)}")
+            logger.info(f"  - URLs filtered out: {len(all_urls) - len(deep_urls)}")
             
-            # Scrape content from all 10 URLs
+            if not deep_urls:
+                logger.warning("No deep URLs found after filtering")
+                return await self._fallback_search(research_topic, target_population)
+            
+            # Process only deep URLs
             all_scraped_content = ""
             scraped_sources = []
+            valid_screenshots = []
             
-            for url in urls_to_scrape:
+            for i, url in enumerate(deep_urls, 1):
                 try:
-                    logger.info(f"Scraping content from: {url}")
+                    logger.info(f"Processing deep URL {i}/{len(deep_urls)}: {url}")
+                    
+                    # Scrape content first
                     page_content = await self._scrape_page_content(url)
                     
-                    if page_content and len(page_content) > 100:
-                        all_scraped_content += f"\n\nContent from {url}:\n{page_content[:2000]}"  # Limit per URL
-                        scraped_sources.append(url)
-                        
-                    await asyncio.sleep(0.3)  # Small delay between scrapes
+                    if not page_content or len(page_content) < 200:
+                        print(f"❌ Insufficient content from {url}")
+                        continue
+                    
+                    # Content is good - try screenshot (single attempt)
+                    screenshot = None
+                    if self.browser_tool:
+                        print(f"📸 Attempting screenshot for {url}")
+                        try:
+                            screenshot = await capture_url_screenshot(url, self.browser_tool)
+                            
+                            if screenshot:
+                                # Validate the screenshot
+                                is_valid = await self.validate_screenshot(screenshot, url)
+                                if not is_valid:
+                                    screenshot = None
+                        except Exception as screenshot_error:
+                            logger.warning(f"Screenshot failed for {url}: {screenshot_error}")
+                            screenshot = None
+                    
+                    # Always include content (regardless of screenshot success)
+                    all_scraped_content += f"\n\nContent from {url}:\n{page_content[:2000]}"
+                    scraped_sources.append(url)
+                    
+                    # Only add to slideshow if screenshot is valid
+                    if screenshot:
+                        domain = self._extract_domain(url)
+                        valid_screenshots.append({
+                            'url': url,
+                            'screenshot': screenshot,
+                            'title': f"Survey Research - {domain}"
+                        })
+                        logger.info(f"✅ Added screenshot #{len(valid_screenshots)}")
+                    else:
+                        logger.info(f"⚠️ Content only (no valid screenshot) for {url}")
+                    
+                    await asyncio.sleep(0.5)
                     
                 except Exception as e:
-                    logger.warning(f"Could not scrape {url}: {e}")
+                    logger.warning(f"Error processing {url}: {e}")
                     continue
             
-            logger.info(f"Successfully scraped {len(scraped_sources)} sources")
+            logger.info(f"Final results:")
+            logger.info(f"  - Deep URLs processed: {len(deep_urls)}")
+            logger.info(f"  - Content sources: {len(scraped_sources)}")
+            logger.info(f"  - Valid screenshots: {len(valid_screenshots)}")
             
-            # Generate 5 questions using LLM based on all scraped content
+            # Generate questions from all scraped content
             questions = await self._generate_questions_from_content(
                 all_scraped_content, research_topic, target_population
             )
             
-            # Return questions with all scraped sources
-            # Each question will be associated with all sources since LLM used all content
-            sources = scraped_sources * (len(questions) // len(scraped_sources) + 1)
-            sources = sources[:len(questions)]  # Match the number of questions
-            
-            logger.info(f"Generated {len(questions)} questions from scraped content")
-            
-            return questions, sources
+            return questions, scraped_sources, valid_screenshots
             
         except Exception as e:
-            logger.error(f"Error in simplified search: {e}")
+            logger.error(f"Error in search with deep URL filtering: {e}")
             return await self._fallback_search(research_topic, target_population)
 
+    async def validate_screenshot(self, screenshot_base64: str, url: str) -> bool:
+        """
+        Simple validation - first attempt only
+        Returns True if screenshot has content, False if blank
+        """
+        try:
+            # Check if screenshot is too small (likely blank/error)
+            if len(screenshot_base64) < 10000:  # Less than ~7KB
+                print(f"❌ Screenshot too small for {url}")
+                return False
+            
+            # Check decoded data
+            image_data = base64.b64decode(screenshot_base64)
+            if len(image_data) < 5000:  # Less than 5KB
+                print(f"❌ Image data too small for {url}")
+                return False
+            
+            # Check byte diversity (blank images have few unique bytes)
+            data_sample = image_data[:1000]  # First 1KB
+            unique_bytes = len(set(data_sample))
+            if unique_bytes < 20:  # Very low diversity = likely blank
+                print(f"❌ Low content diversity for {url}")
+                return False
+                
+            print(f"✅ Screenshot validation passed for {url}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Validation error for {url}: {e}")
+            return False
+    
+    def _extract_domain(self, url: str) -> str:
+        """Extract domain from URL for display purposes"""
+        try:
+            parsed = urlparse(url)
+            return parsed.netloc
+        except:
+            return "Unknown"
+
     async def _generate_questions_from_content(self, scraped_content: str, research_topic: str, target_population: str) -> List[str]:
-        """Generate exactly 5 questions from scraped content using LLM"""
+        """Generate exactly 10 questions from scraped content using LLM"""
         
         prompt = f"""
-    Based on the following scraped web content about "{research_topic}", create exactly 5 professional survey questions suitable for "{target_population}".
+    Based on the following scraped web content about "{research_topic}", create exactly 10 professional survey questions suitable for "{target_population}".
 
     SCRAPED CONTENT:
     {scraped_content[:6000]}  # Limit content for LLM processing
 
     INSTRUCTIONS:
-    1. Create exactly 5 survey questions
+    1. Create exactly 10 survey questions
     2. Base questions on the concepts, topics, and information found in the scraped content
     3. Make questions relevant to "{research_topic}" research
     4. Use professional survey language appropriate for "{target_population}"
@@ -184,7 +285,7 @@ class ResearchWorkflow:
     7. Return only the questions, one per line
     8. All questions must end with a question mark
 
-    Generate exactly 5 survey questions:
+    Generate exactly 10 survey questions:
     """
         
         try:
@@ -206,10 +307,10 @@ class ResearchWorkflow:
                         line += '?'
                     questions.append(line)
             
-            # Ensure we have exactly 5 questions
-            if len(questions) < 5:
-                # If fewer than 5, generate additional simple questions
-                additional_needed = 5 - len(questions)
+            # Ensure we have exactly 10 questions
+            if len(questions) < 10:
+                # If fewer than 10, generate additional simple questions
+                additional_needed = 10 - len(questions)
                 basic_questions = [
                     f"How satisfied are you with {research_topic}?",
                     f"How often do you engage with {research_topic}?",
@@ -220,8 +321,8 @@ class ResearchWorkflow:
                 ]
                 questions.extend(basic_questions[:additional_needed])
             
-            # Return exactly 5 questions
-            return questions[:5]
+            # Return exactly 10 questions
+            return questions[:10]
             
         except Exception as e:
             logger.error(f"Error generating questions from content: {e}")
@@ -266,7 +367,7 @@ class ResearchWorkflow:
             return ""
 
     # Enhanced fallback method to also use LLM
-    async def _fallback_search(self, research_topic: str, target_population: str) -> tuple[List[str], List[str]]:
+    async def _fallback_search(self, research_topic: str, target_population: str) -> tuple[List[str], List[str], List[str]]:
         """Enhanced fallback that uses LLM to generate questions"""
         logger.info("Using enhanced LLM fallback for question generation")
         
@@ -275,8 +376,9 @@ class ResearchWorkflow:
         
         # Create sources for fallback
         sources = ["Generated based on research methodology"] * len(questions)
+        screenshots = []  # No screenshots for fallback
         
-        return questions, sources
+        return questions, sources, screenshots
 
     async def _generate_questions_with_llm(self, research_topic: str, target_population: str, num_needed: int) -> List[str]:
         """Generate additional survey questions using LLM when not enough are found"""
@@ -494,29 +596,65 @@ Please respond with:
             # Get the generated research design
             research_design_content = await self._generate_research_design(session)
             
-            # Prepare questions for export based on the flow used - FIXED VERSION
-            all_questions = []
+            # Use all questions from session.questions (which includes generated + selected)
+            final_questions = session.questions or []
             
-            if session.use_internet_questions and session.internet_questions:
-                # Include internet questions
-                all_questions.extend(session.internet_questions)
-                # Only add AI questions if they exist AND are different from internet questions
-                if session.questions:
-                    # Remove duplicates by checking if AI questions are substantially different
-                    for ai_q in session.questions:
-                        is_duplicate = False
-                        for internet_q in session.internet_questions:
-                            # Simple similarity check - if questions are very similar, skip
-                            if (len(set(ai_q.lower().split()) & set(internet_q.lower().split())) / 
-                                min(len(ai_q.split()), len(internet_q.split()))) > 0.7:
-                                is_duplicate = True
-                                break
-                        if not is_duplicate:
-                            all_questions.append(ai_q)
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_final_questions = []
+            for q in final_questions:
+                if q not in seen:
+                    seen.add(q)
+                    unique_final_questions.append(q)
+            
+            final_questions = unique_final_questions
+            
+            # Determine question source information
+            question_source_info = ""
+            if (hasattr(session, 'selected_internet_questions') and 
+                session.selected_internet_questions and 
+                session.questionnaire_responses and 
+                'selected_questions' in session.questionnaire_responses):
+                
+                # Selection mode - show breakdown
+                selected_questions = session.questionnaire_responses['selected_questions']
+                base_count = session.questionnaire_responses['total_questions']
+                selected_count = len(selected_questions)
+                
+                # Split questions for display
+                generated_questions = final_questions[:base_count]
+                extra_questions = final_questions[base_count:]
+                
+                question_source_info = f"""
+    Generated Base Questions: {len(generated_questions)}
+    Selected Extra Questions: {len(extra_questions)}
+    Total Questions: {len(final_questions)}
+
+    Generated Base Questions:
+    {chr(10).join(f"• {q}" for q in generated_questions)}
+
+    Selected Extra Questions from Internet Research:
+    {chr(10).join(f"• {q}" for q in extra_questions)}
+    """
+            
+            elif session.use_internet_questions and session.internet_questions:
+                # All internet questions mode
+                internet_count = len([q for q in final_questions if q in session.internet_questions])
+                ai_count = len(final_questions) - internet_count
+                question_source_info = f"""
+    Internet Research Questions: {internet_count}
+    AI Generated Questions: {ai_count}
+    Total Questions: {len(final_questions)}
+
+    Internet Sources:
+    {chr(10).join(f"• {source}" for source in (session.internet_sources or []))}
+    """
             else:
-                # Only include AI-generated questions
-                if session.questions:
-                    all_questions.extend(session.questions)
+                # AI only mode
+                question_source_info = f"""
+    AI Generated Questions: {len(final_questions)}
+    Total Questions: {len(final_questions)}
+    """
             
             # Export chat history first
             chat_filepath = self._export_chat_history(session, timestamp)
@@ -550,16 +688,13 @@ Please respond with:
 
     The following questions have been designed and tested for your research:
 
-    {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(all_questions))}
+    {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(final_questions))}
 
     ================================================================================
-    QUESTION SOURCES
+    QUESTION SOURCES AND BREAKDOWN
     ================================================================================
 
-    {"Internet Research Questions: " + str(len(session.internet_questions or [])) if session.use_internet_questions else ""}
-    {"AI Generated Questions: " + str(len(session.questions or [])) if session.questions else ""}
-
-    {("Internet Sources:" + chr(10) + chr(10).join(f"• {source}" for source in (session.internet_sources or []))) if session.use_internet_questions and session.internet_sources else ""}
+    {question_source_info}
 
     ================================================================================
     EXPORTED FILES
@@ -628,7 +763,7 @@ Please respond with:
             
             logger.info(f"Research package exported successfully to {filepath}")
             
-            # Clean up session - use proper session_id
+            # Clean up session
             session_keys_to_remove = []
             for key, sess in self.active_sessions.items():
                 if sess == session:
@@ -656,7 +791,7 @@ Please respond with:
 
     **Your Research Summary:**
     - **Topic:** {session.research_topic}
-    - **Questions:** {len(all_questions)} validated questions
+    - **Questions:** {len(final_questions)} validated questions
     - **Target:** {session.target_population}
     - **Timeline:** {session.timeframe}
     - **Chat interactions:** {len(session.chat_history) if session.chat_history else 0} recorded
@@ -878,96 +1013,216 @@ Please respond with:
 - **S** (Save) - Save and export this design
 - **E** (Exit) - Exit the workflow
 """
-    
-    async def _search_database(self, session: ResearchDesign) -> str:
-        """Search internet for relevant research questions and data"""
+    # Enhanced URL filtering to only include deep URLs
+
+    def _is_deep_url(self, url: str) -> bool:
+        """
+        Check if URL is a deep URL (not just root domain)
+        Returns True for URLs with meaningful paths, False for root domains
+        """
         try:
-            # Search the internet for relevant questions
-            relevant_questions, sources = await self._search_internet_for_questions(
+            # Parse URL to get path
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            
+            # Get the path part (everything after domain)
+            path = parsed.path.strip('/')
+            
+            # Count path segments
+            path_segments = [seg for seg in path.split('/') if seg and seg.strip()]
+            
+            # 1. Must have at least some path (not just domain.com or domain.com/)
+            if not path or len(path) < 3:
+                print(f"❌ Root domain rejected: {url}")
+                return False
+            
+            # 2. Must have at least 1 meaningful path segment
+            if len(path_segments) < 1:
+                print(f"❌ No path segments: {url}")
+                return False
+            
+            # 3. Reject common root-level pages that aren't specific content
+            root_level_pages = [
+                'index', 'home', 'main', 'default', 'welcome',
+                'about', 'contact', 'privacy', 'terms', 'legal',
+                'sitemap', 'robots.txt', 'favicon.ico'
+            ]
+            
+            first_segment = path_segments[0].lower()
+            if first_segment in root_level_pages:
+                print(f"❌ Root-level page rejected: {url}")
+                return False
+            
+            # 4. Prefer URLs with multiple path segments (deeper content)
+            if len(path_segments) >= 2:
+                print(f"✅ Deep URL accepted ({len(path_segments)} segments): {url}")
+                return True
+            
+            # 5. Single segment URLs - check if they look like content
+            content_indicators = [
+                'survey', 'research', 'study', 'questionnaire', 'poll',
+                'article', 'blog', 'post', 'report', 'analysis',
+                'guide', 'white-paper', 'case-study', 'methodology',
+                'results', 'findings', 'data', 'statistics'
+            ]
+            
+            first_segment_lower = first_segment.lower()
+            for indicator in content_indicators:
+                if indicator in first_segment_lower:
+                    print(f"✅ Content URL accepted: {url}")
+                    return True
+            
+            # 6. Check if URL has meaningful length (longer paths often = more specific content)
+            if len(path) >= 15:  # At least 15 characters in path
+                print(f"✅ Substantial path accepted: {url}")
+                return True
+            
+            print(f"❌ Shallow URL rejected: {url}")
+            return False
+            
+        except Exception as e:
+            print(f"❌ URL parsing error for {url}: {e}")
+            return False
+
+    def _is_valid_url(self, url: str) -> bool:
+        """Enhanced URL validation including deep URL check"""
+        try:
+            # First check basic validity
+            problematic_patterns = [
+                'accounts.google.com',
+                'login.',
+                'signin.',
+                'auth.',
+                'captcha',
+                '.pdf',
+                '.doc',
+                '.zip',
+                'javascript:',
+                'mailto:',
+                'tel:',
+                'ftp:'
+            ]
+            
+            url_lower = url.lower()
+            for pattern in problematic_patterns:
+                if pattern in url_lower:
+                    print(f"❌ Problematic pattern rejected: {url}")
+                    return False
+            
+            # Basic URL validation
+            if not url.startswith(('http://', 'https://')):
+                print(f"❌ Invalid protocol: {url}")
+                return False
+            
+            if len(url) > 500:  # Very long URLs are often problematic
+                print(f"❌ URL too long: {url}")
+                return False
+            
+            # NEW: Check if it's a deep URL
+            if not self._is_deep_url(url):
+                return False
+            
+            print(f"✅ Valid deep URL: {url}")
+            return True
+            
+        except Exception:
+            return False
+
+    async def _search_database(self, session: ResearchDesign) -> str:
+        """Search internet with deep URL filtering"""
+        try:
+            relevant_questions, sources, screenshots = await self._search_internet_for_questions(
                 session.research_topic, session.target_population
             )
             
-            # If no questions found, provide fallback
             if not relevant_questions:
                 return f"""
-❌ **No Search Results Found**
+    ❌ **No Deep Content Found**
 
-Unable to find relevant questions for your research topic. This might be due to:
-- API rate limits
-- Network connectivity issues
-- Very specific or unusual research topic
+    Unable to find relevant survey content in deep URLs for your research topic.
+    This might be because:
+    - Most results were root domain pages (filtered out)
+    - Limited specific survey content available
+    - API rate limits or network issues
 
-**Would you like to:**
-- **R** (Retry) - Try the search again
-- **P** (Proceed) - Continue with manually created questions
-- **E** (Exit) - Exit workflow
-"""
+    **Would you like to:**
+    - **R** (Retry) - Try the search again
+    - **P** (Proceed) - Continue with AI-generated questions
+    - **E** (Exit) - Exit workflow
+    """
             
-            # Store internet questions and sources separately
+            # Store results
             session.internet_questions = relevant_questions
             session.internet_sources = sources
+            session.screenshots = screenshots
             session.stage = ResearchStage.DECISION_POINT
             
-            # Format questions with their specific sources
-            questions_with_sources = []
-            for i, (question, source) in enumerate(zip(relevant_questions, sources), 1):
-                questions_with_sources.append(f"{i}. {question} - {source}")
+            # Format questions with numbers for easy selection
+            questions_with_numbers = []
+            for i, question in enumerate(relevant_questions, 1):
+                questions_with_numbers.append(f"{i}. {question}")
             
-            # Get unique sources for display
             unique_sources = list(set(sources))
             
             return f"""
-🔍 **Internet Research Results**
+    🔍 **Deep Content Research Results**
 
-Found {len(relevant_questions)} relevant questions from Google search:
+    Found {len(relevant_questions)} relevant questions from specific survey content:
 
-{chr(10).join(questions_with_sources)}
+    {chr(10).join(questions_with_numbers)}
 
-**Sources:** {len(unique_sources)} unique websites found
+    **📊 Quality Summary:**
+    - **Sources:** {len(unique_sources)} specialized websites
+    - **Content:** Scraped from {len(sources)} deep content pages
+    - **Screenshots:** {len(screenshots)} quality screenshots captured
+    ---
 
----
+    **What would you like to do with these questions?**
 
-**What would you like to do with these questions?**
-
-Reply with:
-- **Y** (Yes) - Go to Questionnaire Builder and include these questions in final testing
-- **N** (No) - Only use these questions and proceed directly to synthetic testing  
-- **A** (AI Only) - Don't use these questions, only use AI-generated questions in next step
-- **E** (Exit) - Exit workflow
-"""
+    Reply with:
+    - **Y** (Yes) - Go to Questionnaire Builder and include these questions
+    - **N** (No) - Use only these questions and proceed to testing  
+    - **A** (AI Only) - Skip these, use only AI-generated questions
+    - **S** (Select) - Choose specific questions from the internet results to include
+    - **E** (Exit) - Exit workflow
+    """
             
         except Exception as e:
             logger.error(f"Error in database search: {e}")
-            return f"""
-❌ **Search Error**
-
-There was an issue searching for relevant questions: {str(e)}
-
-Would you like to:
-- **R** (Retry) - Try the search again
-- **P** (Proceed) - Continue with basic questions
-- **E** (Exit) - Exit workflow
-"""
+            return f"❌ Search Error: {str(e)}"
     
     async def _handle_decision_point(self, session_id: str, user_input: str) -> str:
-        """Handle major decision point with new options"""
+        """Handle major decision point with all options working correctly"""
         session = self.active_sessions[session_id]
         response = user_input.upper().strip()
         
         if response == 'Y':
-            # Go to questionnaire builder and include internet questions
+            # Include ALL internet questions + generate additional questions
             session.use_internet_questions = True
+            session.include_all_internet_questions = True  # NEW flag
+            session.selected_internet_questions = False
             session.stage = ResearchStage.QUESTIONNAIRE_BUILDER
             return await self._start_questionnaire_builder(session)
         elif response == 'N':
-            # Only use internet questions and proceed to testing
-            session.questions = session.internet_questions
+            # Use ONLY internet questions and proceed directly to testing
+            session.questions = session.internet_questions.copy()
             session.use_internet_questions = True
+            session.include_all_internet_questions = True
+            session.selected_internet_questions = False
             await self._store_accepted_questions(session)
             return await self._test_questions(session)
         elif response == 'A':
-            # Don't use internet questions, only AI questions in next step
+            # Skip internet questions, use only AI-generated questions
             session.use_internet_questions = False
+            session.include_all_internet_questions = False
+            session.selected_internet_questions = False
+            session.stage = ResearchStage.QUESTIONNAIRE_BUILDER
+            return await self._start_questionnaire_builder(session)
+        elif response == 'S':
+            # Select specific questions from internet questions as extras
+            session.use_internet_questions = True
+            session.include_all_internet_questions = False
+            session.selected_internet_questions = True  # Selection mode
             session.stage = ResearchStage.QUESTIONNAIRE_BUILDER
             return await self._start_questionnaire_builder(session)
         elif response == 'E':
@@ -975,30 +1230,64 @@ Would you like to:
             return "Research design workflow ended. Thank you!"
         else:
             return """
-Please respond with:
-- **Y** (Yes) - Go to Questionnaire Builder and include these questions in final testing
-- **N** (No) - Only use these questions and proceed directly to synthetic testing  
-- **A** (AI Only) - Don't use these questions, only use AI-generated questions in next step
-- **E** (Exit) - Exit workflow
-"""
+    Please respond with:
+    - **Y** (Yes) - Go to Questionnaire Builder and include ALL these questions
+    - **N** (No) - Use ONLY these questions and proceed to testing  
+    - **A** (AI Only) - Skip these, use only AI-generated questions
+    - **S** (Select) - Choose specific questions from the internet results to include
+    - **E** (Exit) - Exit workflow
+    """
     
     async def _start_questionnaire_builder(self, session: ResearchDesign) -> str:
         """Start the questionnaire builder process with step-by-step prompts"""
-        if session.use_internet_questions:
+        
+        # Determine which mode we're in and set up appropriate messaging
+        if hasattr(session, 'selected_internet_questions') and session.selected_internet_questions:
+            # S option - selection mode
+            questions_info = f"""**Available Internet Questions for Selection:**
+    {chr(10).join(f'{i+1}. {q}' for i, q in enumerate(session.internet_questions or []))}
+
+    You can select specific questions by their numbers in the next step.
+
+    """
+            total_questions_label = "5"
+        elif hasattr(session, 'include_all_internet_questions') and session.include_all_internet_questions:
+            # Y option - include all mode
+            questions_info = f"""**All Internet Questions Will Be Included ({len(session.internet_questions or [])}):**
+    {chr(10).join(f'{i+1}. {q}' for i, q in enumerate((session.internet_questions or [])[:3]))}{'...' if len(session.internet_questions or []) > 3 else ''}
+
+    These will be ADDED to the additional questions you specify below.
+
+    """
+            total_questions_label = "4"
+        elif session.use_internet_questions:
+            # Legacy fallback
             questions_info = f"**Available Internet Questions ({len(session.internet_questions or [])}):**\n{chr(10).join(f'{i+1}. {q}' for i, q in enumerate((session.internet_questions or [])[:3]))}{'...' if len(session.internet_questions or []) > 3 else ''}\n\n"
+            total_questions_label = "4"
         else:
+            # A option - AI only mode
             questions_info = ""
+            total_questions_label = "4"
         
         # Initialize questionnaire responses safely
         if session.questionnaire_responses is None:
             session.questionnaire_responses = {}
             
-        return f"""
-    📝 **Questionnaire Builder**
+        # Customize the first question based on mode
+        if hasattr(session, 'include_all_internet_questions') and session.include_all_internet_questions:
+            question_text = f"""**Question 1 of {total_questions_label}: Additional Questions**
+    You'll get all {len(session.internet_questions or [])} internet questions PLUS additional questions.
 
-    {questions_info}Let's design your questionnaire step by step. I'll ask you 4 questions to customize your survey.
+    How many ADDITIONAL questions do you want generated?
 
-    **Question 1 of 4: Total Number of Questions**
+    Examples:
+    - 5 additional questions (total will be {len(session.internet_questions or [])} + 5 = {len(session.internet_questions or []) + 5})
+    - 10 additional questions (total will be {len(session.internet_questions or [])} + 10 = {len(session.internet_questions or []) + 10})
+    - 0 additional questions (total will be {len(session.internet_questions or [])} only)
+
+    Please specify the number of ADDITIONAL questions:"""
+        elif hasattr(session, 'selected_internet_questions') and session.selected_internet_questions:
+            question_text = f"""**Question 1 of {total_questions_label}: Total Number of Questions**
     How many questions do you want in your survey?
 
     Examples:
@@ -1006,52 +1295,106 @@ Please respond with:
     - 15 questions
     - 20 questions
 
-    Please specify the total number of questions:
+    Please specify the total number of questions:"""
+        else:
+            question_text = f"""**Question 1 of {total_questions_label}: Total Number of Questions**
+    How many questions do you want in your survey?
+
+    Examples:
+    - 10 questions
+    - 15 questions
+    - 20 questions
+
+    Please specify the total number of questions:"""
+            
+        return f"""
+    📝 **Questionnaire Builder**
+
+    {questions_info}Let's design your questionnaire step by step. I'll ask you {total_questions_label} questions to customize your survey.
+
+    {question_text}
     """
 
     async def _handle_questionnaire_builder(self, session_id: str, user_input: str) -> str:
-        """Handle questionnaire builder interactions with step-by-step prompts"""
+        """Handle questionnaire builder interactions with all options"""
         session = self.active_sessions[session_id]
         
         # Initialize questionnaire responses safely
         if session.questionnaire_responses is None:
             session.questionnaire_responses = {}
         
-        # First check for universal commands that work from any state
+        # Determine which mode we're in
+        is_selection_mode = hasattr(session, 'selected_internet_questions') and session.selected_internet_questions
+        is_include_all_mode = hasattr(session, 'include_all_internet_questions') and session.include_all_internet_questions
+        total_questions_flow = 5 if is_selection_mode else 4
+        
+        # Universal commands
         if user_input.upper().strip() == 'A':
-            # Accept questions - store them and move to testing phase
             await self._store_accepted_questions(session)
             return await self._test_questions(session)
         elif user_input.upper().strip() == 'R':
-            # Revise questions
             return await self._revise_questions(session)
         elif user_input.upper().strip() == 'M':
-            # Generate more questions
             return await self._generate_more_questions(session)
         elif user_input.upper().strip() == 'B':
-            # Back to menu - reset questionnaire responses
             session.questionnaire_responses = {}
             return await self._start_questionnaire_builder(session)
         
-        # Handle step-by-step questionnaire building
+        # Handle first question differently based on mode
         if 'total_questions' not in session.questionnaire_responses:
-            # This is the response to Question 1 (total questions)
             try:
-                # Extract number from response
                 import re
                 numbers = re.findall(r'\d+', user_input)
                 if numbers:
-                    total_questions = min(int(numbers[0]), 25)  # Cap at 25
-                    session.questionnaire_responses['total_questions'] = total_questions
+                    number_value = min(int(numbers[0]), 25)  # Cap at 25
                     
-                    return f"""
+                    if is_include_all_mode:
+                        # Y option - this is ADDITIONAL questions
+                        session.questionnaire_responses['additional_questions'] = number_value
+                        total_final = len(session.internet_questions or []) + number_value
+                        session.questionnaire_responses['total_questions'] = number_value  # For generation purposes
+                        
+                        return f"""
     **Question 2 of 4: Question Types Breakdown**
-    How would you like to distribute the {total_questions} questions?
+    You will have {len(session.internet_questions or [])} internet questions + {number_value} additional questions = **{total_final} total questions**.
+
+    How would you like to distribute the {number_value} ADDITIONAL questions?
+
+    Examples:
+    - "3 demographic, 2 general, 0 open-ended" (for 5 additional)
+    - "no demographic, 8 general, 2 open-ended" (for 10 additional)
+    - "all general questions" (for any additional count)
+
+    **Question Types:**
+    - **Demographic**: Age, gender, education, income, location
+    - **General**: Satisfaction, rating, frequency, importance (Likert scales)
+    - **Open-ended**: What, why, suggestions, feelings
+
+    Please specify your question breakdown for the {number_value} ADDITIONAL questions:
+    """
+                    else:
+                        # S or A option - this is total questions
+                        session.questionnaire_responses['total_questions'] = number_value
+                        
+                        if is_selection_mode:
+                            return f"""
+    **Question 2 of 5: Select Internet Questions**
+    Please enter the question numbers from the internet-generated questions you want to include AS EXTRAS.
+
+    **Available Questions:**
+    {chr(10).join(f'{i+1}. {q}' for i, q in enumerate(session.internet_questions or []))}
+
+    **Note:** Your selected questions will be ADDED to the {number_value} questions we'll generate.
+
+    Enter the question numbers separated by spaces (e.g., "1 3 5 7"):
+    """
+                        else:
+                            return f"""
+    **Question 2 of 4: Question Types Breakdown**
+    How would you like to distribute the {number_value} questions?
 
     Examples:
     - "5 demographic, 3 general, 2 open-ended" (for 10 total)
-    - "3 demographic, 7 general, 5 open-ended" (for 15 total)
-    - "no demographic, 8 general, 2 open-ended" (for 10 total)
     - "all general questions" (for any total)
 
     **Question Types:**
@@ -1062,82 +1405,119 @@ Please respond with:
     Please specify your question breakdown:
     """
                 else:
-                    return """
-    Please provide a number for the total questions.
-    Examples: "10 questions", "15", "20 questions total"
+                    label = "ADDITIONAL" if is_include_all_mode else "total"
+                    return f"""
+    Please provide a number for the {label} questions.
+    Examples: "10 questions", "15", "5 additional"
 
-    Please specify the total number of questions:
+    Please specify the number of {label} questions:
     """
             except Exception as e:
-                return """
-    Please provide a valid number for the total questions.
-    Examples: "10 questions", "15", "20 questions total"
+                label = "ADDITIONAL" if is_include_all_mode else "total"
+                return f"""
+    Please provide a valid number for the {label} questions.
 
-    Please specify the total number of questions:
+    Please specify the number of {label} questions:
     """
         
+        # Handle selection step (S option only)
+        elif is_selection_mode and 'selected_question_numbers' not in session.questionnaire_responses:
+            try:
+                import re
+                numbers = re.findall(r'\d+', user_input)
+                selected_numbers = [int(num) for num in numbers if 1 <= int(num) <= len(session.internet_questions or [])]
+                
+                if not selected_numbers:
+                    return f"""
+    Please enter valid question numbers from 1 to {len(session.internet_questions or [])}.
+
+    **Available Questions:**
+    {chr(10).join(f'{i+1}. {q}' for i, q in enumerate(session.internet_questions or []))}
+
+    Enter the question numbers separated by spaces:
+    """
+                
+                session.questionnaire_responses['selected_question_numbers'] = selected_numbers
+                selected_questions = [session.internet_questions[i-1] for i in selected_numbers]
+                session.questionnaire_responses['selected_questions'] = selected_questions
+                
+                base_questions = session.questionnaire_responses['total_questions']
+                total_final = base_questions + len(selected_questions)
+                
+                return f"""
+    **Question 3 of 5: Question Types Breakdown**
+    You have selected {len(selected_questions)} questions as extras.
+
+    **Final Survey Structure:**
+    - Base questions to generate: {base_questions}
+    - Selected extras: {len(selected_questions)}
+    - **Total final questions: {total_final}**
+
+    How would you like to distribute the {base_questions} BASE questions?
+
+    Please specify your question breakdown for the {base_questions} BASE questions:
+    """
+            except Exception as e:
+                return f"""
+    Please enter valid question numbers.
+    """
+        
+        # Handle question breakdown
         elif 'question_breakdown' not in session.questionnaire_responses:
-            # This is the response to Question 2 (question breakdown)
             session.questionnaire_responses['question_breakdown'] = user_input.strip()
             
-            return """
-    **Question 3 of 4: Survey Length**
+            next_q = 3 if is_include_all_mode else (4 if is_selection_mode else 3)
+            total_q = 4 if is_include_all_mode else (5 if is_selection_mode else 4)
+            
+            return f"""
+    **Question {next_q} of {total_q}: Survey Length**
     How long should the survey take to complete?
 
     Examples:
     - "under 5 minutes"
-    - "under 10 minutes"
+    - "under 10 minutes"  
     - "under 15 minutes"
-    - "10-15 minutes"
 
     Please specify the target completion time:
     """
         
         elif 'survey_length' not in session.questionnaire_responses:
-            # This is the response to Question 3 (survey length)
             session.questionnaire_responses['survey_length'] = user_input.strip()
             
-            return """
-    **Question 4 of 4: Target Audience Style**
+            next_q = 4 if is_include_all_mode else (5 if is_selection_mode else 4)
+            total_q = 4 if is_include_all_mode else (5 if is_selection_mode else 4)
+            
+            return f"""
+    **Question {next_q} of {total_q}: Target Audience Style**
     What audience style should the questions use?
 
     Examples:
     - "general audience"
     - "senior-friendly"
     - "mobile-friendly"
-    - "student-friendly"
-    - "business professional"
 
     Please specify the audience style:
     """
         
         elif 'audience_style' not in session.questionnaire_responses:
-            # This is the response to Question 4 (audience style) - final question
             session.questionnaire_responses['audience_style'] = user_input.strip()
-            
-            # Now generate questions with the collected specifications
             return await self._generate_questions_from_specifications(session)
         
         else:
-            # All questions have been answered - this shouldn't happen
-            return "All questionnaire specifications have been completed. Please proceed with question generation."
+            return "All questionnaire specifications completed."
 
-    async def _generate_questions_from_specifications(self, session: ResearchDesign) -> str:
-        """Generate questions based on collected specifications"""
+    async def _generate_ai_questions(self, session: ResearchDesign, count: int, breakdown: str, survey_length: str, audience_style: str) -> list:
+        """Generate AI questions with specified count and breakdown"""
         
-        # Extract specifications
-        total_questions = session.questionnaire_responses['total_questions']
-        breakdown = session.questionnaire_responses['question_breakdown'].lower()
-        survey_length = session.questionnaire_responses['survey_length']
-        audience_style = session.questionnaire_responses['audience_style']
+        if count <= 0:
+            return []
         
-        # Parse question breakdown
+        # Parse breakdown
         import re
         demographic_count = 0
         general_count = 0
         open_ended_count = 0
         
-        # Extract numbers for each type
         if "no demographic" in breakdown or "0 demographic" in breakdown:
             demographic_count = 0
         else:
@@ -1146,7 +1526,7 @@ Please respond with:
                 demographic_count = int(demo_match.group(1))
         
         if "all general" in breakdown:
-            general_count = total_questions - demographic_count - open_ended_count
+            general_count = count - demographic_count - open_ended_count
         else:
             general_match = re.search(r'(\d+)\s+general', breakdown)
             if general_match:
@@ -1159,100 +1539,165 @@ Please respond with:
             if open_match:
                 open_ended_count = int(open_match.group(1))
         
-        # If breakdown doesn't add up to total, adjust general questions
+        # Adjust if breakdown doesn't add up
         current_total = demographic_count + general_count + open_ended_count
-        if current_total != total_questions:
-            general_count = total_questions - demographic_count - open_ended_count
-            general_count = max(0, general_count)  # Don't go negative
+        if current_total != count:
+            general_count = count - demographic_count - open_ended_count
+            general_count = max(0, general_count)
         
-        # Generate questions with strict count control
+        # Generate questions
         prompt = f"""
-    Generate EXACTLY {total_questions} survey questions for this research:
+    Generate EXACTLY {count} survey questions for this research:
 
     Research Topic: {session.research_topic}
     Target Population: {session.target_population}
 
-    STRICT REQUIREMENTS:
-    - EXACTLY {total_questions} questions total (no more, no less)
+    REQUIREMENTS:
+    - EXACTLY {count} questions total
     - EXACTLY {demographic_count} demographic questions
-    - EXACTLY {general_count} general questions (satisfaction, rating, frequency, Likert scales)
+    - EXACTLY {general_count} general questions
     - EXACTLY {open_ended_count} open-ended questions
     - Completion time: {survey_length}
     - Audience: {audience_style}
 
-    CRITICAL INSTRUCTIONS:
-    1. Generate questions in this exact order: demographic first, then general, then open-ended
-    2. Number each question (1., 2., 3., etc.)
-    3. Each question must end with a question mark
-    4. Return ONLY the numbered questions, nothing else
-    5. Do not exceed {total_questions} questions under any circumstances
-
-    Generate exactly {total_questions} questions now:
+    Return ONLY the numbered questions, nothing else.
     """
         
         try:
             response = await self.llm.ask(prompt, temperature=0.6)
             cleaned_response = remove_chinese_and_punct(str(response))
             
-            # Parse questions with strict counting
+            # Parse questions
             lines = cleaned_response.split('\n')
             questions = []
             
             for line in lines:
                 line = line.strip()
-                
-                # Skip empty lines and instructional text
                 if not line or len(line) < 10:
                     continue
-                
-                # Skip lines that are clearly not questions
-                if any(skip_word in line.lower() for skip_word in [
-                    'note:', 'requirements:', 'instructions:', 'demographic:', 'general:', 'open-ended:',
-                    'exactly', 'total', 'questions:', 'generate', 'critical', 'strict'
-                ]):
+                    
+                # Skip instructional text
+                if any(skip in line.lower() for skip in ['note:', 'requirements:', 'instructions:']):
                     continue
                 
-                # Extract clean question
+                # Clean question
                 clean_line = re.sub(r'^[\d\.\-\•\*\s]*', '', line).strip()
                 
                 if clean_line and len(clean_line) > 15:
-                    # Ensure question ends with ?
                     if not clean_line.endswith('?'):
                         clean_line += '?'
-                    
                     questions.append(clean_line)
                     
-                    # STRICT LIMIT: Stop when we reach the target
-                    if len(questions) >= total_questions:
+                    if len(questions) >= count:
                         break
             
-            # CRITICAL: Ensure exactly the requested number
-            if len(questions) > total_questions:
-                questions = questions[:total_questions]
-            elif len(questions) < total_questions:
-                # Generate basic questions to fill the gap
-                needed = total_questions - len(questions)
+            # Ensure exact count
+            if len(questions) > count:
+                questions = questions[:count]
+            elif len(questions) < count:
+                # Fill with basic questions
+                needed = count - len(questions)
                 for i in range(needed):
                     questions.append(f"How satisfied are you with {session.research_topic}?")
             
-            # Store the questions
-            session.questions = questions
+            return questions
             
-            logger.info(f"Generated exactly {len(session.questions)} questions as requested")
+        except Exception as e:
+            logger.error(f"Error generating AI questions: {e}")
+            # Return basic fallback questions
+            return [f"How satisfied are you with {session.research_topic}?" for _ in range(count)]
+
+    async def _generate_questions_from_specifications(self, session: ResearchDesign) -> str:
+        """Generate questions based on specifications - handling all decision modes"""
+        
+        # Determine which mode we're in
+        is_selection_mode = hasattr(session, 'selected_internet_questions') and session.selected_internet_questions
+        is_include_all_mode = hasattr(session, 'include_all_internet_questions') and session.include_all_internet_questions
+        
+        # Get basic specifications
+        breakdown = session.questionnaire_responses['question_breakdown'].lower()
+        survey_length = session.questionnaire_responses['survey_length']
+        audience_style = session.questionnaire_responses['audience_style']
+        
+        if is_include_all_mode:
+            # Y option: ALL internet questions + additional generated questions
+            questions_to_generate = session.questionnaire_responses.get('total_questions', 0)  # This is additional count
+            all_internet_questions = session.internet_questions or []
             
-            return f"""
+        elif is_selection_mode:
+            # S option: Selected questions + generated questions
+            selected_questions = session.questionnaire_responses.get('selected_questions', [])
+            questions_to_generate = session.questionnaire_responses['total_questions']
+            
+        else:
+            # A option: Only generated questions
+            questions_to_generate = session.questionnaire_responses['total_questions']
+        
+        # Generate the required questions
+        if questions_to_generate > 0:
+            generated_questions = await self._generate_ai_questions(
+                session, questions_to_generate, breakdown, survey_length, audience_style
+            )
+        else:
+            generated_questions = []
+        
+        # Combine questions based on mode
+        if is_include_all_mode:
+            # Y option: Internet questions + generated questions
+            final_questions = (session.internet_questions or []) + generated_questions
+            
+            display_info = f"""**All Internet Questions ({len(session.internet_questions or [])}):**
+    {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(session.internet_questions or []))}
+
+    {"**Additional Generated Questions (" + str(len(generated_questions)) + "):**" if generated_questions else "**No Additional Questions Generated**"}
+    {chr(10).join(f"{i+len(session.internet_questions or [])+1}. {q}" for i, q in enumerate(generated_questions)) if generated_questions else ""}
+
+    **Total Questions: {len(final_questions)}** ({len(session.internet_questions or [])} internet + {len(generated_questions)} generated)
+    """
+            specs_info = f"""- Internet questions: {len(session.internet_questions or [])} (all included)
+    - Additional generated: {len(generated_questions)}
+    - Final total: {len(final_questions)}"""
+            
+        elif is_selection_mode:
+            # S option: Generated questions + selected questions as extras
+            selected_questions = session.questionnaire_responses.get('selected_questions', [])
+            final_questions = generated_questions + selected_questions
+            
+            display_info = f"""**Generated Questions ({len(generated_questions)}):**
+    {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(generated_questions))}
+
+    **Selected Internet Questions Added as Extras ({len(selected_questions)}):**
+    {chr(10).join(f"{i+len(generated_questions)+1}. {q}" for i, q in enumerate(selected_questions))}
+
+    **Total Questions: {len(final_questions)}** ({len(generated_questions)} generated + {len(selected_questions)} selected extras)
+    """
+            specs_info = f"""- Generated questions: {len(generated_questions)}
+    - Selected extras: {len(selected_questions)}
+    - Final total: {len(final_questions)}"""
+            
+        else:
+            # A option: Only generated questions
+            final_questions = generated_questions
+            
+            display_info = f"""**Generated Questions ({len(generated_questions)} total):**
+    {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(generated_questions))}
+    """
+            specs_info = f"""- Total questions: {len(final_questions)}"""
+        
+        # Store final questions
+        session.questions = final_questions
+        
+        logger.info(f"Created {len(final_questions)} total questions in mode: {'include_all' if is_include_all_mode else 'selection' if is_selection_mode else 'ai_only'}")
+        
+        return f"""
     ⚙️ **Questions Generated with Your Specifications**
 
     **Applied Specifications:**
-    - Total questions: {total_questions}
-    - Demographic questions: {demographic_count}
-    - General questions: {general_count}
-    - Open-ended questions: {open_ended_count}
+    {specs_info}
     - Target time: {survey_length}
     - Audience: {audience_style}
 
-    **Generated Questions ({len(session.questions)} total):**
-    {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(session.questions))}
+    {display_info}
 
     ---
 
@@ -1261,18 +1706,6 @@ Please respond with:
     - **R** (Revise) - Request modifications to the questions
     - **M** (More) - Generate additional questions
     - **B** (Back) - Return to questionnaire builder menu
-    """
-            
-        except Exception as e:
-            logger.error(f"Error generating questions: {e}")
-            return f"""
-    ❌ **Error Generating Questions**
-
-    There was an issue generating questions: {str(e)}
-
-    Please try again:
-    - **B** (Back) - Return to questionnaire builder menu
-    - **R** (Revise) - Try generating questions again
     """
 
     async def _set_limits(self, session: ResearchDesign) -> str:
@@ -1377,55 +1810,75 @@ Format each as a clear, complete survey question. Respond in English only.
         # Move to final output stage
         session.stage = ResearchStage.FINAL_OUTPUT
         
-        # Prepare all questions for testing
-        all_test_questions = []
+        # Use all questions stored in session.questions (which now includes both generated + selected)
+        all_test_questions = session.questions or []
         
-        if session.use_internet_questions and session.internet_questions:
-            all_test_questions.extend(session.internet_questions)
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_questions = []
+        for q in all_test_questions:
+            if q not in seen:
+                seen.add(q)
+                unique_questions.append(q)
         
-        if session.questions:
-            all_test_questions.extend(session.questions)
+        all_test_questions = unique_questions
         
         try:
             # Generate synthetic respondent feedback using LLM
             synthetic_feedback = await self._generate_synthetic_respondent_feedback_all(session, all_test_questions)
             
+            # Determine description based on selection mode
+            selection_info = ""
+            if (hasattr(session, 'selected_internet_questions') and 
+                session.selected_internet_questions and 
+                session.questionnaire_responses and 
+                'selected_questions' in session.questionnaire_responses):
+                
+                selected_count = len(session.questionnaire_responses['selected_questions'])
+                base_count = session.questionnaire_responses['total_questions']
+                selection_info = f"({base_count} generated questions + {selected_count} selected extras)"
+            elif session.use_internet_questions:
+                internet_count = len([q for q in all_test_questions if q in (session.internet_questions or [])])
+                ai_count = len(all_test_questions) - internet_count
+                selection_info = f"({ai_count} AI generated + {internet_count} internet research questions)"
+            else:
+                selection_info = "(AI generated questions only)"
+            
             return f"""
-🧪 **Testing Questionnaire with Synthetic Respondents**
+    🧪 **Testing Questionnaire with Synthetic Respondents**
 
-Running simulation with 5 diverse synthetic respondents matching your target population...
+    Running simulation with 5 diverse synthetic respondents matching your target population...
 
-**Testing {len(all_test_questions)} total questions**
-{"(Including " + str(len(session.internet_questions or [])) + " internet research questions + " + str(len(session.questions or [])) + " AI generated questions)" if session.use_internet_questions else "(AI generated questions only)"}
+    **Testing {len(all_test_questions)} total questions**
+    {selection_info}
 
-{synthetic_feedback}
+    {synthetic_feedback}
 
----
+    ---
 
-**Are you satisfied with the questionnaire?**
-- **Y** (Yes) - Finalize and export complete research package
-- **N** (No) - Make additional modifications
-- **T** (Test Again) - Run another round of testing
-"""
+    **Are you satisfied with the questionnaire?**
+    - **Y** (Yes) - Finalize and export complete research package
+    - **N** (No) - Make additional modifications
+    - **T** (Test Again) - Run another round of testing
+    """
         except Exception as e:
             logger.error(f"Error in synthetic testing: {e}")
-            # Fallback to basic testing if AI simulation fails
             return f"""
-🧪 **Testing Questionnaire with Synthetic Respondents**
+    🧪 **Testing Questionnaire with Synthetic Respondents**
 
-**Test Results:**
-✅ **Question Clarity**: All {len(all_test_questions)} questions are clear and understandable
-✅ **Response Time**: Estimated completion time: 8-12 minutes  
-✅ **Flow Logic**: Question sequence flows logically
-✅ **Response Validation**: All answer options are appropriate
+    **Test Results:**
+    ✅ **Question Clarity**: All {len(all_test_questions)} questions are clear and understandable
+    ✅ **Response Time**: Estimated completion time: 8-12 minutes  
+    ✅ **Flow Logic**: Question sequence flows logically
+    ✅ **Response Validation**: All answer options are appropriate
 
----
+    ---
 
-**Are you satisfied with the questionnaire?**
-- **Y** (Yes) - Finalize and export complete research package
-- **N** (No) - Make additional modifications
-- **T** (Test Again) - Run another round of testing
-"""
+    **Are you satisfied with the questionnaire?**
+    - **Y** (Yes) - Finalize and export complete research package
+    - **N** (No) - Make additional modifications
+    - **T** (Test Again) - Run another round of testing
+    """
     
     async def _generate_synthetic_respondent_feedback_all(self, session: ResearchDesign, all_questions: List[str]) -> str:
         """Generate realistic synthetic respondent feedback using AI for all questions"""
@@ -1776,12 +2229,248 @@ def save_comprehensive_response(query: str, agent_response: str, agent_messages:
     except Exception as e:
         print(f"Error saving response: {e}")
 
+# Screenshot capture utilities with multiple fallback methods
+async def capture_url_screenshot(url: str, browser_tool) -> Optional[str]:
+    """Capture screenshot of a URL using browser automation with multiple fallback methods"""
+    try:
+        print(f"📸 Capturing screenshot of: {url}")
+        
+        # Ensure URL has proper protocol
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        
+        screenshot_base64 = None
+        
+        # Method 1: Try using browser tool's built-in screenshot capability
+        try:
+            if hasattr(browser_tool, 'take_screenshot'):
+                print("Trying Method 1: Direct screenshot method")
+                await browser_tool.navigate(url)
+                screenshot_base64 = await browser_tool.take_screenshot()
+            elif hasattr(browser_tool, 'screenshot'):
+                print("Trying Method 1b: Direct screenshot property")
+                await browser_tool.navigate(url)
+                screenshot_base64 = browser_tool.screenshot
+        except Exception as e:
+            print(f"Method 1 failed: {e}")
+        
+        # Method 2: Try using action-based interface
+        if not screenshot_base64:
+            try:
+                print("Trying Method 2: Action-based interface")
+                if hasattr(browser_tool, 'execute'):
+                    action = f"""
+                    Navigate to {url} and wait for page to fully load.
+                    Wait at least 2 seconds for content to render.
+                    Take a screenshot of the entire page content, not loading screens.
+                    """
+                    result = await browser_tool.execute(action)
+                    
+                    # Extract screenshot from various result formats
+                    if hasattr(result, 'screenshot'):
+                        screenshot_base64 = result.screenshot
+                    elif isinstance(result, dict) and 'screenshot' in result:
+                        screenshot_base64 = result['screenshot']
+                    elif isinstance(result, dict) and 'base64_image' in result:
+                        screenshot_base64 = result['base64_image']
+                    elif hasattr(result, 'output') and hasattr(result.output, 'screenshot'):
+                        screenshot_base64 = result.output.screenshot
+            except Exception as e:
+                print(f"Method 2 failed: {e}")
+        
+        # Method 3: Try using LLM-based browser tool call
+        if not screenshot_base64:
+            try:
+                print("Trying Method 3: LLM-based tool call")
+                if hasattr(browser_tool, 'call'):
+                    action_text = f"Navigate to {url} and capture a screenshot of the page"
+                    result = await browser_tool.call(action_text)
+                    
+                    if hasattr(result, 'screenshot'):
+                        screenshot_base64 = result.screenshot
+                    elif isinstance(result, dict) and 'screenshot' in result:
+                        screenshot_base64 = result['screenshot']
+                    elif isinstance(result, str) and len(result) > 100:
+                        # Might be base64 encoded
+                        screenshot_base64 = result
+            except Exception as e:
+                print(f"Method 3 failed: {e}")
+        
+        # Method 4: Try using ToolCall interface (for BrowserUseTool)
+        if not screenshot_base64:
+            try:
+                print("Trying Method 4: ToolCall interface")
+                from app.schema import ToolCall
+                
+                # Create a tool call for browser use
+                tool_call = ToolCall(
+                    function=type('Function', (), {
+                        'name': 'browser_use',
+                        'arguments': json.dumps({
+                            'action': f'Go to {url} and take a screenshot of the page'
+                        })
+                    })()
+                )
+                
+                result = await browser_tool.execute(tool_call)
+                
+                # Try to extract screenshot from result
+                if hasattr(result, 'output'):
+                    if hasattr(result.output, 'screenshot'):
+                        screenshot_base64 = result.output.screenshot
+                    elif isinstance(result.output, dict) and 'screenshot' in result.output:
+                        screenshot_base64 = result.output['screenshot']
+                    elif isinstance(result.output, str) and 'data:image' in result.output:
+                        # Extract base64 from data URI
+                        screenshot_base64 = result.output.split(',')[1] if ',' in result.output else result.output
+                elif hasattr(result, 'screenshot'):
+                    screenshot_base64 = result.screenshot
+                elif isinstance(result, dict) and 'screenshot' in result:
+                    screenshot_base64 = result['screenshot']
+                    
+            except Exception as e:
+                print(f"Method 4 failed: {e}")
+        
+        # Method 5: Try playwright fallback if available
+        if not screenshot_base64:
+            try:
+                print("Trying Method 5: Playwright fallback")
+                screenshot_base64 = await capture_screenshot_with_playwright(url)
+            except Exception as e:
+                print(f"Method 5 failed: {e}")
+        
+        # Validate and return screenshot
+        if screenshot_base64:
+            print(f"✅ Screenshot captured successfully")
+            # Ensure it's proper base64 format
+            if isinstance(screenshot_base64, str) and len(screenshot_base64) > 100:
+                # Remove data URI prefix if present
+                if screenshot_base64.startswith('data:image'):
+                    screenshot_base64 = screenshot_base64.split(',')[1]
+                return screenshot_base64
+            elif isinstance(screenshot_base64, bytes):
+                return base64.b64encode(screenshot_base64).decode('utf-8')
+        
+        print(f"❌ No screenshot captured with any method")
+        return None
+            
+    except Exception as e:
+        print(f"❌ Error capturing screenshot: {e}")
+        return None
+
+async def simple_screenshot_validation(screenshot_base64: str, url: str) -> bool:
+    """Simple validation to check if screenshot has content"""
+    try:
+        # Check base64 string length
+        if len(screenshot_base64) < 10000:  # Less than ~7KB
+            print(f"❌ Screenshot too small for {url}")
+            return False
+        
+        # Check decoded data size
+        image_data = base64.b64decode(screenshot_base64)
+        if len(image_data) < 5000:  # Less than 5KB
+            print(f"❌ Image data too small for {url}")
+            return False
+        
+        # Check byte diversity (blank images have few unique bytes)
+        data_sample = image_data[:1000]
+        unique_bytes = len(set(data_sample))
+        if unique_bytes < 20:
+            print(f"❌ Low byte diversity for {url}")
+            return False
+            
+        print(f"✅ Basic validation passed for {url}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error validating {url}: {e}")
+        return False
+
+async def capture_screenshot_with_retry(url: str, browser_tool, max_retries: int = 2) -> Optional[str]:
+    """Capture screenshot with validation and retry"""
+    for attempt in range(max_retries + 1):
+        try:
+            # Progressive wait time for page loading
+            wait_time = 2 + (attempt * 2)  # 2s, 4s, 6s
+            await asyncio.sleep(wait_time)
+            
+            screenshot_base64 = await capture_url_screenshot(url, browser_tool)
+            
+            if screenshot_base64:
+                is_valid = await simple_screenshot_validation(screenshot_base64, url)
+                if is_valid:
+                    return screenshot_base64
+            
+            print(f"❌ Attempt {attempt + 1} failed, retrying...")
+            
+        except Exception as e:
+            print(f"❌ Error on attempt {attempt + 1}: {e}")
+    
+    return None
+
+async def capture_google_search_screenshot(query: str, browser_tool) -> Optional[str]:
+    """Capture screenshot of Google search results"""
+    try:
+        print(f"📸 Capturing Google search screenshot for: {query}")
+        
+        # Construct Google search URL
+        encoded_query = urllib.parse.quote_plus(query)
+        google_search_url = f"https://www.google.com/search?q={encoded_query}"
+        
+        # Use the same screenshot capture method as URL capture
+        screenshot_base64 = await capture_url_screenshot(google_search_url, browser_tool)
+        
+        if screenshot_base64:
+            print(f"✅ Google search screenshot captured successfully")
+            return screenshot_base64
+        else:
+            print(f"❌ Failed to capture Google search screenshot")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Error capturing Google search screenshot: {e}")
+        return None
+
+async def capture_screenshot_with_playwright(url: str) -> Optional[str]:
+    """Fallback method using playwright for screenshot capture"""
+    try:
+        from playwright.async_api import async_playwright
+        
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            
+            # Set viewport size
+            await page.set_viewport_size({"width": 1200, "height": 800})
+            
+            # Navigate to URL
+            await page.goto(url, wait_until="networkidle")
+            
+            # Take screenshot
+            screenshot_bytes = await page.screenshot(full_page=False)
+            
+            # Convert to base64
+            screenshot_base64 = base64.b64encode(screenshot_bytes).decode('utf-8')
+            
+            await browser.close()
+            
+            print(f"✅ Playwright screenshot captured for {url}")
+            return screenshot_base64
+            
+    except ImportError:
+        print("Playwright not available. Install with: pip install playwright")
+        return None
+    except Exception as e:
+        print(f"Playwright screenshot failed: {e}")
+        return None
 
 async def process_message_with_direct_scraping(agent, message: str, max_timeout: int = 400):
-    """Process message with direct scraping and chunked LLM processing."""
+    """Process message with direct scraping and OCR-based screenshot validation."""
     screenshot_base64 = None
+    detected_url = None
+    
     try:
-        # Enhanced URL detection
+        # URL detection
         urls = []
         full_url_pattern = r'https?://[^\s]+'
         full_urls = re.findall(full_url_pattern, message)
@@ -1806,6 +2495,63 @@ async def process_message_with_direct_scraping(agent, message: str, max_timeout:
             if not url.startswith(('http://', 'https://')):
                 url = 'https://' + url
             print(f"🔗 URL detected and normalized: {url}")
+            
+            detected_url = url
+            
+            # SCREENSHOT CAPTURE WITH OCR VALIDATION
+            try:
+                if hasattr(agent, 'tools'):
+                    browser_tool = None
+                    
+                    # Get browser tool
+                    if hasattr(agent.tools, 'browser_use_tool'):
+                        browser_tool = agent.tools.browser_use_tool
+                    elif hasattr(agent.tools, 'browser_use'):
+                        browser_tool = agent.tools.browser_use
+                    elif hasattr(agent.tools, 'tools'):
+                        for tool in agent.tools.tools:
+                            if 'browser' in str(type(tool)).lower():
+                                browser_tool = tool
+                                break
+                    
+                    if browser_tool:
+                        print("🔧 Browser tool found, attempting screenshot with OCR validation")
+                        
+                        # Try up to 2 attempts
+                        max_attempts = 2
+                        for attempt in range(max_attempts):
+                            print(f"📸 Screenshot attempt {attempt + 1}/{max_attempts}")
+                            
+                            # Wait for page to load
+                            wait_time = 5 + (attempt * 3)  # 5s, 8s
+                            await asyncio.sleep(wait_time)
+                            
+                            temp_screenshot = await capture_url_screenshot(url, browser_tool)
+                            
+                            if temp_screenshot:
+                                # OCR-based validation
+                                is_valid = await validate_screenshot_content(temp_screenshot, url)
+                                if is_valid:
+                                    screenshot_base64 = temp_screenshot
+                                    print(f"✅ Valid screenshot with meaningful content captured on attempt {attempt + 1}")
+                                    break
+                                else:
+                                    print(f"❌ Screenshot shows error/blocked page on attempt {attempt + 1}")
+                            else:
+                                print(f"❌ No screenshot captured on attempt {attempt + 1}")
+                            
+                            if attempt < max_attempts - 1:
+                                await asyncio.sleep(2)
+                        
+                        if not screenshot_base64:
+                            print("⚠️ All screenshot attempts failed OCR validation - page appears blocked/error")
+                    else:
+                        print("⚠️ No browser tool found")
+                        
+            except Exception as e:
+                print(f"⚠️ Screenshot capture failed: {e}")
+            
+            # Content scraping (always attempt)
             scraped_content = scrape_page_content(url)
             
             if scraped_content and not scraped_content.startswith("Error"):
@@ -1823,27 +2569,29 @@ COMPLETE SCRAPED CONTENT:
 Based on this content, address the user's prompt in English only and within 300 words by avoiding unnecessary spaces. Strictly do not include any other language.
 """
                 raw = await asyncio.wait_for(
-                    agent.llm.ask(enhanced_message,
-                    temperature=0.7),
+                    agent.llm.ask(enhanced_message, temperature=0.7),
                     timeout=max_timeout
                 )
                 response = annotate_invalid_links(str(raw))
                 response = remove_chinese_and_punct(response)
             else:
-                print(f"❌ Scraping failed: {scraped_content}")
+                print(f"❌ Content scraping failed for {url}")
+                # Add note about access being blocked
+                blocked_message = f"""
+{message}
+
+Note: The website {url} appears to be blocking access. I was unable to retrieve meaningful content for analysis.
+"""
                 raw = await asyncio.wait_for(
-                    agent.llm.ask(message,
-                    temperature=0.7),
+                    agent.llm.ask(blocked_message, temperature=0.7),
                     timeout=max_timeout
                 )
                 response = annotate_invalid_links(str(raw))
                 response = remove_chinese_and_punct(response)
         else:
-            print("ℹ️ No URL detected in message, processing with direct response")
-            # Use direct response generation
+            # No URL detected
             raw = await asyncio.wait_for(
-                agent.llm.ask(message,
-                temperature=0.7),
+                agent.llm.ask(message, temperature=0.7),
                 timeout=max_timeout
             )
             response = annotate_invalid_links(str(raw))
@@ -1860,10 +2608,12 @@ Based on this content, address the user's prompt in English only and within 300 
         
         return {
             "response": str(response) if response else "No response generated",
-            "base64_image": screenshot_base64
+            "base64_image": screenshot_base64,  # Only valid screenshots
+            "source_url": detected_url,
+            "screenshot_validated": screenshot_base64 is not None
         }
         
-    except AsyncTimeoutError:
+    except asyncio.TimeoutError:
         print(f"Agent execution timed out after {max_timeout} seconds")
         
         # Extract the best available response from memory
@@ -1874,26 +2624,20 @@ Based on this content, address the user's prompt in English only and within 300 
             for msg in agent.memory.messages:
                 if hasattr(msg, 'role') and msg.role == 'assistant' and hasattr(msg, 'content'):
                     content = str(msg.content)
-                    if len(content) > 100:  # Only consider substantial responses
+                    if len(content) > 100:
                         assistant_responses.append(content)
             
             if assistant_responses:
-                # Get the longest response or combine multiple if needed
                 longest_response = max(assistant_responses, key=len)
-                
                 if len(longest_response) > 300:
-                    best_response = f"Partial response (timed out):\n\n{longest_response}"
-                elif len(assistant_responses) > 1:
-                    # Combine multiple responses
-                    combined = "\n\n---\n\n".join(assistant_responses[-2:])
-                    best_response = f"Partial response (timed out):\n\n{combined}"
-                else:
                     best_response = f"Partial response (timed out):\n\n{longest_response}"
         
         save_comprehensive_response(message, best_response, is_partial=True)
         return {
             "response": best_response,
-            "base64_image": screenshot_base64
+            "base64_image": None,
+            "source_url": detected_url,
+            "screenshot_validated": False
         }
     
     except Exception as e:
@@ -1902,9 +2646,173 @@ Based on this content, address the user's prompt in English only and within 300 
         save_comprehensive_response(message, error_msg, is_error=True)
         return {
             "response": error_msg,
-            "base64_image": screenshot_base64
+            "base64_image": None,
+            "source_url": detected_url,
+            "screenshot_validated": False
         }
 
+
+async def validate_screenshot_content(screenshot_base64: str, url: str) -> bool:
+    """
+    Simple OCR-based validation to detect error pages by reading text content
+    Returns True if screenshot contains valid website content, False for error pages
+    """
+    try:
+        # Basic size check first
+        if len(screenshot_base64) < 5000:
+            print(f"❌ Screenshot too small for {url}")
+            return False
+        
+        # Decode and convert to PIL Image
+        image_data = base64.b64decode(screenshot_base64)
+        image = Image.open(io.BytesIO(image_data))
+        
+        print(f"🔍 Reading text from screenshot for {url}...")
+        
+        # Extract text using OCR
+        extracted_text = pytesseract.image_to_string(image, config='--psm 6').lower().strip()
+        
+        print(f"📝 Extracted text (first 300 chars): {extracted_text[:300]}")
+        
+        # Define error page indicators
+        error_indicators = [
+            # Access/Permission errors
+            'access denied',
+            'permission denied',
+            'you don\'t have permission',
+            'forbidden',
+            'not authorized',
+            'unauthorized',
+            
+            # HTTP errors
+            '403 forbidden',
+            '404 not found',
+            '500 internal server error',
+            '502 bad gateway',
+            '503 service unavailable',
+            '504 gateway timeout',
+            'page not found',
+            'server error',
+            'internal server error',
+            
+            # Connection errors
+            'this site can\'t be reached',
+            'connection timed out',
+            'connection refused',
+            'dns_probe_finished_nxdomain',
+            'err_connection_refused',
+            'err_connection_timed_out',
+            'unable to connect',
+            'connection failed',
+            
+            # Security/Blocking
+            'blocked by',
+            'access blocked',
+            'security check',
+            'firewall',
+            'your ip has been blocked',
+            'ip blocked',
+            'request blocked',
+            'contact our support',
+            'contact administrator',
+            'contact admin team',
+            
+            # Cloudflare and other services
+            'cloudflare',
+            'ray id:',
+            'cf-ray:',
+            'checking your browser',
+            'security service',
+            'ddos protection',
+            
+            # CAPTCHA and verification
+            'captcha',
+            'verify you are human',
+            'prove you\'re not a robot',
+            'security verification',
+            'human verification',
+            
+            # Maintenance and unavailable
+            'temporarily unavailable',
+            'under maintenance',
+            'site maintenance',
+            'coming soon',
+            'website unavailable',
+            
+            # Reference numbers (common in error pages)
+            'reference #',
+            'reference id',
+            'incident id',
+            'error code',
+            'request id',
+            
+            # Generic error terms
+            'something went wrong',
+            'error occurred',
+            'try again later',
+            'service temporarily',
+            'technical difficulties'
+        ]
+        
+        # Check for error indicators
+        for indicator in error_indicators:
+            if indicator in extracted_text:
+                print(f"❌ Error page detected - found '{indicator}' in screenshot for {url}")
+                return False
+        
+        # Additional checks for minimal content
+        words = extracted_text.split()
+        meaningful_words = [word for word in words if len(word) > 2 and word.isalpha()]
+        
+        if len(meaningful_words) < 10:
+            print(f"❌ Insufficient meaningful content ({len(meaningful_words)} words) for {url}")
+            return False
+        
+        # Check for overly repetitive content (some error pages repeat messages)
+        word_counts = {}
+        for word in meaningful_words:
+            word_counts[word] = word_counts.get(word, 0) + 1
+        
+        if word_counts:
+            max_count = max(word_counts.values())
+            repetition_ratio = max_count / len(meaningful_words)
+            
+            if repetition_ratio > 0.4:  # More than 40% repetition
+                print(f"❌ Overly repetitive content (ratio: {repetition_ratio:.2f}) for {url}")
+                return False
+        
+        # Check for very short content that might be just error messages
+        if len(extracted_text.strip()) < 50:
+            print(f"❌ Very short content ({len(extracted_text)} chars) for {url}")
+            return False
+        
+        # Special check for placeholder pages
+        placeholder_indicators = [
+            'default page',
+            'placeholder',
+            'coming soon',
+            'under construction',
+            'website coming soon',
+            'page under construction'
+        ]
+        
+        for placeholder in placeholder_indicators:
+            if placeholder in extracted_text:
+                print(f"❌ Placeholder page detected - found '{placeholder}' for {url}")
+                return False
+        
+        print(f"✅ Valid content detected for {url} ({len(meaningful_words)} meaningful words)")
+        return True
+        
+    except ImportError:
+        print(f"❌ OCR libraries not installed. Please run: pip install pytesseract pillow")
+        print(f"❌ Also install Tesseract OCR binary for your system")
+        return False
+        
+    except Exception as e:
+        print(f"❌ OCR validation failed for {url}: {e}")
+        # If OCR fails, we'll be conservative and reject the screenshot
+        return False
 
 def detect_user_intent(message: str) -> UserAction:
     """Detect user intent from message with enhanced detection"""
@@ -2046,6 +2954,7 @@ class OpenManusUI:
                 
                 self.agent = Manus(config=config, tools=manus_tools, llm=llm_instance)
                 self.research_workflow = ResearchWorkflow(llm_instance)
+                self.research_workflow.browser_tool = browser_use_tool
                 self.patch_agent_methods()
                 logger.info("Manus agent and Research Workflow initialized successfully on startup.")
             except Exception as e:
@@ -2108,23 +3017,55 @@ class OpenManusUI:
                         content={"response": "Agent not initialized", "status": "error"}
                     )
 
-                # Use provided session ID or create default
                 session_id = request.research_session_id or "default_research_session"
                 
                 # Check if we have an active research session first
                 if session_id in self.research_workflow.active_sessions:
-                    # Continue existing research session
-                    logger.info(f"Continuing research session: {session_id}")
-                    response_content = await self.research_workflow.process_research_input(
-                        session_id, request.content
-                    )
+                    session = self.research_workflow.active_sessions[session_id]
+                    slideshow_data = None
                     
-                    return JSONResponse({
+                    # Special handling for research workflow screenshot capture
+                    if session.stage == ResearchStage.DESIGN_REVIEW and request.content.upper().strip() == 'Y':
+                        # User accepted design and we're about to search - capture URL screenshots
+                        try:
+                            response_content = await self.research_workflow.process_research_input(
+                                session_id, request.content
+                            )
+                            
+                            # Check if we have screenshots to include
+                            if hasattr(session, 'screenshots') and session.screenshots:
+                                slideshow_data = {
+                                    "screenshots": session.screenshots,
+                                    "total_count": len(session.screenshots),
+                                    "research_topic": session.research_topic
+                                }
+                                
+                        except Exception as e:
+                            logger.warning(f"Could not capture screenshots: {e}")
+                            response_content = await self.research_workflow.process_research_input(
+                                session_id, request.content
+                            )
+                    else:
+                        response_content = await self.research_workflow.process_research_input(
+                            session_id, request.content
+                        )
+                    
+                    result = {
                         "response": response_content,
                         "status": "success",
                         "action_type": UserAction.BUILD_QUESTIONNAIRE.value,
                         "session_id": session_id
-                    })
+                    }
+                    
+                    if slideshow_data:
+                        result["slideshow_data"] = slideshow_data
+                        # Also include first screenshot as main browser image
+                        if slideshow_data["screenshots"]:
+                            result["base64_image"] = slideshow_data["screenshots"][0]["screenshot"]
+                            result["image_url"] = slideshow_data["screenshots"][0]["url"]
+                            result["image_title"] = slideshow_data["screenshots"][0]["title"]
+                    
+                    return JSONResponse(result)
 
                 # Determine action type if not provided
                 action_type = request.action_type
@@ -2147,7 +3088,7 @@ class OpenManusUI:
                     })
                 
                 else:
-                    # Handle URL research or general research
+                    # Handle URL research or general research with enhanced screenshot validation
                     response_data = await process_message_with_direct_scraping(
                         self.agent,
                         request.content,
@@ -2157,9 +3098,13 @@ class OpenManusUI:
                     if isinstance(response_data, dict):
                         response_content = response_data.get("response", "")
                         screenshot = response_data.get("base64_image", None)
+                        source_url = response_data.get("source_url", None)
+                        screenshot_validated = response_data.get("screenshot_validated", False)
                     else:
                         response_content = str(response_data)
                         screenshot = None
+                        source_url = None
+                        screenshot_validated = False
                     
                     result = {
                         "response": response_content,
@@ -2169,6 +3114,23 @@ class OpenManusUI:
                     
                     if screenshot:
                         result["base64_image"] = screenshot
+                        result["screenshot_validated"] = screenshot_validated
+                        
+                        # Add source URL info for the Visit Site button
+                        if source_url:
+                            result["source_url"] = source_url
+                            result["image_url"] = source_url
+                            
+                            # Extract domain for title
+                            try:
+                                from urllib.parse import urlparse
+                                parsed = urlparse(source_url)
+                                domain = parsed.netloc
+                                result["image_title"] = f"Screenshot from {domain}"
+                            except:
+                                result["image_title"] = "Website Screenshot"
+                        else:
+                            result["image_title"] = "Screenshot"
                     
                     return JSONResponse(result)
                 
@@ -2217,21 +3179,54 @@ class OpenManusUI:
             return {"message": "Frontend not built yet. Please run 'npm run build' in the frontend directory."}
 
     async def process_message(self, user_message: str, session_id: str = "default", action_type: str = None):
-        """Process a user message via WebSocket."""
+        """Process a user message via WebSocket with enhanced screenshot validation."""
         try:
             if not self.agent:
                 await self.broadcast_message("error", {"message": "Agent not initialized"})
                 return
 
-            # Log current session state for debugging
-            logger.info(f"Processing message for session: {session_id}")
-            logger.info(f"Active sessions: {list(self.research_workflow.active_sessions.keys())}")
-            logger.info(f"Message content: {user_message[:100]}...")
-
             # Check if we have an active research session first
             if session_id in self.research_workflow.active_sessions:
-                # We have an active research session, continue it regardless of intent detection
-                logger.info(f"Active research session found: {session_id}, continuing workflow")
+                session = self.research_workflow.active_sessions[session_id]
+                
+                # Special handling for research workflow - check if we're at the search stage
+                if session.stage == ResearchStage.DESIGN_REVIEW and user_message.upper().strip() == 'Y':
+                    # User accepted design and we're about to search - this will capture URL screenshots
+                    try:
+                        # Process the research input which will capture screenshots of found URLs
+                        response = await self.research_workflow.process_research_input(session_id, user_message)
+                        
+                        # After processing, check if we have screenshots to display
+                        if hasattr(session, 'screenshots') and session.screenshots:
+                            logger.info(f"Broadcasting slideshow with {len(session.screenshots)} screenshots")
+                            
+                            # Send slideshow data to frontend
+                            await self.broadcast_message("slideshow_data", {
+                                "screenshots": session.screenshots,
+                                "total_count": len(session.screenshots),
+                                "research_topic": session.research_topic
+                            })
+                            
+                            # Also send the first screenshot to browser view
+                            if session.screenshots:
+                                await self.broadcast_message("browser_state", {
+                                    "base64_image": session.screenshots[0]['screenshot'],
+                                    "url": session.screenshots[0]['url'],
+                                    "title": session.screenshots[0]['title'],
+                                    "source_url": session.screenshots[0]['url']  # For Visit Site button
+                                })
+                        
+                        await self.broadcast_message("agent_message", {
+                            "content": response,
+                            "action_type": UserAction.BUILD_QUESTIONNAIRE.value,
+                            "session_id": session_id
+                        })
+                        return
+                        
+                    except Exception as e:
+                        logger.warning(f"Could not process research with screenshots: {e}")
+                
+                # Regular research workflow processing
                 response = await self.research_workflow.process_research_input(session_id, user_message)
                 
                 await self.broadcast_message("agent_message", {
@@ -2245,7 +3240,6 @@ class OpenManusUI:
             if not action_type:
                 intent = detect_user_intent(user_message)
                 action_type = intent.value
-                logger.info(f"Detected intent: {action_type} for message: {user_message[:50]}...")
 
             await self.broadcast_message("agent_action", {
                 "action": "Processing",
@@ -2255,7 +3249,6 @@ class OpenManusUI:
             # Handle different action types
             if action_type == UserAction.BUILD_QUESTIONNAIRE.value:
                 # Start new research session  
-                logger.info(f"Starting new research session: {session_id}")
                 response = await self.research_workflow.start_research_design(session_id)
 
                 await self.broadcast_message("agent_message", {
@@ -2265,9 +3258,9 @@ class OpenManusUI:
                 })
 
             else:
-                # Handle URL research or general research (these don't need chat logging)
+                # Handle URL research or general research with enhanced validation
                 if action_type == UserAction.URL_RESEARCH.value or 'http' in user_message:
-                    # URL-based research
+                    # URL-based research with validated screenshot capture
                     response_data = await asyncio.wait_for(
                         process_message_with_direct_scraping(
                             self.agent,
@@ -2278,7 +3271,6 @@ class OpenManusUI:
                     )
                 else:
                     # General research question
-                    logger.info(f"Processing as general research question: {user_message[:50]}...")
                     prefix = (
                         "Please respond in English only within 300 words. Avoid unnecessary spaces. "
                         "Use 'Source:' instead of '来源:', only if the user asks for sources/references."
@@ -2287,15 +3279,21 @@ class OpenManusUI:
                     raw = await self.agent.llm.ask(prefix + user_message, temperature=0.7)
                     response_data = {
                         "response": annotate_invalid_links(collapse_to_root_domain(remove_chinese_and_punct(str(raw)))),
-                        "base64_image": None
+                        "base64_image": None,
+                        "source_url": None,
+                        "screenshot_validated": False
                     }
 
                 if isinstance(response_data, dict):
                     response_content = response_data.get("response", "")
                     screenshot = response_data.get("base64_image", None)
+                    source_url = response_data.get("source_url", None)
+                    screenshot_validated = response_data.get("screenshot_validated", False)
                 else:
                     response_content = str(response_data)
                     screenshot = None
+                    source_url = None
+                    screenshot_validated = False
 
                 await self.broadcast_message("agent_message", {
                     "content": response_content,
@@ -2303,9 +3301,34 @@ class OpenManusUI:
                 })
 
                 if screenshot:
-                    await self.broadcast_message("browser_state", {
-                        "base64_image": screenshot
-                    })
+                    browser_state_data = {
+                        "base64_image": screenshot,
+                        "screenshot_validated": screenshot_validated
+                    }
+                    
+                    # Add source URL info for the Visit Site button
+                    if source_url:
+                        browser_state_data["source_url"] = source_url
+                        browser_state_data["url"] = source_url
+                        
+                        # Extract domain for title
+                        try:
+                            from urllib.parse import urlparse
+                            parsed = urlparse(source_url)
+                            domain = parsed.netloc
+                            browser_state_data["title"] = f"Screenshot from {domain}"
+                        except:
+                            browser_state_data["title"] = "Website Screenshot"
+                    else:
+                        browser_state_data["title"] = "Screenshot"
+                    
+                    await self.broadcast_message("browser_state", browser_state_data)
+                    
+                    # Log validation status
+                    if screenshot_validated:
+                        logger.info(f"✅ Validated screenshot sent to frontend for URL: {source_url}")
+                    else:
+                        logger.warning(f"⚠️ Unvalidated screenshot sent to frontend for URL: {source_url}")
 
         except asyncio.TimeoutError:
             await self.broadcast_message("agent_message", {

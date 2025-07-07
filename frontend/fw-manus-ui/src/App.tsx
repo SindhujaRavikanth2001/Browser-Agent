@@ -14,7 +14,9 @@ import {
   IconButton,
   Tooltip,
   Alert,
-  Snackbar
+  Snackbar,
+  LinearProgress,
+  Chip
 } from '@mui/material';
 import { alpha } from '@mui/material/styles';
 import SendIcon from '@mui/icons-material/Send';
@@ -24,6 +26,10 @@ import MicIcon from '@mui/icons-material/Mic';
 import MicOffIcon from '@mui/icons-material/MicOff';
 import CheckIcon from '@mui/icons-material/Check';
 import ClearIcon from '@mui/icons-material/Clear';
+import ArrowBackIosIcon from '@mui/icons-material/ArrowBackIos';
+import ArrowForwardIosIcon from '@mui/icons-material/ArrowForwardIos';
+import PlayArrowIcon from '@mui/icons-material/PlayArrow';
+import PauseIcon from '@mui/icons-material/Pause';
 import './App.css';
 
 // TypeScript declarations for Speech Recognition API
@@ -104,6 +110,19 @@ type AgentAction = {
   timestamp: number;
 };
 
+// Slideshow types
+type ScreenshotData = {
+  url: string;
+  screenshot: string;
+  title: string;
+};
+
+type SlideshowData = {
+  screenshots: ScreenshotData[];
+  total_count: number;
+  research_topic: string;
+};
+
 function App() {
   const theme = useTheme();
   const [socket, setSocket] = useState<WebSocket | null>(null);
@@ -128,6 +147,14 @@ function App() {
   const isListeningRef = useRef(false);
   const voiceInputRef = useRef('');
 
+  // Slideshow state
+  const [slideshowData, setSlideshowData] = useState<SlideshowData | null>(null);
+  const [currentSlideIndex, setCurrentSlideIndex] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentImageUrl, setCurrentImageUrl] = useState<string>('');
+  const [currentImageTitle, setCurrentImageTitle] = useState<string>('');
+  const slideshowTimerRef = useRef<number | null>(null);
+  
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const actionsEndRef = useRef<HTMLDivElement>(null);
   const browserEndRef = useRef<HTMLDivElement>(null);
@@ -343,6 +370,60 @@ function App() {
     setVoiceError(null);
   };
 
+  // Slideshow control functions
+  const nextSlide = () => {
+    if (!slideshowData || slideshowData.screenshots.length === 0) return;
+    
+    const nextIndex = (currentSlideIndex + 1) % slideshowData.screenshots.length;
+    setCurrentSlideIndex(nextIndex);
+    
+    const nextScreenshot = slideshowData.screenshots[nextIndex];
+    setBrowserState(nextScreenshot.screenshot);
+    setCurrentImageUrl(nextScreenshot.url);
+    setCurrentImageTitle(nextScreenshot.title);
+  };
+
+  const previousSlide = () => {
+    if (!slideshowData || slideshowData.screenshots.length === 0) return;
+    
+    const prevIndex = currentSlideIndex === 0 
+      ? slideshowData.screenshots.length - 1 
+      : currentSlideIndex - 1;
+    setCurrentSlideIndex(prevIndex);
+    
+    const prevScreenshot = slideshowData.screenshots[prevIndex];
+    setBrowserState(prevScreenshot.screenshot);
+    setCurrentImageUrl(prevScreenshot.url);
+    setCurrentImageTitle(prevScreenshot.title);
+  };
+
+  const togglePlayPause = () => {
+    if (isPlaying) {
+      // Pause slideshow
+      if (slideshowTimerRef.current) {
+        clearInterval(slideshowTimerRef.current);
+        slideshowTimerRef.current = null;
+      }
+      setIsPlaying(false);
+    } else {
+      // Start slideshow
+      slideshowTimerRef.current = setInterval(() => {
+        nextSlide();
+      }, 3000); // Change slide every 3 seconds
+      setIsPlaying(true);
+    }
+  };
+
+  const goToSlide = (index: number) => {
+    if (!slideshowData || slideshowData.screenshots.length === 0) return;
+    
+    setCurrentSlideIndex(index);
+    const screenshot = slideshowData.screenshots[index];
+    setBrowserState(screenshot.screenshot);
+    setCurrentImageUrl(screenshot.url);
+    setCurrentImageTitle(screenshot.title);
+  };
+
   // Connect to WebSocket server when component mounts
   useEffect(() => {
     const socketUrl = 'ws://localhost:8000/ws';
@@ -368,7 +449,7 @@ function App() {
     newSocket.onmessage = (event) => {
       const data = JSON.parse(event.data);
       console.log('Received message:', data);
-
+    
       if (data.type === 'connect') {
         console.log('Connection confirmed by server');
       } else if (data.type === 'agent_message') {
@@ -379,6 +460,30 @@ function App() {
         }]);
         setIsLoading(false);
         setActiveTab(0);
+        
+        // Handle screenshot in agent message response
+        if (data.base64_image) {
+          console.log('Received screenshot with agent message');
+          setBrowserState(data.base64_image);
+          setCurrentImageUrl(data.image_url || '');
+          setCurrentImageTitle(data.image_title || '');
+        }
+      } else if (data.type === 'slideshow_data') {
+        // Handle slideshow data
+        console.log('Received slideshow data:', data);
+        setSlideshowData({
+          screenshots: data.screenshots,
+          total_count: data.total_count,
+          research_topic: data.research_topic
+        });
+        setCurrentSlideIndex(0);
+        
+        // Set the first screenshot as current
+        if (data.screenshots && data.screenshots.length > 0) {
+          setBrowserState(data.screenshots[0].screenshot);
+          setCurrentImageUrl(data.screenshots[0].url);
+          setCurrentImageTitle(data.screenshots[0].title);
+        }
       } else if (data.type === 'agent_message_stream_start') {
         setIsStreaming(true);
         setStreamingMessage('');
@@ -412,9 +517,12 @@ function App() {
       } else if (data.type === 'browser_state') {
         console.log('Received browser state with image data length:',
           data.base64_image ? data.base64_image.length : 0);
-
+    
         if (data.base64_image && data.base64_image.length > 0) {
           setBrowserState(data.base64_image);
+          setCurrentImageUrl(data.url || '');
+          setCurrentImageTitle(data.title || '');
+          console.log('Screenshot displayed in browser view');
         } else {
           console.warn('Received empty browser screenshot');
         }
@@ -437,18 +545,27 @@ function App() {
     actionsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [agentActions]);
 
+  // Clean up slideshow timer on unmount
+  useEffect(() => {
+    return () => {
+      if (slideshowTimerRef.current) {
+        clearInterval(slideshowTimerRef.current);
+      }
+    };
+  }, []);
+
   // Handle sending messages
   const sendMessage = () => {
     if (!input.trim()) return;
-
+  
     const newMessage: ChatMessage = {
       role: 'user',
       content: input,
       timestamp: Date.now()
     };
-
+  
     setMessages(prev => [...prev, newMessage]);
-
+  
     if (socket && socket.readyState === WebSocket.OPEN) {
       console.log('Sending message via WebSocket:', input);
       socket.send(JSON.stringify({ content: input }));
@@ -472,8 +589,20 @@ function App() {
               }
             ]);
           }
+          
+          // Handle slideshow data from HTTP API
+          if (data.slideshow_data) {
+            console.log('Received slideshow data from HTTP API');
+            setSlideshowData(data.slideshow_data);
+            setCurrentSlideIndex(0);
+          }
+          
+          // Handle screenshot from HTTP API response
           if (data.base64_image) {
+            console.log('Received screenshot from HTTP API');
             setBrowserState(data.base64_image);
+            setCurrentImageUrl(data.image_url || '');
+            setCurrentImageTitle(data.image_title || '');
           }
           setIsLoading(false);
         })
@@ -482,7 +611,7 @@ function App() {
           setIsLoading(false);
         });
     }
-
+  
     setInput('');
     setIsLoading(true);
   };
@@ -920,7 +1049,7 @@ function App() {
             />
           </PanelResizeHandle>
 
-          {/* Right Panel - Browser View */}
+          {/* Right Panel - Enhanced Browser View with Slideshow */}
           <Panel defaultSize={60} minSize={40}>
             <Paper
               elevation={0}
@@ -940,46 +1069,135 @@ function App() {
                   flexDirection: 'column',
                   height: '100%'
                 }}>
-                  {/* Browser Header */}
+                  {/* Enhanced Browser Header with Slideshow Controls */}
                   <Box sx={{
                     display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'center',
-                    p: 1.5,
-                    pl: 3,
+                    flexDirection: 'column',
                     borderBottom: `1px solid ${theme.palette.divider}`,
                     backgroundColor: alpha(theme.palette.background.paper, 0.6),
                     flexShrink: 0
                   }}>
-                    <Typography variant="h6" sx={{ fontSize: '1.1rem', fontWeight: 500 }}>
-                      Browser View
-                    </Typography>
-                    <Box>
-                      <Button
-                        variant="text"
-                        size="small"
-                        startIcon={<OpenInFullIcon />}
-                        onClick={() => window.open(`data:image/jpeg;base64,${browserState}`, '_blank')}
-                        sx={{
-                          textTransform: 'none',
-                          color: theme.palette.primary.main
-                        }}
-                      >
-                        Full Size
-                      </Button>
-                      <Button
-                        variant="text"
-                        size="small"
-                        startIcon={<CloseIcon />}
-                        onClick={() => setBrowserState(null)}
-                        sx={{
-                          textTransform: 'none',
-                          color: theme.palette.error.main
-                        }}
-                      >
-                        Close
-                      </Button>
+                    {/* Main header */}
+                    <Box sx={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      p: 1.5,
+                      pl: 3
+                    }}>
+                      <Box>
+                        <Typography variant="h6" sx={{ fontSize: '1.1rem', fontWeight: 500 }}>
+                          Browser View
+                          {slideshowData && (
+                            <Chip
+                              label={`${slideshowData.total_count} screenshots`}
+                              size="small"
+                              sx={{ ml: 1, fontSize: '0.75rem' }}
+                            />
+                          )}
+                        </Typography>
+                        {currentImageTitle && (
+                          <Typography variant="caption" sx={{ display: 'block', opacity: 0.7, mt: 0.5 }}>
+                            {currentImageTitle}
+                          </Typography>
+                        )}
+                      </Box>
+                      <Box>
+                        <Button
+                          variant="text"
+                          size="small"
+                          startIcon={<OpenInFullIcon />}
+                          onClick={() => {
+                            if (currentImageUrl) {
+                              window.open(currentImageUrl, '_blank');
+                            } else {
+                              window.open(`data:image/jpeg;base64,${browserState}`, '_blank');
+                            }
+                          }}
+                          sx={{
+                            textTransform: 'none',
+                            color: theme.palette.primary.main
+                          }}
+                        >
+                          {currentImageUrl ? 'Visit Site' : 'Full Size'}
+                        </Button>
+                        <Button
+                          variant="text"
+                          size="small"
+                          startIcon={<CloseIcon />}
+                          onClick={() => {
+                            setBrowserState(null);
+                            setSlideshowData(null);
+                            setCurrentImageUrl('');
+                            setCurrentImageTitle('');
+                            if (slideshowTimerRef.current) {
+                              clearInterval(slideshowTimerRef.current);
+                              setIsPlaying(false);
+                            }
+                          }}
+                          sx={{
+                            textTransform: 'none',
+                            color: theme.palette.error.main
+                          }}
+                        >
+                          Close
+                        </Button>
+                      </Box>
                     </Box>
+
+                    {/* Slideshow Controls */}
+                    {slideshowData && slideshowData.screenshots.length > 1 && (
+                      <Box sx={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        gap: 1,
+                        p: 1,
+                        backgroundColor: alpha(theme.palette.background.default, 0.1)
+                      }}>
+                        <IconButton
+                          size="small"
+                          onClick={previousSlide}
+                          disabled={slideshowData.screenshots.length <= 1}
+                        >
+                          <ArrowBackIosIcon fontSize="small" />
+                        </IconButton>
+                        
+                        <IconButton
+                          size="small"
+                          onClick={togglePlayPause}
+                          sx={{
+                            backgroundColor: isPlaying ? alpha(theme.palette.error.main, 0.1) : alpha(theme.palette.primary.main, 0.1),
+                            '&:hover': {
+                              backgroundColor: isPlaying ? alpha(theme.palette.error.main, 0.2) : alpha(theme.palette.primary.main, 0.2)
+                            }
+                          }}
+                        >
+                          {isPlaying ? <PauseIcon fontSize="small" /> : <PlayArrowIcon fontSize="small" />}
+                        </IconButton>
+                        
+                        <Typography variant="caption" sx={{ mx: 1 }}>
+                          {currentSlideIndex + 1} / {slideshowData.screenshots.length}
+                        </Typography>
+                        
+                        <IconButton
+                          size="small"
+                          onClick={nextSlide}
+                          disabled={slideshowData.screenshots.length <= 1}
+                        >
+                          <ArrowForwardIosIcon fontSize="small" />
+                        </IconButton>
+                      </Box>
+                    )}
+
+                    {/* Progress bar for slideshow */}
+                    {slideshowData && slideshowData.screenshots.length > 1 && (
+                      <LinearProgress
+                        variant="determinate"
+                        value={(currentSlideIndex + 1) / slideshowData.screenshots.length * 100}
+                        sx={{ height: 2 }}
+                      />
+                    )}
                   </Box>
 
                   {/* Browser Content */}
@@ -999,7 +1217,8 @@ function App() {
                         borderRadius: 1.5,
                         overflow: 'hidden',
                         mb: 1,
-                        boxShadow: '0 2px 10px rgba(0, 0, 0, 0.15)'
+                        boxShadow: '0 2px 10px rgba(0, 0, 0, 0.15)',
+                        position: 'relative'
                       }}
                     >
                       <img
@@ -1009,7 +1228,13 @@ function App() {
                         style={{
                           width: '100%',
                           height: 'auto',
-                          display: 'block'
+                          display: 'block',
+                          cursor: currentImageUrl ? 'pointer' : 'default'
+                        }}
+                        onClick={() => {
+                          if (currentImageUrl) {
+                            window.open(currentImageUrl, '_blank');
+                          }
                         }}
                         onError={(e) => {
                           const target = e.target as HTMLImageElement;
@@ -1019,7 +1244,73 @@ function App() {
                           }
                         }}
                       />
+                      
+                      {/* URL overlay */}
+                      {currentImageUrl && (
+                        <Box sx={{
+                          position: 'absolute',
+                          bottom: 0,
+                          left: 0,
+                          right: 0,
+                          background: 'linear-gradient(transparent, rgba(0,0,0,0.7))',
+                          color: 'white',
+                          p: 1,
+                          fontSize: '0.75rem'
+                        }}>
+                          <Typography variant="caption" sx={{ 
+                            wordBreak: 'break-all',
+                            opacity: 0.9
+                          }}>
+                            {currentImageUrl}
+                          </Typography>
+                        </Box>
+                      )}
                     </Paper>
+
+                    {/* Thumbnail navigation for slideshow */}
+                    {slideshowData && slideshowData.screenshots.length > 1 && (
+                      <Box sx={{
+                        display: 'flex',
+                        gap: 1,
+                        mt: 2,
+                        overflowX: 'auto',
+                        pb: 1
+                      }}>
+                        {slideshowData.screenshots.map((screenshot, index) => (
+                          <Paper
+                            key={index}
+                            elevation={currentSlideIndex === index ? 3 : 1}
+                            sx={{
+                              minWidth: 80,
+                              height: 60,
+                              borderRadius: 1,
+                              overflow: 'hidden',
+                              cursor: 'pointer',
+                              border: currentSlideIndex === index 
+                                ? `2px solid ${theme.palette.primary.main}` 
+                                : '2px solid transparent',
+                              transition: 'all 0.2s ease',
+                              '&:hover': {
+                                transform: 'scale(1.05)',
+                                boxShadow: theme.shadows[4]
+                              }
+                            }}
+                            onClick={() => goToSlide(index)}
+                          >
+                            <img
+                              src={`data:image/jpeg;base64,${screenshot.screenshot}`}
+                              alt={`Screenshot ${index + 1}`}
+                              style={{
+                                width: '100%',
+                                height: '100%',
+                                objectFit: 'cover'
+                              }}
+                            />
+                          </Paper>
+                        ))}
+                      </Box>
+                    )}
+                    
                     <div ref={browserEndRef} />
                   </Box>
                 </Box>
@@ -1040,7 +1331,7 @@ function App() {
                     When the agent uses the browser, the content will appear here.
                   </Typography>
                   <Typography variant="body2" color="text.secondary" sx={{ mt: 2 }}>
-                    Try asking a question that requires web browsing.
+                    Try asking a question that requires web browsing or start a research workflow.
                   </Typography>
                 </Box>
               )}

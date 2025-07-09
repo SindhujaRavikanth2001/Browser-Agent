@@ -72,18 +72,178 @@ class ResearchDesign(BaseModel):
     internet_sources: Optional[List[str]] = None
     screenshots: Optional[List[Dict]] = None
     use_internet_questions: bool = False
-    selected_internet_questions: bool = False
     stage: ResearchStage = ResearchStage.INITIAL
     user_responses: Optional[Dict] = None
     questionnaire_responses: Optional[Dict] = None
     chat_history: Optional[List[Dict]] = None
-    selected_internet_questions: bool = False  # S option flag
-    include_all_internet_questions: bool = False  # Y option flag
+    
+    # NEW: URL management fields
+    all_collected_urls: Optional[List[str]] = None  # All 30 unique deep URLs
+    current_batch_index: int = 0  # Which batch of 6 we're currently on
+    browsed_urls: Optional[List[str]] = None  # URLs that have been processed
+    rebrowse_count: int = 0  # How many times user has rebrowsed
+    extracted_questions_with_sources: Optional[List[Dict]] = None
 
 class UserMessage(BaseModel):
     content: str
     action_type: Optional[str] = None
     research_session_id: Optional[str] = None
+
+class ImprovedQuestionExtractor:
+    """Improved question extraction with better pattern recognition and source attribution"""
+    
+    def __init__(self):
+        # Fixed and improved regex patterns
+        self.question_patterns = [
+            # Basic question words - FIXED regex syntax
+            r'(?:^|\n)\s*(?:\d+[\.\)]\s*)?([^.!]*(?:How|What|Which|Would|Do|Are|Have|Can|Did|Will)\s+[^?]*\?)',
+            
+            # Rating and scale questions
+            r'(?:^|\n)\s*(?:\d+[\.\)]\s*)?([^.!]*(?:On\s+a\s+scale|Rate|Please\s+rate|from\s+1\s+to|1-10|scale\s+of)[^?]*\?)',
+            
+            # Likert scale indicators
+            r'(?:^|\n)\s*(?:\d+[\.\)]\s*)?([^.!]*(?:strongly\s+agree|satisfaction|satisfied|likely|important)[^?]*\?)',
+            
+            # Frequency questions
+            r'(?:^|\n)\s*(?:\d+[\.\)]\s*)?([^.!]*(?:How\s+often|How\s+frequently|How\s+many\s+times)[^?]*\?)',
+            
+            # Preference questions
+            r'(?:^|\n)\s*(?:\d+[\.\)]\s*)?([^.!]*(?:prefer|choose|select|pick)[^?]*\?)',
+            
+            # Experience questions
+            r'(?:^|\n)\s*(?:\d+[\.\)]\s*)?([^.!]*(?:experience|background|years)[^?]*\?)',
+            
+            # Opinion questions
+            r'(?:^|\n)\s*(?:\d+[\.\)]\s*)?([^.!]*(?:opinion|think|believe|feel)[^?]*\?)',
+            
+            # Recommendation questions
+            r'(?:^|\n)\s*(?:\d+[\.\)]\s*)?([^.!]*(?:recommend|suggest)[^?]*\?)',
+        ]
+    
+    def extract_questions_with_sources(self, content: str, url: str) -> List[Dict]:
+        """Extract questions with improved pattern matching and full source tracking"""
+        
+        all_questions = []
+        
+        # Method 1: Simple line-by-line analysis (most reliable)
+        simple_questions = self._extract_simple_questions(content, url)
+        all_questions.extend(simple_questions)
+        
+        # Method 2: Advanced pattern matching
+        pattern_questions = self._extract_pattern_questions(content, url)
+        all_questions.extend(pattern_questions)
+        
+        # Remove duplicates while preserving order
+        unique_questions = []
+        seen = set()
+        
+        for q_dict in all_questions:
+            question_lower = q_dict['question'].lower().strip()
+            if question_lower not in seen and len(question_lower) > 15:
+                seen.add(question_lower)
+                unique_questions.append(q_dict)
+        
+        return unique_questions[:10]  # Limit to top 10 questions
+    
+    def _extract_simple_questions(self, content: str, url: str) -> List[Dict]:
+        """Simple, reliable question extraction"""
+        questions = []
+        lines = content.split('\n')
+        
+        question_starters = [
+            'how ', 'what ', 'which ', 'would you', 'do you', 'are you',
+            'have you', 'can you', 'did you', 'will you', 'please rate',
+            'on a scale', 'rate the', 'how often', 'how much', 'how likely',
+            'how satisfied', 'how important', 'to what extent'
+        ]
+        
+        for line in lines:
+            line = line.strip()
+            
+            # Must end with question mark and have reasonable length
+            if not line.endswith('?') or len(line) < 20 or len(line) > 300:
+                continue
+            
+            # Clean up formatting
+            clean_line = re.sub(r'^\d+[\.\)]\s*', '', line)  # Remove numbering
+            clean_line = re.sub(r'^[-•*]\s*', '', clean_line)  # Remove bullets
+            clean_line = clean_line.strip()
+            
+            # Check if it starts with question words
+            line_lower = clean_line.lower()
+            if any(line_lower.startswith(starter) for starter in question_starters):
+                questions.append({
+                    'question': clean_line,
+                    'source': url,  # Full URL instead of domain
+                    'extraction_method': 'simple_pattern'
+                })
+        
+        return questions
+    
+    def _extract_pattern_questions(self, content: str, url: str) -> List[Dict]:
+        """Advanced pattern-based extraction with fixed regex"""
+        questions = []
+        
+        for pattern in self.question_patterns:
+            try:
+                matches = re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE)
+                for match in matches:
+                    question = match.group(1).strip()
+                    
+                    # Clean up
+                    question = re.sub(r'^\d+[\.\)]\s*', '', question)
+                    question = re.sub(r'\s+', ' ', question)
+                    question = question.strip()
+                    
+                    # Quality checks
+                    if (len(question) > 20 and len(question) < 300 and 
+                        question.endswith('?')):
+                        
+                        questions.append({
+                            'question': question,
+                            'source': url,  # Full URL
+                            'extraction_method': 'regex_pattern'
+                        })
+                        
+            except re.error as e:
+                logger.warning(f"Regex error with pattern: {e}")
+                continue
+        
+        return questions
+
+    def format_questions_by_source(self, questions_with_sources: List[Dict]) -> str:
+        """Format questions grouped by full source URL"""
+        
+        # Group questions by source URL
+        source_groups = {}
+        for q_dict in questions_with_sources:
+            source_url = q_dict['source']
+            if source_url not in source_groups:
+                source_groups[source_url] = []
+            source_groups[source_url].append(q_dict['question'])
+        
+        # Format output
+        formatted_output = []
+        question_counter = 1
+        
+        for source_num, (source_url, questions) in enumerate(source_groups.items(), 1):
+            # Extract domain for cleaner display
+            try:
+                from urllib.parse import urlparse
+                domain = urlparse(source_url).netloc
+            except:
+                domain = source_url
+            
+            formatted_output.append(f"**Source {source_num}: {domain}**")
+            formatted_output.append(f"*Full URL: {source_url}*")
+            
+            for question in questions:
+                formatted_output.append(f"{question_counter}. {question}")
+                question_counter += 1
+            
+            formatted_output.append("")  # Empty line between sources
+        
+        return "\n".join(formatted_output)
 
 # Research Design Workflow Functions
 class ResearchWorkflow:
@@ -108,63 +268,253 @@ class ResearchWorkflow:
             logger.warning("Google API credentials not found. Using fallback search.")
             self.search_service = None
 
-    async def _search_internet_for_questions(self, research_topic: str, target_population: str) -> tuple[List[str], List[str], List[str]]:
-        """Search internet with deep URL filtering and screenshot validation"""
+    async def _collect_all_urls(self, research_topic: str) -> List[str]:
+        """Collect 30 unique deep URLs upfront for the research topic"""
         try:
             if not self.search_service:
-                logger.warning("Google Custom Search API not available, using fallback")
-                return await self._fallback_search(research_topic, target_population)
+                logger.warning("Google Custom Search API not available")
+                return []
             
             search_query = f"Surveys on {research_topic}"
-            logger.info(f"Searching for: {search_query}")
+            logger.info(f"Collecting URLs for: {search_query}")
             
-            try:
-                # Get more results since we'll filter many out
-                search_result = self.search_service.cse().list(
-                    q=search_query,
-                    cx=self.google_cse_id,
-                    num=10,  # Get exactly 10 results
-                    safe='active',
-                    fields='items(title,link,snippet)'
-                ).execute()
+            all_unique_urls = []
+            seen_urls = set()
+            
+            # Try multiple search variations to get 30 unique URLs
+            search_variations = [
+                f"Surveys on {research_topic}",
+                f"{research_topic} questionnaire research",
+                f"{research_topic} survey methodology",
+                f"{research_topic} study questions"
+            ]
+            
+            for search_term in search_variations:
+                if len(all_unique_urls) >= 30:
+                    break
+                    
+                try:
+                    search_result = self.search_service.cse().list(
+                        q=search_term,
+                        cx=self.google_cse_id,
+                        num=10,  # Get 10 results per search
+                        safe='active',
+                        fields='items(title,link,snippet)'
+                    ).execute()
+                    
+                    if 'items' in search_result:
+                        for item in search_result['items']:
+                            link = item.get('link', '')
+                            title = item.get('title', '')
+                            
+                            if link and link not in seen_urls:
+                                # Check if it's a valid deep URL
+                                if self._is_valid_url(link):
+                                    all_unique_urls.append(link)
+                                    seen_urls.add(link)
+                                    logger.info(f"✅ Collected deep URL #{len(all_unique_urls)}: {title}")
+                                    
+                                    if len(all_unique_urls) >= 30:
+                                        break
+                                else:
+                                    logger.info(f"❌ Filtered out: {title} - {link}")
+                    
+                    # Small delay between searches
+                    await asyncio.sleep(1)
+                    
+                except Exception as api_error:
+                    logger.error(f"Search API error for '{search_term}': {api_error}")
+                    continue
+            
+            logger.info(f"URL collection results:")
+            logger.info(f"  - Total unique deep URLs collected: {len(all_unique_urls)}")
+            logger.info(f"  - Target was: 30 URLs")
+            
+            return all_unique_urls[:30]  # Ensure we don't exceed 30
+            
+        except Exception as e:
+            logger.error(f"Error collecting URLs: {e}")
+            return []
+
+    async def _extract_actual_questions_from_content(self, scraped_content: str, url: str) -> List[Dict]:
+        """Extract actual survey questions with improved error handling and source tracking"""
+        
+        # Initialize the improved extractor
+        if not hasattr(self, '_question_extractor'):
+            self._question_extractor = ImprovedQuestionExtractor()
+        
+        try:
+            # Use improved extraction
+            found_questions = self._question_extractor.extract_questions_with_sources(scraped_content, url)
+            
+            if len(found_questions) >= 3:
+                logger.info(f"Found {len(found_questions)} questions using improved patterns from {url}")
+                return found_questions
+            
+            # Fallback to LLM if pattern matching doesn't find enough
+            logger.info(f"Pattern matching found only {len(found_questions)} questions, using LLM for {url}")
+            
+            llm_questions = await self._llm_extract_actual_questions(scraped_content, url)
+            found_questions.extend(llm_questions)
+            
+            # Remove duplicates
+            unique_questions = []
+            seen = set()
+            
+            for q_dict in found_questions:
+                question_text = q_dict['question'].lower().strip()
+                if question_text not in seen and len(question_text) > 15:
+                    seen.add(question_text)
+                    unique_questions.append(q_dict)
+            
+            return unique_questions[:6]
+            
+        except Exception as e:
+            logger.error(f"Error in question extraction from {url}: {e}")
+            return []
+
+    def _find_questions_with_patterns(self, content: str, url: str) -> List[Dict]:
+        """Find actual survey questions using corrected regex patterns"""
+        
+        # Initialize extractor if not exists
+        if not hasattr(self, '_question_extractor'):
+            self._question_extractor = ImprovedQuestionExtractor()
+        
+        return self._question_extractor._extract_pattern_questions(content, url)
+
+    def _find_questions_simple_patterns(self, content: str, url: str) -> List[Dict]:
+        """Find questions using simple, reliable patterns"""
+        
+        # Initialize extractor if not exists
+        if not hasattr(self, '_question_extractor'):
+            self._question_extractor = ImprovedQuestionExtractor()
+        
+        return self._question_extractor._extract_simple_questions(content, url)
+
+    async def _llm_extract_actual_questions(self, scraped_content: str, url: str) -> List[Dict]:
+        """Enhanced LLM extraction with better prompting and full URL tracking"""
+        
+        # Pre-process content to find question-rich sections
+        lines = scraped_content.split('\n')
+        question_sections = []
+        
+        for i, line in enumerate(lines):
+            if '?' in line or any(word in line.lower() for word in ['question', 'survey', 'ask', 'rate', 'scale', 'satisfaction']):
+                # Get context around potential questions
+                start = max(0, i - 3)
+                end = min(len(lines), i + 5)
+                section = ' '.join(lines[start:end])
+                question_sections.append(section)
+        
+        # Use most relevant sections or fallback to beginning of content
+        if question_sections:
+            content_to_analyze = ' '.join(question_sections[:5])  # Use top 5 sections
+        else:
+            content_to_analyze = scraped_content[:3000]
+        
+        prompt = f"""
+    Extract EXISTING survey questions from this webpage content. Find questions that already exist - do NOT create new ones.
+
+    WEBPAGE: {url}
+
+    CONTENT TO ANALYZE:
+    {content_to_analyze}
+
+    EXTRACTION RULES:
+    1. Only extract questions that already exist in the content
+    2. Questions must end with "?"
+    3. Questions should be 20-200 characters long
+    4. Return maximum 6 questions
+    5. Format: One question per line, no numbering or bullets
+    6. If no actual questions found, return "NO_QUESTIONS_FOUND"
+
+    EXISTING QUESTIONS:
+    """
+        
+        try:
+            response = await self.llm.ask(prompt, temperature=0.1)
+            cleaned_response = remove_chinese_and_punct(str(response))
+            
+            if "NO_QUESTIONS_FOUND" in cleaned_response.upper():
+                logger.info(f"LLM found no questions in {url}")
+                return []
+            
+            lines = cleaned_response.split('\n')
+            questions_found = []
+            
+            for line in lines:
+                line = line.strip()
+                if not line or len(line) < 20:
+                    continue
                 
-            except Exception as api_error:
-                logger.error(f"Google Search API error: {api_error}")
-                return await self._fallback_search(research_topic, target_population)
+                # Remove any numbering or bullets that LLM might add
+                line = re.sub(r'^\d+[\.\)]\s*', '', line)
+                line = re.sub(r'^[-•*]\s*', '', line)
+                line = line.strip()
+                
+                # Must be a proper question
+                if line.endswith('?') and len(line) > 20 and len(line) < 250:
+                    questions_found.append({
+                        'question': line,
+                        'source': url,  # Store full URL
+                        'extraction_method': 'llm_extraction'
+                    })
+                    
+                    if len(questions_found) >= 6:
+                        break
             
-            # Extract and filter URLs
-            all_urls = []
-            deep_urls = []
+            logger.info(f"LLM extracted {len(questions_found)} questions from {url}")
+            return questions_found
             
-            if 'items' in search_result:
-                for item in search_result['items']:
-                    link = item.get('link', '')
-                    title = item.get('title', '')
-                    if link:
-                        all_urls.append(link)
-                        if self._is_valid_url(link):  # This now includes deep URL check
-                            deep_urls.append(link)
-                            logger.info(f"✅ Deep URL found: {title}")
-                        else:
-                            logger.info(f"❌ Filtered out: {title} - {link}")
+        except Exception as e:
+            logger.error(f"LLM extraction error for {url}: {e}")
+            return []
+
+    async def _search_internet_for_questions(self, research_topic: str, target_population: str, session: ResearchDesign) -> tuple[List[Dict], List[str], List[Dict]]:
+        """Process the next batch of 6 URLs and extract actual questions"""
+        try:
+            # If this is the first time, collect all URLs
+            if session.all_collected_urls is None:
+                logger.info("First time search - collecting all URLs")
+                session.all_collected_urls = await self._collect_all_urls(research_topic)
+                session.current_batch_index = 0
+                session.browsed_urls = []
+                
+                if not session.all_collected_urls:
+                    logger.warning("No URLs collected")
+                    return [], [], []
             
-            logger.info(f"URL filtering results:")
-            logger.info(f"  - Total URLs found: {len(all_urls)}")
-            logger.info(f"  - Deep URLs kept: {len(deep_urls)}")
-            logger.info(f"  - URLs filtered out: {len(all_urls) - len(deep_urls)}")
+            # Check if we've exhausted all URLs
+            total_urls = len(session.all_collected_urls)
+            start_index = session.current_batch_index * 6
             
-            if not deep_urls:
-                logger.warning("No deep URLs found after filtering")
-                return await self._fallback_search(research_topic, target_population)
+            if start_index >= total_urls:
+                logger.warning("All collected URLs have been processed")
+                return [], [], []
             
-            # Process only deep URLs
-            all_scraped_content = ""
+            # Get the next batch of 6 URLs
+            end_index = min(start_index + 6, total_urls)
+            current_batch_urls = session.all_collected_urls[start_index:end_index]
+            
+            logger.info(f"Processing batch {session.current_batch_index + 1}")
+            logger.info(f"URLs {start_index + 1}-{end_index} of {total_urls} total collected URLs")
+            
+            # Process the current batch
+            all_extracted_questions = []
             scraped_sources = []
             valid_screenshots = []
             
-            for i, url in enumerate(deep_urls, 1):
+            # SIMPLE FIX: Track already seen questions across ALL sessions
+            seen_questions = set()
+            
+            # Add previously found questions to seen set
+            if hasattr(session, 'extracted_questions_with_sources') and session.extracted_questions_with_sources:
+                for prev_q in session.extracted_questions_with_sources:
+                    seen_questions.add(prev_q['question'].lower().strip())
+            
+            for i, url in enumerate(current_batch_urls, 1):
                 try:
-                    logger.info(f"Processing deep URL {i}/{len(deep_urls)}: {url}")
+                    logger.info(f"Processing URL {start_index + i}/{total_urls}: {url}")
                     
                     # Scrape content first
                     page_content = await self._scrape_page_content(url)
@@ -173,7 +523,27 @@ class ResearchWorkflow:
                         print(f"❌ Insufficient content from {url}")
                         continue
                     
-                    # Content is good - try screenshot (single attempt)
+                    # Extract actual questions from this URL
+                    url_questions = await self._extract_actual_questions_from_content(page_content, url)
+                    
+                    # SIMPLE FIX: Filter out duplicate questions
+                    unique_url_questions = []
+                    for q_dict in url_questions:
+                        question_text = q_dict['question'].lower().strip()
+                        if question_text not in seen_questions:
+                            seen_questions.add(question_text)
+                            unique_url_questions.append(q_dict)
+                            logger.info(f"✅ Added unique question: {q_dict['question'][:50]}...")
+                        else:
+                            logger.info(f"⚠️ Skipped duplicate question: {q_dict['question'][:50]}...")
+                    
+                    if unique_url_questions:
+                        all_extracted_questions.extend(unique_url_questions)
+                        logger.info(f"✅ Extracted {len(unique_url_questions)} unique questions from {url}")
+                    else:
+                        logger.info(f"⚠️ No unique questions found in {url}")
+                    
+                    # Try screenshot
                     screenshot = None
                     if self.browser_tool:
                         print(f"📸 Attempting screenshot for {url}")
@@ -189,8 +559,6 @@ class ResearchWorkflow:
                             logger.warning(f"Screenshot failed for {url}: {screenshot_error}")
                             screenshot = None
                     
-                    # Always include content (regardless of screenshot success)
-                    all_scraped_content += f"\n\nContent from {url}:\n{page_content[:2000]}"
                     scraped_sources.append(url)
                     
                     # Only add to slideshow if screenshot is valid
@@ -211,21 +579,21 @@ class ResearchWorkflow:
                     logger.warning(f"Error processing {url}: {e}")
                     continue
             
-            logger.info(f"Final results:")
-            logger.info(f"  - Deep URLs processed: {len(deep_urls)}")
-            logger.info(f"  - Content sources: {len(scraped_sources)}")
+            # Update session tracking
+            session.browsed_urls.extend(scraped_sources)
+            session.current_batch_index += 1
+            
+            logger.info(f"Batch {session.current_batch_index} results:")
+            logger.info(f"  - URLs in this batch: {len(current_batch_urls)}")
+            logger.info(f"  - Total UNIQUE questions extracted: {len(all_extracted_questions)}")
             logger.info(f"  - Valid screenshots: {len(valid_screenshots)}")
             
-            # Generate questions from all scraped content
-            questions = await self._generate_questions_from_content(
-                all_scraped_content, research_topic, target_population
-            )
-            
-            return questions, scraped_sources, valid_screenshots
+            # Return extracted questions (not generated ones)
+            return all_extracted_questions, scraped_sources, valid_screenshots
             
         except Exception as e:
-            logger.error(f"Error in search with deep URL filtering: {e}")
-            return await self._fallback_search(research_topic, target_population)
+            logger.error(f"Error in batch URL processing: {e}")
+            return [], [], []
 
     async def validate_screenshot(self, screenshot_base64: str, url: str) -> bool:
         """
@@ -266,17 +634,17 @@ class ResearchWorkflow:
         except:
             return "Unknown"
 
-    async def _generate_questions_from_content(self, scraped_content: str, research_topic: str, target_population: str) -> List[str]:
-        """Generate exactly 10 questions from scraped content using LLM"""
+    async def _generate_questions_from_content(self, scraped_content: str, research_topic: str, target_population: str, num_questions: int = 6) -> List[str]:
+        """Generate exactly num_questions questions from scraped content using LLM"""
         
         prompt = f"""
-    Based on the following scraped web content about "{research_topic}", create exactly 10 professional survey questions suitable for "{target_population}".
+    Based on the following scraped web content about "{research_topic}", create exactly {num_questions} professional survey questions suitable for "{target_population}".
 
     SCRAPED CONTENT:
-    {scraped_content[:6000]}  # Limit content for LLM processing
+    {scraped_content[:6000]}
 
     INSTRUCTIONS:
-    1. Create exactly 10 survey questions
+    1. Create exactly {num_questions} survey questions
     2. Base questions on the concepts, topics, and information found in the scraped content
     3. Make questions relevant to "{research_topic}" research
     4. Use professional survey language appropriate for "{target_population}"
@@ -285,32 +653,27 @@ class ResearchWorkflow:
     7. Return only the questions, one per line
     8. All questions must end with a question mark
 
-    Generate exactly 10 survey questions:
+    Generate exactly {num_questions} survey questions:
     """
         
         try:
             response = await self.llm.ask(prompt, temperature=0.7)
             cleaned_response = remove_chinese_and_punct(str(response))
             
-            # Parse questions from response
             lines = cleaned_response.split('\n')
             questions = []
             
             for line in lines:
                 line = line.strip()
-                # Remove numbering, bullets, etc.
                 line = re.sub(r'^[\d\.\-\•\*\s]*', '', line)
                 
                 if line and len(line) > 15:
-                    # Ensure question ends with ?
                     if not line.endswith('?'):
                         line += '?'
                     questions.append(line)
             
-            # Ensure we have exactly 10 questions
-            if len(questions) < 10:
-                # If fewer than 10, generate additional simple questions
-                additional_needed = 10 - len(questions)
+            if len(questions) < num_questions:
+                additional_needed = num_questions - len(questions)
                 basic_questions = [
                     f"How satisfied are you with {research_topic}?",
                     f"How often do you engage with {research_topic}?",
@@ -321,22 +684,21 @@ class ResearchWorkflow:
                 ]
                 questions.extend(basic_questions[:additional_needed])
             
-            # Return exactly 10 questions
-            return questions[:10]
+            return questions[:num_questions]
             
         except Exception as e:
             logger.error(f"Error generating questions from content: {e}")
-            # Fallback to basic questions if LLM fails
             return [
                 f"How satisfied are you with {research_topic}?",
                 f"How often do you use {research_topic}?",
                 f"How important is {research_topic} to you?",
                 f"How likely are you to recommend {research_topic}?",
-                f"What factors influence your decisions about {research_topic}?"
-            ]
+                f"What factors influence your decisions about {research_topic}?",
+                f"How would you rate your overall experience with {research_topic}?"
+            ][:num_questions]
 
     async def _scrape_page_content(self, url: str) -> str:
-        """Scrape content from a webpage"""
+        """Enhanced content scraping with better text extraction"""
         try:
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
@@ -348,18 +710,37 @@ class ResearchWorkflow:
             soup = BeautifulSoup(response.content, 'html.parser')
             
             # Remove unwanted elements
-            for element in soup(['script', 'style', 'nav', 'header', 'footer', 'aside']):
+            for element in soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe', 'noscript']):
                 element.decompose()
             
-            # Extract text content
-            text = soup.get_text()
+            # Try to find content in common containers first
+            content_selectors = [
+                'main', '.content', '.main-content', '.post-content', 
+                '.article-content', '.entry-content', '.page-content',
+                'article', '.survey-questions', '.questions', '.form-content'
+            ]
+            
+            main_content = ""
+            for selector in content_selectors:
+                elements = soup.select(selector)
+                if elements:
+                    main_content = ' '.join([elem.get_text() for elem in elements])
+                    break
+            
+            # If no specific content area found, get all text
+            if not main_content:
+                main_content = soup.get_text()
             
             # Clean up text
-            lines = (line.strip() for line in text.splitlines())
+            lines = (line.strip() for line in main_content.splitlines())
             chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
             cleaned_text = ' '.join(chunk for chunk in chunks if chunk)
             
-            # Limit content length for LLM processing
+            # Remove extra whitespace
+            cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+            
+            logger.info(f"✅ Successfully scraped {len(cleaned_text)} characters from {url}")
+            logger.info(f"Content: {cleaned_text[:8000]}")
             return cleaned_text[:8000]  # Limit to 8000 characters
             
         except Exception as e:
@@ -371,8 +752,8 @@ class ResearchWorkflow:
         """Enhanced fallback that uses LLM to generate questions"""
         logger.info("Using enhanced LLM fallback for question generation")
         
-        # Generate comprehensive set of questions using LLM
-        questions = await self._generate_questions_with_llm(research_topic, target_population, 5)
+        # Generate 6 questions using LLM (reduced from more)
+        questions = await self._generate_questions_with_llm(research_topic, target_population, 6)
         
         # Create sources for fallback
         sources = ["Generated based on research methodology"] * len(questions)
@@ -441,7 +822,7 @@ GENERATE {num_needed} SURVEY QUESTIONS:
         """Start the research design process"""
         self.active_sessions[session_id] = ResearchDesign(
             stage=ResearchStage.DESIGN_INPUT,
-            chat_history=[]  # Initialize empty chat history
+            chat_history=[]
         )
         
         initial_response = """
@@ -449,7 +830,7 @@ GENERATE {num_needed} SURVEY QUESTIONS:
 
     Let's design your research study step by step. I'll ask you a series of questions to help create a comprehensive research design.
 
-    **Question 1 of 4: Research Topic**
+    **Question 1 of 3: Research Topic**
     What are you looking to find out? Please describe your research topic or area of interest.
 
     Examples:
@@ -837,7 +1218,7 @@ Please respond with:
         logger.info(f"Logged chat interaction for session {session_id}, total interactions: {len(session.chat_history)}")
 
     async def _handle_design_input(self, session_id: str, user_input: str) -> str:
-        """Handle user input during design input phase"""
+        """Handle user input during design input phase - now 3 questions instead of 4"""
         session = self.active_sessions[session_id]
         
         if not session.user_responses:
@@ -852,25 +1233,23 @@ Please respond with:
             logger.info(f"Session {session_id}: Saved topic - {session.research_topic}")
             
             return """
-**Question 2 of 4: Research Objectives**
-What specific objectives do you want to achieve with this research? 
+    **Question 2 of 3: Research Objectives**
+    What specific objectives do you want to achieve with this research? 
 
-Examples:
-- Understand customer satisfaction levels
-- Identify factors influencing purchasing decisions
-- Measure the effectiveness of a new program
-- Compare different groups or conditions
+    Examples:
+    - Understand customer satisfaction levels
+    - Identify factors influencing purchasing decisions
+    - Measure the effectiveness of a new program
+    - Compare different groups or conditions
 
-Please list your research objectives (you can provide multiple objectives):
-"""
+    Please list your research objectives (you can provide multiple objectives):
+    """
         
         elif 'objectives' not in session.user_responses:
             # This is the response to Question 2 (objectives)
-            # Handle both single line and multi-line objectives
             if '\n' in user_input:
                 objectives = [obj.strip() for obj in user_input.split('\n') if obj.strip()]
             else:
-                # If single line, try to split by common delimiters
                 if ',' in user_input:
                     objectives = [obj.strip() for obj in user_input.split(',') if obj.strip()]
                 elif ';' in user_input:
@@ -884,104 +1263,78 @@ Please list your research objectives (you can provide multiple objectives):
             logger.info(f"Session {session_id}: Saved objectives - {session.objectives}")
             
             return """
-**Question 3 of 4: Target Population**
-Who is your target population or study participants?
+    **Question 3 of 3: Target Population**
+    Who is your target population or study participants?
 
-Examples:
-- Adults aged 18-65 in urban areas
-- College students at public universities
-- Small business owners in the technology sector
-- Parents of children under 12
+    Examples:
+    - Adults aged 18-65 in urban areas
+    - College students at public universities
+    - Small business owners in the technology sector
+    - Parents of children under 12
 
-Please describe your target population:
-"""
+    Please describe your target population:
+    """
         
         elif 'target_population' not in session.user_responses:
-            # This is the response to Question 3 (target population)
+            # This is the response to Question 3 (target population) - final question
             session.user_responses['target_population'] = user_input.strip()
             session.target_population = user_input.strip()
             
             logger.info(f"Session {session_id}: Saved target population - {session.target_population}")
-            
-            return """
-**Question 4 of 4: Research Timeframe**
-What is the timeframe for your research study?
-
-Examples:
-- Cross-sectional (one-time survey)
-- Longitudinal over 6 months
-- Pre-post intervention study
-- Historical data from 2020-2024
-
-Please specify your research timeframe:
-"""
-        
-        elif 'timeframe' not in session.user_responses:
-            # This is the response to Question 4 (timeframe) - final question
-            session.user_responses['timeframe'] = user_input.strip()
-            session.timeframe = user_input.strip()
-            
-            logger.info(f"Session {session_id}: Saved timeframe - {session.timeframe}")
-            logger.info(f"Session {session_id}: All 4 questions completed, generating research design")
+            logger.info(f"Session {session_id}: All 3 questions completed, generating research design")
             
             # Generate research design summary
             research_design = await self._generate_research_design(session)
             session.stage = ResearchStage.DESIGN_REVIEW
             
             return f"""
-📋 **Research Design Summary**
+    📋 **Research Design Summary**
 
-**Topic:** {session.research_topic}
+    **Topic:** {session.research_topic}
 
-**Objectives:**
-{chr(10).join(f"• {obj}" for obj in session.objectives)}
+    **Objectives:**
+    {chr(10).join(f"• {obj}" for obj in session.objectives)}
 
-**Target Population:** {session.target_population}
+    **Target Population:** {session.target_population}
 
-**Timeframe:** {session.timeframe}
+    **Generated Research Design:**
+    {research_design}
 
-**Generated Research Design:**
-{research_design}
+    ---
 
----
+    **Is this research design acceptable?**
 
-**Is this research design acceptable?**
-
-Reply with:
-- **Y** (Yes) - Proceed to search for relevant questions and data
-- **N** (No) - Revise the research design
-- **S** (Save) - Save and export this design
-- **E** (Exit) - Exit the workflow
-"""
+    Reply with:
+    - **Y** (Yes) - Proceed to search for relevant questions and data
+    - **N** (No) - Revise the research design
+    - **S** (Save) - Save and export this design
+    - **E** (Exit) - Exit the workflow
+    """
         
         else:
-            # All questions have been answered - this shouldn't happen in DESIGN_INPUT stage
             logger.warning(f"Session {session_id}: Unexpected state - all questions answered but still in DESIGN_INPUT stage")
             return "All research design questions have been completed. Please proceed with the review."
     
     async def _generate_research_design(self, session: ResearchDesign) -> str:
-        """Generate a comprehensive research design using LLM"""
+        """Generate a comprehensive research design using LLM without specifying data collection modes"""
         prompt = f"""
-Generate a comprehensive research design based on the following information:
+    Generate a comprehensive research design based on the following information:
 
-Topic: {session.research_topic}
-Objectives: {', '.join(session.objectives)}
-Target Population: {session.target_population}
-Timeframe: {session.timeframe}
+    Topic: {session.research_topic}
+    Objectives: {', '.join(session.objectives)}
+    Target Population: {session.target_population}
 
-Please provide:
-1. Research methodology recommendations
-2. Suggested data collection methods
-3. Key variables to measure
-4. Potential limitations and considerations
-5. Recommended sample size
+    Please provide:
+    1. Research methodology recommendations
+    2. Key variables to measure
+    3. Potential limitations and considerations
+    4. Recommended sample size
 
-Keep the response concise but comprehensive (under 300 words). Respond in English only.
-"""
+    Keep the response concise but comprehensive (under 300 words). Focus on online survey methodology as the primary approach. Respond in English only.
+    """
         
         try:
             response = await self.llm.ask(prompt, temperature=0.7)
-            # Clean the response to remove Chinese characters
             cleaned_response = remove_chinese_and_punct(str(response))
             return cleaned_response
         except Exception as e:
@@ -1129,61 +1482,62 @@ Please respond with:
             return False
 
     async def _search_database(self, session: ResearchDesign) -> str:
-        """Search internet with deep URL filtering"""
+        """Search internet and extract real questions with improved source formatting"""
         try:
-            relevant_questions, sources, screenshots = await self._search_internet_for_questions(
-                session.research_topic, session.target_population
+            extracted_questions, sources, screenshots = await self._search_internet_for_questions(
+                session.research_topic, session.target_population, session
             )
             
-            if not relevant_questions:
+            if not extracted_questions:
                 return f"""
-    ❌ **No Deep Content Found**
+    ❌ **No Survey Questions Found**
 
-    Unable to find relevant survey content in deep URLs for your research topic.
-    This might be because:
-    - Most results were root domain pages (filtered out)
-    - Limited specific survey content available
-    - API rate limits or network issues
+    Unable to find actual survey questions in the current batch of URLs.
 
     **Would you like to:**
-    - **R** (Retry) - Try the search again
-    - **P** (Proceed) - Continue with AI-generated questions
+    - **R** (Rebrowse) - Try the next batch of URLs
     - **E** (Exit) - Exit workflow
     """
             
-            # Store results
-            session.internet_questions = relevant_questions
+            # Store results - convert to simple format for compatibility
+            session.internet_questions = [q['question'] for q in extracted_questions]
             session.internet_sources = sources
             session.screenshots = screenshots
+            # Store detailed questions with sources for display
+            session.extracted_questions_with_sources = extracted_questions
             session.stage = ResearchStage.DECISION_POINT
             
-            # Format questions with numbers for easy selection
-            questions_with_numbers = []
-            for i, question in enumerate(relevant_questions, 1):
-                questions_with_numbers.append(f"{i}. {question}")
+            # Initialize extractor for formatting
+            if not hasattr(self, '_question_extractor'):
+                self._question_extractor = ImprovedQuestionExtractor()
             
-            unique_sources = list(set(sources))
+            # Format questions grouped by source with full URLs
+            formatted_questions = self._question_extractor.format_questions_by_source(extracted_questions)
+            
+            # Calculate progress info
+            total_collected = len(session.all_collected_urls) if session.all_collected_urls else 0
+            current_batch = session.current_batch_index
+            processed_count = len(session.browsed_urls) if session.browsed_urls else 0
             
             return f"""
-    🔍 **Deep Content Research Results**
+    🔍 **Real Survey Questions Found (Batch {current_batch}/{(total_collected + 5) // 6})**
 
-    Found {len(relevant_questions)} relevant questions from specific survey content:
+    Found {len(extracted_questions)} actual survey questions from websites:
 
-    {chr(10).join(questions_with_numbers)}
+    {formatted_questions}
 
-    **📊 Quality Summary:**
-    - **Sources:** {len(unique_sources)} specialized websites
-    - **Content:** Scraped from {len(sources)} deep content pages
+    **📊 Progress Summary:**
+    - **URLs processed:** {processed_count} of {total_collected} collected
+    - **Current batch:** {len(sources)} URLs processed in this batch
+    - **Questions extracted:** {len(extracted_questions)} real questions (not AI-generated)
     - **Screenshots:** {len(screenshots)} quality screenshots captured
     ---
 
     **What would you like to do with these questions?**
 
     Reply with:
-    - **Y** (Yes) - Go to Questionnaire Builder and include these questions
-    - **N** (No) - Use only these questions and proceed to testing  
-    - **A** (AI Only) - Skip these, use only AI-generated questions
-    - **S** (Select) - Choose specific questions from the internet results to include
+    - **Y** (Yes) - Use these questions and build the questionnaire
+    - **R** (Rebrowse) - Search the next batch of URLs for more questions
     - **E** (Exit) - Exit workflow
     """
             
@@ -1192,52 +1546,179 @@ Please respond with:
             return f"❌ Search Error: {str(e)}"
     
     async def _handle_decision_point(self, session_id: str, user_input: str) -> str:
-        """Handle major decision point with all options working correctly"""
+        """Handle decision point with rebrowse limits"""
         session = self.active_sessions[session_id]
         response = user_input.upper().strip()
         
         if response == 'Y':
-            # Include ALL internet questions + generate additional questions
+            # Use current questions and proceed to questionnaire builder
             session.use_internet_questions = True
-            session.include_all_internet_questions = True  # NEW flag
-            session.selected_internet_questions = False
-            session.stage = ResearchStage.QUESTIONNAIRE_BUILDER
-            return await self._start_questionnaire_builder(session)
-        elif response == 'N':
-            # Use ONLY internet questions and proceed directly to testing
             session.questions = session.internet_questions.copy()
-            session.use_internet_questions = True
-            session.include_all_internet_questions = True
-            session.selected_internet_questions = False
-            await self._store_accepted_questions(session)
-            return await self._test_questions(session)
-        elif response == 'A':
-            # Skip internet questions, use only AI-generated questions
-            session.use_internet_questions = False
-            session.include_all_internet_questions = False
-            session.selected_internet_questions = False
             session.stage = ResearchStage.QUESTIONNAIRE_BUILDER
             return await self._start_questionnaire_builder(session)
-        elif response == 'S':
-            # Select specific questions from internet questions as extras
-            session.use_internet_questions = True
-            session.include_all_internet_questions = False
-            session.selected_internet_questions = True  # Selection mode
-            session.stage = ResearchStage.QUESTIONNAIRE_BUILDER
-            return await self._start_questionnaire_builder(session)
+        elif response == 'R':
+            # Check if rebrowse is still allowed
+            if session.rebrowse_count >= 4:
+                return """
+    ❌ **Maximum Rebrowses Reached**
+
+    You have already browsed through all available URLs.
+
+    Please choose:
+    - **Y** (Yes) - Use the current questions and build the questionnaire
+    - **E** (Exit) - Exit workflow
+    """
+            # Rebrowse internet for more questions
+            return await self._rebrowse_internet(session)
         elif response == 'E':
             del self.active_sessions[session_id]
             return "Research design workflow ended. Thank you!"
         else:
-            return """
+            # Check if rebrowse option should be shown
+            rebrowse_option = "- **R** (Rebrowse) - Search a few more URLs for additional questions" if session.rebrowse_count < 4 else ""
+            
+            return f"""
     Please respond with:
-    - **Y** (Yes) - Go to Questionnaire Builder and include ALL these questions
-    - **N** (No) - Use ONLY these questions and proceed to testing  
-    - **A** (AI Only) - Skip these, use only AI-generated questions
-    - **S** (Select) - Choose specific questions from the internet results to include
+    - **Y** (Yes) - Use these questions and build the questionnaire
+    {rebrowse_option}
     - **E** (Exit) - Exit workflow
     """
-    
+
+    async def _rebrowse_internet(self, session: ResearchDesign) -> str:
+        """Rebrowse next batch of URLs and extract real questions with improved formatting"""
+        try:
+            # Check rebrowse limit
+            if session.rebrowse_count >= 4:
+                total_questions = len(session.internet_questions) if session.internet_questions else 0
+                
+                # Format final results with full URLs
+                if hasattr(session, 'extracted_questions_with_sources') and session.extracted_questions_with_sources:
+                    if not hasattr(self, '_question_extractor'):
+                        self._question_extractor = ImprovedQuestionExtractor()
+                    formatted_final = self._question_extractor.format_questions_by_source(session.extracted_questions_with_sources)
+                else:
+                    formatted_final = chr(10).join(f"{i+1}. {q}" for i, q in enumerate(session.internet_questions or []))
+                
+                return f"""
+    📚 **All Relevant URLs Processed**
+
+    You have browsed through all the relevant URLs we found for your research topic.
+
+    **Final Results Summary:**
+    - **Total URLs collected:** {len(session.all_collected_urls) if session.all_collected_urls else 0}
+    - **Total URLs processed:** {len(session.browsed_urls) if session.browsed_urls else 0}
+    - **Total real questions extracted:** {total_questions}
+
+    **All Extracted Questions by Source:**
+    {formatted_final}
+
+    **Would you like to:**
+    - **Y** (Yes) - Use these questions and build the questionnaire
+    - **E** (Exit) - Exit workflow
+    """
+            
+            # Increment rebrowse count
+            session.rebrowse_count += 1
+            
+            # Get new questions from next batch
+            new_extracted_questions, new_sources, new_screenshots = await self._search_internet_for_questions(
+                session.research_topic, session.target_population, session
+            )
+            
+            if not new_extracted_questions:
+                # Format current results for display
+                if hasattr(session, 'extracted_questions_with_sources') and session.extracted_questions_with_sources:
+                    if not hasattr(self, '_question_extractor'):
+                        self._question_extractor = ImprovedQuestionExtractor()
+                    formatted_current = self._question_extractor.format_questions_by_source(session.extracted_questions_with_sources)
+                else:
+                    formatted_current = chr(10).join(f"{i+1}. {q}" for i, q in enumerate(session.internet_questions or []))
+                
+                return f"""
+    ❌ **No More Questions Found**
+
+    No additional survey questions found in the remaining URLs.
+
+    **Current Results by Source:**
+    {formatted_current}
+
+    **Would you like to:**
+    - **Y** (Yes) - Use the current questions and build the questionnaire
+    - **E** (Exit) - Exit workflow
+    """
+            
+            # SIMPLE FIX: Combine with uniqueness checking
+            old_detailed = getattr(session, 'extracted_questions_with_sources', [])
+            
+            # Create a set of existing questions for deduplication
+            existing_questions = set()
+            for old_q in old_detailed:
+                existing_questions.add(old_q['question'].lower().strip())
+            
+            # Filter new questions to only include truly unique ones
+            unique_new_questions = []
+            for new_q in new_extracted_questions:
+                question_text = new_q['question'].lower().strip()
+                if question_text not in existing_questions:
+                    unique_new_questions.append(new_q)
+                    existing_questions.add(question_text)  # Add to set for next iteration
+                    logger.info(f"✅ Added unique rebrowse question: {new_q['question'][:50]}...")
+                else:
+                    logger.info(f"⚠️ Skipped duplicate rebrowse question: {new_q['question'][:50]}...")
+            
+            # Combine old and new questions (now guaranteed unique)
+            new_questions_simple = [q['question'] for q in unique_new_questions]
+            all_questions = (session.internet_questions or []) + new_questions_simple
+            all_sources = (session.internet_sources or []) + new_sources
+            all_screenshots = (session.screenshots or []) + new_screenshots
+            
+            # Combine detailed questions with sources
+            all_detailed = old_detailed + unique_new_questions
+            session.extracted_questions_with_sources = all_detailed
+            
+            # Update session with combined results
+            session.internet_questions = all_questions
+            session.internet_sources = all_sources
+            session.screenshots = all_screenshots
+            
+            # Format all questions by source
+            if not hasattr(self, '_question_extractor'):
+                self._question_extractor = ImprovedQuestionExtractor()
+            formatted_all = self._question_extractor.format_questions_by_source(all_detailed)
+            
+            # Calculate progress
+            total_collected = len(session.all_collected_urls) if session.all_collected_urls else 0
+            current_batch = session.current_batch_index
+            processed_count = len(session.browsed_urls) if session.browsed_urls else 0
+            remaining_batches = max(0, ((total_collected + 5) // 6) - current_batch)
+            
+            return f"""
+    🔍 **Extended Real Questions Found (Batch {current_batch}/{(total_collected + 5) // 6})**
+
+    **All UNIQUE Questions by Source:**
+    {formatted_all}
+
+    **📊 Updated Progress:**
+    - **Total UNIQUE Questions:** {len(all_questions)} real questions extracted
+    - **New unique questions this batch:** {len(unique_new_questions)}
+    - **URLs processed:** {processed_count} of {total_collected} collected
+    - **Screenshots:** {len(all_screenshots)} quality screenshots captured
+    - **Remaining batches:** {remaining_batches}
+    - **Rebrowses used:** {session.rebrowse_count} of 4 maximum
+    ---
+
+    **What would you like to do with these questions?**
+
+    Reply with:
+    - **Y** (Yes) - Use all these questions and build the questionnaire
+    {"- **R** (Rebrowse) - Search the next batch of URLs for more questions" if session.rebrowse_count < 4 else ""}
+    - **E** (Exit) - Exit workflow
+    """
+            
+        except Exception as e:
+            logger.error(f"Error in rebrowse internet: {e}")
+            return f"❌ Rebrowse Error: {str(e)}"
+
     async def _start_questionnaire_builder(self, session: ResearchDesign) -> str:
         """Start the questionnaire builder process with step-by-step prompts"""
         
@@ -3045,11 +3526,35 @@ class OpenManusUI:
                             response_content = await self.research_workflow.process_research_input(
                                 session_id, request.content
                             )
+                    
+                    # Special handling for rebrowse option
+                    elif session.stage == ResearchStage.DECISION_POINT and request.content.upper().strip() == 'R':
+                        try:
+                            response_content = await self.research_workflow.process_research_input(
+                                session_id, request.content
+                            )
+                            
+                            # Check if we have updated screenshots to include
+                            if hasattr(session, 'screenshots') and session.screenshots:
+                                slideshow_data = {
+                                    "screenshots": session.screenshots,
+                                    "total_count": len(session.screenshots),
+                                    "research_topic": session.research_topic
+                                }
+                                
+                        except Exception as e:
+                            logger.warning(f"Could not capture rebrowse screenshots: {e}")
+                            response_content = await self.research_workflow.process_research_input(
+                                session_id, request.content
+                            )
+                    
+                    # Regular research workflow processing for all other cases
                     else:
                         response_content = await self.research_workflow.process_research_input(
                             session_id, request.content
                         )
                     
+                    # Prepare the result
                     result = {
                         "response": response_content,
                         "status": "success",
@@ -3057,6 +3562,7 @@ class OpenManusUI:
                         "session_id": session_id
                     }
                     
+                    # Add slideshow data if we have screenshots
                     if slideshow_data:
                         result["slideshow_data"] = slideshow_data
                         # Also include first screenshot as main browser image
@@ -3226,6 +3732,40 @@ class OpenManusUI:
                     except Exception as e:
                         logger.warning(f"Could not process research with screenshots: {e}")
                 
+                elif session.stage == ResearchStage.DECISION_POINT and user_message.upper().strip() == 'R':
+                    try:
+                        # Process the rebrowse which will capture additional screenshots
+                        response = await self.research_workflow.process_research_input(session_id, user_message)
+                        
+                        # After processing, check if we have updated screenshots to display
+                        if hasattr(session, 'screenshots') and session.screenshots:
+                            logger.info(f"Broadcasting updated slideshow with {len(session.screenshots)} screenshots")
+                            
+                            # Send updated slideshow data to frontend
+                            await self.broadcast_message("slideshow_data", {
+                                "screenshots": session.screenshots,
+                                "total_count": len(session.screenshots),
+                                "research_topic": session.research_topic
+                            })
+                            
+                            # Also send the first screenshot to browser view
+                            if session.screenshots:
+                                await self.broadcast_message("browser_state", {
+                                    "base64_image": session.screenshots[0]['screenshot'],
+                                    "url": session.screenshots[0]['url'],
+                                    "title": session.screenshots[0]['title'],
+                                    "source_url": session.screenshots[0]['url']
+                                })
+                        
+                        await self.broadcast_message("agent_message", {
+                            "content": response,
+                            "action_type": UserAction.BUILD_QUESTIONNAIRE.value,
+                            "session_id": session_id
+                        })
+                        return
+                        
+                    except Exception as e:
+                        logger.warning(f"Could not process rebrowse with screenshots: {e}")
                 # Regular research workflow processing
                 response = await self.research_workflow.process_research_input(session_id, user_message)
                 

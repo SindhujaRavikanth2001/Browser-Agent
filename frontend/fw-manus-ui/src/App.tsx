@@ -16,7 +16,9 @@ import {
   Alert,
   Snackbar,
   LinearProgress,
-  Chip
+  Chip,
+  Drawer,
+  CircularProgress
 } from '@mui/material';
 import { alpha } from '@mui/material/styles';
 import SendIcon from '@mui/icons-material/Send';
@@ -30,6 +32,8 @@ import ArrowBackIosIcon from '@mui/icons-material/ArrowBackIos';
 import ArrowForwardIosIcon from '@mui/icons-material/ArrowForwardIos';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import PauseIcon from '@mui/icons-material/Pause';
+import GetAppIcon from '@mui/icons-material/GetApp';
+import RefreshIcon from '@mui/icons-material/Refresh';
 import './App.css';
 
 // TypeScript declarations for Speech Recognition API
@@ -121,6 +125,18 @@ type SlideshowData = {
   screenshots: ScreenshotData[];
   total_count: number;
   research_topic: string;
+  is_update?: boolean;
+  new_screenshots_added?: number;
+};
+
+// Download types
+type DownloadFile = {
+  filename: string;
+  filepath: string;
+  type: string;
+  size: number;
+  created: number;
+  display_name: string;
 };
 
 function App() {
@@ -154,6 +170,16 @@ function App() {
   const [currentImageUrl, setCurrentImageUrl] = useState<string>('');
   const [currentImageTitle, setCurrentImageTitle] = useState<string>('');
   const slideshowTimerRef = useRef<number | null>(null);
+
+  // Download state
+  const [availableFiles, setAvailableFiles] = useState<DownloadFile[]>([]);
+  const [showDownloadPanel, setShowDownloadPanel] = useState(false);
+  const [downloadLoading, setDownloadLoading] = useState(false);
+  const [downloadNotification, setDownloadNotification] = useState({ 
+    open: false, 
+    message: '', 
+    severity: 'success' as 'success' | 'error' | 'warning' | 'info'
+  });
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const actionsEndRef = useRef<HTMLDivElement>(null);
@@ -163,6 +189,98 @@ function App() {
   useEffect(() => {
     voiceInputRef.current = voiceInput;
   }, [voiceInput]);
+
+  // Download functions
+  const fetchAvailableFiles = async () => {
+    try {
+      const response = await fetch('/api/research-files');
+      const data = await response.json();
+      setAvailableFiles(data.files || []);
+    } catch (error) {
+      console.error('Error fetching files:', error);
+    }
+  };
+
+  const downloadFile = async (filename: string) => {
+    try {
+      setDownloadLoading(true);
+      const response = await fetch(`/api/download/${filename}`);
+      
+      if (response.ok) {
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.style.display = 'none';
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+        
+        // Show success notification
+        showDownloadNotification(`Successfully downloaded: ${filename}`, 'success');
+      } else {
+        showDownloadNotification('Download failed. Please try again.', 'error');
+        console.error('Download failed:', response.statusText);
+      }
+    } catch (error) {
+      showDownloadNotification('Download error. Please check your connection.', 'error');
+      console.error('Error downloading file:', error);
+    } finally {
+      setDownloadLoading(false);
+    }
+  };
+
+  const downloadLatestFile = async (fileType: string) => {
+    try {
+      setDownloadLoading(true);
+      const response = await fetch(`/api/download-latest/${fileType}`);
+      
+      if (response.ok) {
+        const blob = await response.blob();
+        const filename = response.headers.get('content-disposition')
+          ?.split('filename=')[1]?.replace(/"/g, '') || `latest_${fileType}.txt`;
+        
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.style.display = 'none';
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+        
+        // Show success notification
+        showDownloadNotification(`Successfully downloaded: ${filename}`, 'success');
+      } else {
+        showDownloadNotification(`No ${fileType.replace('_', ' ')} files found.`, 'warning');
+        console.error('Download failed:', response.statusText);
+      }
+    } catch (error) {
+      showDownloadNotification('Download error. Please check your connection.', 'error');
+      console.error('Error downloading latest file:', error);
+    } finally {
+      setDownloadLoading(false);
+    }
+  };
+
+  const formatFileSize = (bytes: number) => {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  };
+
+  const formatDate = (timestamp: number) => {
+    return new Date(timestamp * 1000).toLocaleString();
+  };
+
+  const showDownloadNotification = (message: string, severity: 'success' | 'error' | 'warning' | 'info' = 'success') => {
+    setDownloadNotification({ open: true, message, severity });
+  };
 
   // Initialize Speech Recognition
   useEffect(() => {
@@ -468,22 +586,101 @@ function App() {
           setCurrentImageUrl(data.image_url || '');
           setCurrentImageTitle(data.image_title || '');
         }
-      } else if (data.type === 'slideshow_data') {
-        // Handle slideshow data
-        console.log('Received slideshow data:', data);
-        setSlideshowData({
-          screenshots: data.screenshots,
-          total_count: data.total_count,
-          research_topic: data.research_topic
-        });
-        setCurrentSlideIndex(0);
-        
-        // Set the first screenshot as current
-        if (data.screenshots && data.screenshots.length > 0) {
-          setBrowserState(data.screenshots[0].screenshot);
-          setCurrentImageUrl(data.screenshots[0].url);
-          setCurrentImageTitle(data.screenshots[0].title);
+
+        // NEW: Detect when research package is completed and files are generated
+        if (data.content) {
+          const content = data.content.toLowerCase();
+          
+          // Check if this message indicates files were generated
+          if (content.includes('research package complete') || 
+              content.includes('exported to') || 
+              content.includes('package exported') ||
+              content.includes('research_outputs/')) {
+            
+            // Show notification that files are ready for download
+            showDownloadNotification(
+              'Research files generated! Click the download button in the header to access them.',
+              'success'
+            );
+            
+            // Automatically refresh available files
+            setTimeout(() => {
+              fetchAvailableFiles();
+            }, 1000);
+          }
         }
+      } else if (data.type === 'slideshow_data') {
+        // ENHANCED: Handle slideshow data updates
+        console.log('Received slideshow data:', data);
+        
+        // If this is an update to existing slideshow
+        if (data.is_update && slideshowData) {
+          console.log(`Slideshow update: Added ${data.new_screenshots_added || 0} new screenshots`);
+          
+          // Update existing slideshow data safely
+          setSlideshowData(prevData => {
+            if (!prevData) {
+              // If prevData is null, treat as initial setup
+              return {
+                screenshots: data.screenshots || [],
+                total_count: data.total_count || 0,
+                research_topic: data.research_topic || ''
+              };
+            }
+            
+            return {
+              ...prevData,
+              screenshots: data.screenshots || prevData.screenshots || [],
+              total_count: data.total_count || prevData.total_count || 0,
+              research_topic: data.research_topic || prevData.research_topic || ''
+            };
+          });
+          
+          // Show a brief notification about the update
+          if (data.new_screenshots_added > 0) {
+            // You could add a toast notification here
+            console.log(`✅ Added ${data.new_screenshots_added} new screenshots to slideshow`);
+          }
+          
+          // Don't reset slide index for updates - user might be viewing specific slides
+          // But ensure index is valid
+          if (currentSlideIndex >= (data.screenshots?.length || 0)) {
+            setCurrentSlideIndex(Math.max(0, (data.screenshots?.length || 1) - 1));
+          }
+          
+        } else {
+          // Initial slideshow setup
+          console.log('Setting up initial slideshow with', data.screenshots?.length || 0, 'screenshots');
+          setSlideshowData({
+            screenshots: data.screenshots || [],
+            total_count: data.total_count || 0,
+            research_topic: data.research_topic || ''
+          });
+          setCurrentSlideIndex(0);
+        }
+        
+        // Set the current screenshot (first for new, or maintain current for updates)
+        if (data.screenshots && data.screenshots.length > 0) {
+          let targetIndex = 0;
+          
+          // For updates, stay on current slide if valid, or go to latest
+          if (data.is_update && slideshowData) {
+            if (currentSlideIndex < data.screenshots.length) {
+              targetIndex = currentSlideIndex;
+            } else {
+              targetIndex = data.screenshots.length - 1; // Go to latest
+            }
+          }
+          
+          const targetScreenshot = data.screenshots[targetIndex];
+          if (targetScreenshot) {
+            setBrowserState(targetScreenshot.screenshot);
+            setCurrentImageUrl(targetScreenshot.url || '');
+            setCurrentImageTitle(targetScreenshot.title || '');
+            setCurrentSlideIndex(targetIndex);
+          }
+        }
+        
       } else if (data.type === 'agent_message_stream_start') {
         setIsStreaming(true);
         setStreamingMessage('');
@@ -620,6 +817,148 @@ function App() {
     setActiveTab(newValue);
   };
 
+  // Download Panel Component
+  const DownloadPanel = () => (
+    <Drawer
+      anchor="right"
+      open={showDownloadPanel}
+      onClose={() => setShowDownloadPanel(false)}
+      sx={{
+        '& .MuiDrawer-paper': {
+          width: 400,
+          maxWidth: '90vw',
+          p: 0
+        }
+      }}
+    >
+      <Box sx={{ p: 3, height: '100%', overflow: 'auto' }}>
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
+          <Typography variant="h6" fontWeight="600">
+            Download Research Files
+          </Typography>
+          <IconButton onClick={() => setShowDownloadPanel(false)}>
+            <CloseIcon />
+          </IconButton>
+        </Box>
+
+        {/* Quick Download Section */}
+        <Paper elevation={0} sx={{ p: 2, mb: 3, backgroundColor: alpha(theme.palette.primary.main, 0.05) }}>
+          <Typography variant="subtitle2" sx={{ mb: 2, fontWeight: 600 }}>
+            Quick Downloads
+          </Typography>
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+            <Button
+              variant="outlined"
+              size="small"
+              onClick={() => downloadLatestFile('complete_research_package')}
+              disabled={downloadLoading}
+              startIcon={<GetAppIcon />}
+              sx={{ textTransform: 'none' }}
+            >
+              Latest Research Package
+            </Button>
+            <Button
+              variant="outlined"
+              size="small"
+              onClick={() => downloadLatestFile('chat_history')}
+              disabled={downloadLoading}
+              startIcon={<GetAppIcon />}
+              sx={{ textTransform: 'none' }}
+            >
+              Latest Chat History
+            </Button>
+          </Box>
+        </Paper>
+
+        {/* All Files Section */}
+        <Box sx={{ mb: 2, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <Typography variant="subtitle2" fontWeight="600">
+            All Files ({availableFiles.length})
+          </Typography>
+          <Button
+            size="small"
+            onClick={fetchAvailableFiles}
+            startIcon={<RefreshIcon />}
+            sx={{ textTransform: 'none' }}
+          >
+            Refresh
+          </Button>
+        </Box>
+
+        {availableFiles.length === 0 ? (
+          <Typography variant="body2" color="text.secondary" sx={{ textAlign: 'center', py: 4 }}>
+            No research files found. Complete a research workflow to generate files.
+          </Typography>
+        ) : (
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+            {availableFiles.map((file, index) => (
+              <Paper
+                key={index}
+                elevation={0}
+                sx={{
+                  p: 2,
+                  border: `1px solid ${theme.palette.divider}`,
+                  borderRadius: 2,
+                  '&:hover': {
+                    backgroundColor: alpha(theme.palette.primary.main, 0.02)
+                  }
+                }}
+              >
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', mb: 1 }}>
+                  <Box sx={{ flexGrow: 1, mr: 1 }}>
+                    <Typography variant="body2" fontWeight="500" sx={{ mb: 0.5 }}>
+                      {file.display_name}
+                    </Typography>
+                    <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+                      <Chip
+                        label={file.type.replace('_', ' ')}
+                        size="small"
+                        sx={{
+                          fontSize: '0.7rem',
+                          height: '18px',
+                          backgroundColor: file.type === 'research_package' 
+                            ? alpha(theme.palette.success.main, 0.1)
+                            : file.type === 'chat_history'
+                            ? alpha(theme.palette.info.main, 0.1)
+                            : alpha(theme.palette.grey[500], 0.1)
+                        }}
+                      />
+                      <Typography variant="caption" color="text.secondary">
+                        {formatFileSize(file.size)}
+                      </Typography>
+                    </Box>
+                    <Typography variant="caption" color="text.secondary">
+                      {formatDate(file.created)}
+                    </Typography>
+                  </Box>
+                  <IconButton
+                    size="small"
+                    onClick={() => downloadFile(file.filename)}
+                    disabled={downloadLoading}
+                    sx={{
+                      backgroundColor: alpha(theme.palette.primary.main, 0.1),
+                      '&:hover': {
+                        backgroundColor: alpha(theme.palette.primary.main, 0.2)
+                      }
+                    }}
+                  >
+                    <GetAppIcon fontSize="small" />
+                  </IconButton>
+                </Box>
+              </Paper>
+            ))}
+          </Box>
+        )}
+
+        {downloadLoading && (
+          <Box sx={{ display: 'flex', justifyContent: 'center', mt: 2 }}>
+            <CircularProgress size={24} />
+          </Box>
+        )}
+      </Box>
+    </Drawer>
+  );
+
   return (
     <Box
       sx={{
@@ -666,6 +1005,26 @@ function App() {
               {connected ? 'Connected' : 'Disconnected'}
             </Typography>
           </Box>
+          
+          {/* Download Button */}
+          <Box sx={{ ml: 'auto' }}>
+            <Tooltip title="Download Research Files">
+              <IconButton
+                onClick={() => {
+                  fetchAvailableFiles();
+                  setShowDownloadPanel(true);
+                }}
+                sx={{
+                  backgroundColor: alpha(theme.palette.primary.main, 0.1),
+                  '&:hover': {
+                    backgroundColor: alpha(theme.palette.primary.main, 0.2)
+                  }
+                }}
+              >
+                <GetAppIcon />
+              </IconButton>
+            </Tooltip>
+          </Box>
         </Toolbar>
       </Paper>
 
@@ -678,6 +1037,37 @@ function App() {
       >
         <Alert onClose={clearVoiceError} severity="error" sx={{ width: '100%' }}>
           {voiceError}
+        </Alert>
+      </Snackbar>
+
+      {/* Download Notification Snackbar */}
+      <Snackbar
+        open={downloadNotification.open}
+        autoHideDuration={6000}
+        onClose={() => setDownloadNotification({ ...downloadNotification, open: false })}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+      >
+        <Alert 
+          onClose={() => setDownloadNotification({ ...downloadNotification, open: false })} 
+          severity={downloadNotification.severity} 
+          sx={{ width: '100%' }}
+          action={
+            downloadNotification.severity === 'success' && (
+              <Button 
+                color="inherit" 
+                size="small" 
+                onClick={() => {
+                  fetchAvailableFiles();
+                  setShowDownloadPanel(true);
+                  setDownloadNotification({ ...downloadNotification, open: false });
+                }}
+              >
+                DOWNLOAD
+              </Button>
+            )
+          }
+        >
+          {downloadNotification.message}
         </Alert>
       </Snackbar>
 
@@ -1090,15 +1480,29 @@ function App() {
                           Browser View
                           {slideshowData && (
                             <Chip
-                              label={`${slideshowData.total_count} screenshots`}
+                              label={`${slideshowData.total_count} websites`}
                               size="small"
-                              sx={{ ml: 1, fontSize: '0.75rem' }}
+                              sx={{ 
+                                ml: 1, 
+                                fontSize: '0.75rem',
+                                animation: slideshowData.is_update ? 'pulse 2s ease-in-out' : 'none'
+                              }}
                             />
                           )}
                         </Typography>
                         {currentImageTitle && (
                           <Typography variant="caption" sx={{ display: 'block', opacity: 0.7, mt: 0.5 }}>
                             {currentImageTitle}
+                          </Typography>
+                        )}
+                        {slideshowData?.research_topic && (
+                          <Typography variant="caption" sx={{ 
+                            display: 'block', 
+                            opacity: 0.6, 
+                            fontStyle: 'italic',
+                            mt: 0.25 
+                          }}>
+                            Research: {slideshowData.research_topic}
                           </Typography>
                         )}
                       </Box>
@@ -1145,7 +1549,7 @@ function App() {
                       </Box>
                     </Box>
 
-                    {/* Slideshow Controls */}
+                    {/* Enhanced Slideshow Controls */}
                     {slideshowData && slideshowData.screenshots.length > 1 && (
                       <Box sx={{
                         display: 'flex',
@@ -1180,6 +1584,19 @@ function App() {
                           {currentSlideIndex + 1} / {slideshowData.screenshots.length}
                         </Typography>
                         
+                        {slideshowData.is_update && (
+                          <Chip
+                            label="Updated"
+                            size="small"
+                            color="success"
+                            sx={{ 
+                              fontSize: '0.7rem', 
+                              height: '20px',
+                              animation: 'fadeIn 1s ease-in'
+                            }}
+                          />
+                        )}
+                        
                         <IconButton
                           size="small"
                           onClick={nextSlide}
@@ -1190,12 +1607,16 @@ function App() {
                       </Box>
                     )}
 
-                    {/* Progress bar for slideshow */}
+                    {/* Enhanced Progress bar for slideshow */}
                     {slideshowData && slideshowData.screenshots.length > 1 && (
                       <LinearProgress
                         variant="determinate"
                         value={(currentSlideIndex + 1) / slideshowData.screenshots.length * 100}
-                        sx={{ height: 2 }}
+                        sx={{ 
+                          height: 3,
+                          boxShadow: slideshowData.is_update ? '0 0 8px rgba(46, 196, 72, 0.4)' : 'none',
+                          transition: 'box-shadow 2s ease-out'
+                        }}
                       />
                     )}
                   </Box>
@@ -1339,6 +1760,9 @@ function App() {
           </Panel>
         </PanelGroup>
       </Box>
+
+      {/* Download Panel */}
+      <DownloadPanel />
     </Box>
   );
 }

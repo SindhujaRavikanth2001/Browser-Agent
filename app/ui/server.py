@@ -974,77 +974,41 @@ Please respond with:
 """
     
     async def _export_complete_research_package(self, session: ResearchDesign) -> str:
-        """Export complete research package including questionnaire and chat history"""
+        """Export complete research package with LLM-generated content"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"complete_research_package_{timestamp}.txt"
         
         try:
             os.makedirs("research_outputs", exist_ok=True)
             
-            # Get the generated research design
+            # Get the research design content
             research_design_content = await self._generate_research_design(session)
             
-            # Use all questions from session.questions (which includes generated + selected)
+            # Use ALL questions from session
             final_questions = session.questions or []
             
             # Remove duplicates while preserving order
             seen = set()
             unique_final_questions = []
             for q in final_questions:
-                if q not in seen:
-                    seen.add(q)
+                q_lower = q.lower().strip()
+                if q_lower not in seen:
+                    seen.add(q_lower)
                     unique_final_questions.append(q)
             
             final_questions = unique_final_questions
             
-            # Determine question source information
-            question_source_info = ""
-            if (hasattr(session, 'selected_internet_questions') and 
-                session.selected_internet_questions and 
-                session.questionnaire_responses and 
-                'selected_questions' in session.questionnaire_responses):
-                
-                # Selection mode - show breakdown
-                selected_questions = session.questionnaire_responses['selected_questions']
-                base_count = session.questionnaire_responses['total_questions']
-                selected_count = len(selected_questions)
-                
-                # Split questions for display
-                generated_questions = final_questions[:base_count]
-                extra_questions = final_questions[base_count:]
-                
-                question_source_info = f"""
-    Generated Base Questions: {len(generated_questions)}
-    Selected Extra Questions: {len(extra_questions)}
-    Total Questions: {len(final_questions)}
-
-    Generated Base Questions:
-    {chr(10).join(f"• {q}" for q in generated_questions)}
-
-    Selected Extra Questions from Internet Research:
-    {chr(10).join(f"• {q}" for q in extra_questions)}
-    """
+            # Create comprehensive question breakdown
+            question_source_info = await self._create_comprehensive_question_breakdown(session, final_questions)
             
-            elif session.use_internet_questions and session.internet_questions:
-                # All internet questions mode
-                internet_count = len([q for q in final_questions if q in session.internet_questions])
-                ai_count = len(final_questions) - internet_count
-                question_source_info = f"""
-    Internet Research Questions: {internet_count}
-    AI Generated Questions: {ai_count}
-    Total Questions: {len(final_questions)}
-
-    Internet Sources:
-    {chr(10).join(f"• {source}" for source in (session.internet_sources or []))}
-    """
-            else:
-                # AI only mode
-                question_source_info = f"""
-    AI Generated Questions: {len(final_questions)}
-    Total Questions: {len(final_questions)}
-    """
+            # Generate implementation recommendations using LLM
+            implementation_content = await self._generate_implementation_recommendations(session)
             
-            # Export chat history first
+            # Generate ethics and timeline content using LLM
+            ethics_content = await self._generate_ethics_content(session)
+            timeline_content = await self._generate_timeline_content(session)
+            
+            # Export chat history
             chat_filepath = self._export_chat_history(session, timestamp)
             
             # Create comprehensive research package
@@ -1096,44 +1060,19 @@ Please respond with:
     IMPLEMENTATION RECOMMENDATIONS
     ================================================================================
 
-    1. SURVEY DISTRIBUTION:
-    - Use online survey platforms (SurveyMonkey, Qualtrics, Google Forms)
-    - Target distribution through social media, email lists, or partner organizations
-    - Consider incentives to improve response rates
-
-    2. DATA COLLECTION:
-    - Collect responses over 4-6 weeks
-    - Monitor response rates weekly
-    - Send reminder emails to improve participation
-
-    3. DATA ANALYSIS:
-    - Use statistical software (SPSS, R, or Excel) for analysis
-    - Calculate descriptive statistics for all variables
-    - Perform correlation analysis between satisfaction factors
-    - Consider regression analysis to identify key drivers
-
-    4. REPORTING:
-    - Create visual dashboards with charts and graphs
-    - Provide executive summary with key findings
-    - Include recommendations based on results
+    {implementation_content}
 
     ================================================================================
     RESEARCH ETHICS AND CONSIDERATIONS
     ================================================================================
 
-    - Obtain informed consent from all participants
-    - Ensure participant anonymity and data privacy
-    - Store data securely and follow GDPR/privacy regulations
-    - Provide participants with option to withdraw at any time
+    {ethics_content}
 
     ================================================================================
     EXPECTED TIMELINE
     ================================================================================
 
-    Week 1-2: Finalize questionnaire and setup survey platform
-    Week 3-8: Data collection period
-    Week 9-10: Data analysis and preliminary results
-    Week 11-12: Final report preparation and presentation
+    {timeline_content}
 
     ================================================================================
 
@@ -1160,7 +1099,7 @@ Please respond with:
             for key in session_keys_to_remove:
                 del self.active_sessions[key]
             
-            # Enhanced response with chat export info
+            # Enhanced response with breakdown
             chat_info = f"\nChat file: `{chat_filepath.split('/')[-1] if chat_filepath else 'Export failed'}`" if chat_filepath else "\n⚠️ Chat history export failed"
             
             return f"""
@@ -1172,7 +1111,7 @@ Please respond with:
     **Package Contents:**
     ✅ Complete research design and methodology
     ✅ Tested and validated questionnaire questions  
-    ✅ Implementation recommendations and timeline
+    ✅ LLM-generated implementation recommendations
     ✅ Data analysis guidelines
     ✅ Ethics and privacy considerations
     ✅ Complete conversation history exported
@@ -1184,6 +1123,8 @@ Please respond with:
     - **Timeline:** {session.timeframe}
     - **Chat interactions:** {len(session.chat_history) if session.chat_history else 0} recorded
 
+    {await self._create_comprehensive_question_breakdown(session, final_questions)}
+
     Both files are ready for download from the research_outputs directory.
     Session completed successfully!
     """
@@ -1192,6 +1133,190 @@ Please respond with:
             logger.error(f"Error exporting research package: {str(e)}", exc_info=True)
             return f"Error creating research package: {str(e)}. Please check logs and try again."
     
+    async def _create_comprehensive_question_breakdown(self, session: ResearchDesign, final_questions: List[str]) -> str:
+        """Create comprehensive breakdown of all question sources"""
+        
+        # Get different question types
+        custom_questions = session.__dict__.get('custom_questions', [])
+        selected_questions = []
+        generated_questions = []
+        
+        # Identify selected internet questions
+        if (hasattr(session, 'user_selected_questions') and 
+            session.user_selected_questions):
+            selected_questions = [q['question'] for q in session.user_selected_questions]
+            selected_sources = list(set(q['source'] for q in session.user_selected_questions))
+        elif (session.questionnaire_responses and 
+            'selected_questions' in session.questionnaire_responses):
+            selected_questions = session.questionnaire_responses['selected_questions']
+            selected_sources = session.internet_sources or []
+        else:
+            selected_sources = []
+        
+        # Identify generated questions
+        for q in final_questions:
+            if q not in custom_questions and q not in selected_questions:
+                generated_questions.append(q)
+        
+        # Build comprehensive breakdown
+        breakdown_lines = []
+        
+        if generated_questions:
+            breakdown_lines.append(f"AI Generated Questions: {len(generated_questions)}")
+            breakdown_lines.append(f"  • Created based on research topic and methodology")
+            breakdown_lines.append("")
+        
+        if selected_questions:
+            breakdown_lines.append(f"Internet Research Questions: {len(selected_questions)}")
+            breakdown_lines.append(f"  • Selected from {len(selected_sources)} websites")
+            breakdown_lines.append(f"  • Sources included:")
+            for source in selected_sources[:5]:  # Show up to 5 sources
+                breakdown_lines.append(f"    - {source}")
+            if len(selected_sources) > 5:
+                breakdown_lines.append(f"    - ... and {len(selected_sources) - 5} more sources")
+            breakdown_lines.append("")
+        
+        if custom_questions:
+            breakdown_lines.append(f"Custom Questions (User-Provided): {len(custom_questions)}")
+            breakdown_lines.append(f"  • Questions you added during the questionnaire building process")
+            breakdown_lines.append("")
+        
+        breakdown_lines.append(f"Total Questions: {len(final_questions)}")
+        
+        # Add question listings
+        if generated_questions:
+            breakdown_lines.append(f"\nAI Generated Questions:")
+            for i, q in enumerate(generated_questions, 1):
+                breakdown_lines.append(f"  {i}. {q}")
+        
+        if selected_questions:
+            breakdown_lines.append(f"\nSelected Internet Research Questions:")
+            for i, q in enumerate(selected_questions, 1):
+                breakdown_lines.append(f"  {i}. {q}")
+        
+        if custom_questions:
+            breakdown_lines.append(f"\nYour Custom Questions:")
+            for i, q in enumerate(custom_questions, 1):
+                breakdown_lines.append(f"  {i}. {q}")
+        
+        return "\n".join(breakdown_lines)
+
+    async def _generate_implementation_recommendations(self, session: ResearchDesign) -> str:
+        """Generate implementation recommendations using LLM"""
+        
+        prompt = f"""
+    Generate comprehensive implementation recommendations for this research study:
+
+    Research Topic: {session.research_topic}
+    Target Population: {session.target_population}
+    Number of Questions: {len(session.questions or [])}
+
+    Create detailed recommendations covering:
+    1. Survey Distribution methods
+    2. Data Collection best practices
+    3. Data Analysis approaches
+    4. Reporting strategies
+
+    Make recommendations specific to the research topic and target population. 
+    Be practical and actionable. Use professional research language.
+    Respond in English only.
+    """
+        
+        try:
+            response = await self.llm.ask(prompt, temperature=0.7)
+            return remove_chinese_and_punct(str(response))
+        except Exception as e:
+            logger.error(f"Error generating implementation recommendations: {e}")
+            return """
+    1. SURVEY DISTRIBUTION:
+    - Use online survey platforms (SurveyMonkey, Qualtrics, Google Forms)
+    - Target distribution through relevant channels for your population
+    - Consider incentives to improve response rates
+
+    2. DATA COLLECTION:
+    - Plan for 4-6 week collection period
+    - Monitor response rates weekly
+    - Send follow-up reminders to improve participation
+
+    3. DATA ANALYSIS:
+    - Use statistical software for comprehensive analysis
+    - Calculate descriptive statistics for all variables
+    - Perform correlation analysis between key factors
+
+    4. REPORTING:
+    - Create visual dashboards with charts and graphs
+    - Provide executive summary with key findings
+    - Include actionable recommendations based on results
+    """
+
+    async def _generate_ethics_content(self, session: ResearchDesign) -> str:
+        """Generate ethics content using LLM"""
+        
+        prompt = f"""
+    Generate research ethics and considerations for this study:
+
+    Research Topic: {session.research_topic}
+    Target Population: {session.target_population}
+
+    Cover important ethical considerations including:
+    - Informed consent requirements
+    - Privacy and data protection
+    - Participant rights
+    - Data security measures
+    - Regulatory compliance
+
+    Make it specific to the research context. Be comprehensive but concise.
+    Respond in English only.
+    """
+        
+        try:
+            response = await self.llm.ask(prompt, temperature=0.6)
+            return remove_chinese_and_punct(str(response))
+        except Exception as e:
+            logger.error(f"Error generating ethics content: {e}")
+            return """
+    - Obtain informed consent from all participants
+    - Ensure participant anonymity and data privacy
+    - Store data securely and follow GDPR/privacy regulations
+    - Provide participants with option to withdraw at any time
+    - Protect sensitive information throughout the research process
+    - Follow institutional review board guidelines if applicable
+    """
+
+    async def _generate_timeline_content(self, session: ResearchDesign) -> str:
+        """Generate timeline content using LLM"""
+        
+        prompt = f"""
+    Generate a realistic research timeline for this study:
+
+    Research Topic: {session.research_topic}
+    Target Population: {session.target_population}
+    Questions: {len(session.questions or [])} total questions
+
+    Create a week-by-week timeline covering:
+    - Questionnaire finalization
+    - Data collection period
+    - Analysis phase
+    - Reporting phase
+
+    Make timeline realistic and appropriate for the research scope.
+    Respond in English only.
+    """
+        
+        try:
+            response = await self.llm.ask(prompt, temperature=0.6)
+            return remove_chinese_and_punct(str(response))
+        except Exception as e:
+            logger.error(f"Error generating timeline content: {e}")
+            return """
+    Week 1-2: Finalize questionnaire and setup survey platform
+    Week 3-8: Data collection period
+    Week 9-10: Data analysis and preliminary results
+    Week 11-12: Final report preparation and presentation
+
+    Adjust timeline based on your specific requirements and target population size.
+    """
+
     def _log_chat_interaction(self, session_id: str, user_message: str, bot_response: str):
         """Log chat interaction for the specific session"""
         if session_id not in self.active_sessions:
@@ -1963,6 +2088,19 @@ Please enter question numbers separated by spaces.
                 return await self._show_final_selection_summary(session)
             
             session.selected_questions_pool.extend(new_unique_questions)
+            
+            # FIX: Update session screenshots with new screenshots from this batch
+            if new_screenshots:
+                if not hasattr(session, 'screenshots') or session.screenshots is None:
+                    session.screenshots = []
+                
+                # Add new screenshots to the existing slideshow
+                session.screenshots.extend(new_screenshots)
+                logger.info(f"Added {len(new_screenshots)} new screenshots to slideshow. Total: {len(session.screenshots)}")
+                
+                # IMPORTANT: Trigger slideshow update to UI if this is being called during WebSocket processing
+                # This will be handled by the UI server when it processes the rebrowse request
+            
             session.awaiting_selection = True
             
             # FIXED: Format NEW questions with full source URLs
@@ -2000,14 +2138,17 @@ Please enter question numbers separated by spaces.
             return f"""
     🔍 **New Questions Found - Please Select (Rebrowse {session.rebrowse_count})**
 
-    Found {len(new_unique_questions)} NEW unique questions:
+    Found {len(new_unique_questions)} NEW unique questions from {len(new_screenshots) if new_screenshots else 0} additional websites:
 
     {chr(10).join(new_questions_formatted)}
+
+    📸 **Slideshow Updated**: Added {len(new_screenshots) if new_screenshots else 0} new screenshots (Total: {len(session.screenshots) if hasattr(session, 'screenshots') and session.screenshots else 0})
 
     **📊 Selection Status:**
     - **Currently selected:** {total_selected}/{session.max_selectable_questions}
     - **Remaining selections:** {remaining_selections}
     - **Total questions in pool:** {len(session.selected_questions_pool)}
+    - **Total websites browsed:** {len(session.screenshots) if hasattr(session, 'screenshots') and session.screenshots else 0}
 
     **How to select from NEW questions:**
     Enter question numbers separated by spaces (e.g., "{start_num} {start_num+1}")
@@ -2136,6 +2277,77 @@ Please enter question numbers separated by spaces.
     {question_text}
     """
 
+    async def _handle_custom_question_input(self, session_id: str, user_input: str) -> str:
+        """Handle user's custom question input"""
+        session = self.active_sessions[session_id]
+        
+        try:
+            # Parse custom questions from user input
+            lines = user_input.strip().split('\n')
+            custom_questions = []
+            
+            for line in lines:
+                line = line.strip()
+                if len(line) > 10:  # Minimum length check
+                    # Ensure question ends with ?
+                    if not line.endswith('?'):
+                        line += '?'
+                    custom_questions.append(line)
+            
+            if not custom_questions:
+                return """
+    ❌ **No valid questions found**
+
+    Please enter at least one question. Each question should be on a new line and be meaningful.
+
+    **Enter your custom questions:**
+    """
+            
+            if len(custom_questions) > 10:
+                custom_questions = custom_questions[:10]
+                logger.info("Limited custom questions to 10")
+            
+            # Add custom questions to the existing questions
+            if not session.questions:
+                session.questions = []
+            
+            # Store original count for reporting
+            original_count = len(session.questions)
+            session.questions.extend(custom_questions)
+            
+            # Store custom questions info for testing and export
+            session.__dict__['custom_questions'] = custom_questions
+            session.__dict__['custom_questions_count'] = len(custom_questions)
+            
+            # IMPORTANT: Set the flag to handle the next response properly
+            session.__dict__['custom_questions_added'] = True
+            
+            return f"""
+    ✅ **Custom Questions Added Successfully**
+
+    **Added {len(custom_questions)} custom questions:**
+    {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(custom_questions))}
+
+    **Total Questions: {len(session.questions)}**
+    - Original questions: {original_count}
+    - Your custom questions: {len(custom_questions)}
+
+    **Ready to proceed:**
+    - **T** (Test Now) - Proceed to synthetic testing with all questions
+    - **R** (Review All) - Review the complete question list
+    - **M** (More Custom) - Add more custom questions
+
+    Please choose your option:
+    """
+            
+        except Exception as e:
+            logger.error(f"Error processing custom questions: {e}")
+            return f"""
+    ❌ **Error processing questions:** {str(e)}
+
+    Please try again. Enter your questions one per line:
+    """
+
     async def _handle_questionnaire_builder(self, session_id: str, user_input: str) -> str:
         """Handle questionnaire builder interactions with fixed flow"""
         session = self.active_sessions[session_id]
@@ -2149,21 +2361,93 @@ Please enter question numbers separated by spaces.
         is_include_all_mode = hasattr(session, 'include_all_internet_questions') and session.include_all_internet_questions
         total_questions_flow = 3 if is_selection_mode else 3  # CHANGED: Now 3 questions instead of 4/5
         
-        # FIXED: Handle "More Questions" menu responses FIRST (after M command)
+        # PRIORITY 1: Handle custom question input flow FIRST
+        if session.__dict__.get('awaiting_custom_questions', False):
+            session.__dict__['awaiting_custom_questions'] = False
+            return await self._handle_custom_question_input(session_id, user_input)
+        
+        # PRIORITY 2: Handle the choice after accepting questions
+        if session.__dict__.get('questions_accepted', False):
+            session.__dict__['questions_accepted'] = False
+            
+            if user_input.upper().strip() == 'A':
+                # User wants to add custom questions
+                session.__dict__['awaiting_custom_questions'] = True
+                return """
+    📝 **Add Your Custom Questions**
+
+    Please enter your custom questions, one per line. You can enter multiple questions at once.
+
+    **Example format:**
+    ```
+    How satisfied are you with our customer service?
+    What features would you like to see improved?
+    How likely are you to recommend us to a friend?
+    ```
+
+    **Instructions:**
+    - Enter each question on a new line
+    - Make sure each question ends with a question mark
+    - Enter at least 1 question, maximum 10 additional questions
+
+    **Enter your custom questions:**
+    """
+            elif user_input.upper().strip() == 'T':
+                # Proceed directly to testing
+                return await self._test_questions(session)
+            elif user_input.upper().strip() == 'R':
+                # Review current questions
+                return await self._show_current_questions(session)
+            else:
+                return """
+    Please respond with:
+    - **A** (Add Custom) - Enter your own additional questions
+    - **T** (Test Now) - Proceed directly to synthetic testing
+    - **R** (Review) - Review the current question list
+    """
+        
+        # PRIORITY 3: Handle custom questions after they were added and user chose next step
+        if session.__dict__.get('custom_questions_added', False):
+            session.__dict__['custom_questions_added'] = False
+            
+            if user_input.upper().strip() == 'T':
+                # Test all questions including custom ones
+                return await self._test_questions(session)
+            elif user_input.upper().strip() == 'R':
+                # Review all questions (THIS IS THE FIX - prioritize over universal R)
+                return await self._show_current_questions(session)
+            elif user_input.upper().strip() == 'M':
+                # Add more custom questions
+                session.__dict__['awaiting_custom_questions'] = True
+                return """
+    📝 **Add More Custom Questions**
+
+    Enter additional custom questions, one per line:
+    """
+            else:
+                return """
+    Please respond with:
+    - **T** (Test Now) - Proceed to synthetic testing with all questions
+    - **R** (Review All) - Review the complete question list
+    - **M** (More Custom) - Add more custom questions
+    """
+        
+        # PRIORITY 4: Handle "More Questions" menu responses (after M command)
         if session.__dict__.get('in_more_questions_menu', False):
             session.__dict__['in_more_questions_menu'] = False  # Clear the flag
             return await self._handle_more_questions_response(session_id, user_input)
         
-        # FIXED: Handle additional question selection flow (M -> S flow)
+        # PRIORITY 5: Handle additional question selection flow (M -> S flow)
         if session.__dict__.get('awaiting_additional_selection', False):
             session.__dict__['awaiting_additional_selection'] = False  # Clear the flag
             return await self._handle_additional_question_selection(session_id, user_input)
         
-        # Universal commands
+        # PRIORITY 6: Universal commands (AFTER all specific flows are handled)
         if user_input.upper().strip() == 'A':
-            await self._store_accepted_questions(session)
-            return await self._test_questions(session)
+            session.__dict__['questions_accepted'] = True
+            return await self._store_accepted_questions(session)
         elif user_input.upper().strip() == 'R':
+            # This is the general rephrase command - only triggered when not in specific flows
             return await self._revise_questions(session)
         elif user_input.upper().strip() == 'M':
             session.__dict__['in_more_questions_menu'] = True  # Set flag for next response
@@ -2172,6 +2456,7 @@ Please enter question numbers separated by spaces.
             session.questionnaire_responses = {}
             return await self._start_questionnaire_builder(session)
         
+        # PRIORITY 7: Regular questionnaire building flow (question input)
         # Handle first question differently based on mode
         if 'total_questions' not in session.questionnaire_responses:
             try:
@@ -2597,27 +2882,28 @@ Please specify your preferences using this format:
 Enter your specifications:
 """
 
-    async def _store_accepted_questions(self, session: ResearchDesign) -> None:
-        """Store the accepted questions in the session"""
+    async def _store_accepted_questions(self, session: ResearchDesign) -> str:
+        """Store the accepted questions and offer user input option"""
+        
         # Only generate new questions if we don't already have good ones
         if not session.questions or len(session.questions) < 3:
             logger.info("No sufficient questions found, generating fallback questions")
             # Generate a comprehensive question set for the research topic
             prompt = f"""
-Create a final validated questionnaire for this research:
+    Create a final validated questionnaire for this research:
 
-Topic: {session.research_topic}
-Objectives: {', '.join(session.objectives or [])}
-Target Population: {session.target_population}
+    Topic: {session.research_topic}
+    Objectives: {', '.join(session.objectives or [])}
+    Target Population: {session.target_population}
 
-Generate 8-12 specific, actionable survey questions covering:
-1. Overall satisfaction measures
-2. Specific topic-related questions
-3. Behavioral questions
-4. Demographic questions
+    Generate 8-12 specific, actionable survey questions covering:
+    1. Overall satisfaction measures
+    2. Specific topic-related questions
+    3. Behavioral questions
+    4. Demographic questions
 
-Format each as a clear, complete survey question. Respond in English only.
-"""
+    Format each as a clear, complete survey question. Respond in English only.
+    """
             
             try:
                 response = await self.llm.ask(prompt, temperature=0.7)
@@ -2667,45 +2953,52 @@ Format each as a clear, complete survey question. Respond in English only.
                 logger.info("Used basic fallback questions due to error")
         else:
             logger.info(f"Using existing {len(session.questions)} questions from session")
+        
+        # Count existing questions
+        existing_count = len(session.questions) if session.questions else 0
+        
+        return f"""
+    ✅ **Questions Accepted ({existing_count} questions)**
+
+    Would you like to add your own custom questions before proceeding to testing?
+
+    **Options:**
+    - **A** (Add Custom) - Enter your own additional questions
+    - **T** (Test Now) - Proceed directly to synthetic testing with current questions
+    - **R** (Review) - Review the current question list again
+
+    Please choose your option:
+    """
     
     async def _test_questions(self, session: ResearchDesign) -> str:
-        """Test questions with synthetic respondents using AI simulation"""
-        # Move to final output stage
+        """Test questions with synthetic respondents using ALL session questions"""
         session.stage = ResearchStage.FINAL_OUTPUT
         
-        # Use all questions stored in session.questions (which now includes both generated + selected)
+        # Use ALL questions from session (includes generated + selected + custom)
         all_test_questions = session.questions or []
         
         # Remove duplicates while preserving order
         seen = set()
         unique_questions = []
         for q in all_test_questions:
-            if q not in seen:
-                seen.add(q)
+            q_lower = q.lower().strip()
+            if q_lower not in seen:
+                seen.add(q_lower)
                 unique_questions.append(q)
         
         all_test_questions = unique_questions
         
+        if not all_test_questions:
+            return "❌ No questions available for testing. Please generate questions first."
+        
         try:
-            # Generate synthetic respondent feedback using LLM
-            synthetic_feedback = await self._generate_synthetic_respondent_feedback_all(session, all_test_questions)
+            # Generate synthetic respondent feedback for ALL questions
+            synthetic_feedback = await self._generate_synthetic_respondent_feedback_all(
+                session, all_test_questions
+            )
             
-            # Determine description based on selection mode
-            selection_info = ""
-            if (hasattr(session, 'selected_internet_questions') and 
-                session.selected_internet_questions and 
-                session.questionnaire_responses and 
-                'selected_questions' in session.questionnaire_responses):
-                
-                selected_count = len(session.questionnaire_responses['selected_questions'])
-                base_count = session.questionnaire_responses['total_questions']
-                selection_info = f"({base_count} generated questions + {selected_count} selected extras)"
-            elif session.use_internet_questions:
-                internet_count = len([q for q in all_test_questions if q in (session.internet_questions or [])])
-                ai_count = len(all_test_questions) - internet_count
-                selection_info = f"({ai_count} AI generated + {internet_count} internet research questions)"
-            else:
-                selection_info = "(AI generated questions only)"
+            # Create detailed breakdown for testing report
+            breakdown_info = await self._create_question_breakdown_for_testing(session, all_test_questions)
             
             return f"""
     🧪 **Testing Questionnaire with Synthetic Respondents**
@@ -2713,7 +3006,7 @@ Format each as a clear, complete survey question. Respond in English only.
     Running simulation with 5 diverse synthetic respondents matching your target population...
 
     **Testing {len(all_test_questions)} total questions**
-    {selection_info}
+    {breakdown_info}
 
     {synthetic_feedback}
 
@@ -2735,6 +3028,8 @@ Format each as a clear, complete survey question. Respond in English only.
     ✅ **Flow Logic**: Question sequence flows logically
     ✅ **Response Validation**: All answer options are appropriate
 
+    {await self._create_question_breakdown_for_testing(session, all_test_questions)}
+
     ---
 
     **Are you satisfied with the questionnaire?**
@@ -2743,6 +3038,44 @@ Format each as a clear, complete survey question. Respond in English only.
     - **T** (Test Again) - Run another round of testing
     """
     
+    async def _create_question_breakdown_for_testing(self, session: ResearchDesign, all_questions: List[str]) -> str:
+        """Create detailed breakdown of question sources for testing display"""
+        
+        # Count different types of questions
+        custom_questions = session.__dict__.get('custom_questions', [])
+        selected_questions = []
+        generated_questions = []
+        
+        # Identify selected internet questions
+        if (hasattr(session, 'user_selected_questions') and 
+            session.user_selected_questions):
+            selected_questions = [q['question'] for q in session.user_selected_questions]
+        elif (session.questionnaire_responses and 
+            'selected_questions' in session.questionnaire_responses):
+            selected_questions = session.questionnaire_responses['selected_questions']
+        
+        # Count generated questions (everything else that's not custom or selected)
+        for q in all_questions:
+            if q not in custom_questions and q not in selected_questions:
+                generated_questions.append(q)
+        
+        # Create breakdown display
+        breakdown_parts = []
+        
+        if generated_questions:
+            breakdown_parts.append(f"Generated questions: {len(generated_questions)}")
+        
+        if selected_questions:
+            breakdown_parts.append(f"Selected from internet research: {len(selected_questions)}")
+        
+        if custom_questions:
+            breakdown_parts.append(f"Your custom questions: {len(custom_questions)}")
+        
+        if breakdown_parts:
+            return f"({', '.join(breakdown_parts)})"
+        else:
+            return "(AI generated questions)"
+
     async def _generate_synthetic_respondent_feedback_all(self, session: ResearchDesign, all_questions: List[str]) -> str:
         """Generate realistic synthetic respondent feedback using AI for all questions"""
         
@@ -4178,6 +4511,146 @@ class OpenManusUI:
                 return FileResponse(index_path)
             return {"message": "Frontend not built yet. Please run 'npm run build' in the frontend directory."}
 
+        @self.app.get("/api/research-files")
+        async def list_research_files():
+            """List all available research files for download"""
+            try:
+                research_dir = "research_outputs"
+                if not os.path.exists(research_dir):
+                    return JSONResponse({"files": [], "message": "No research files found"})
+                
+                files = []
+                for filename in os.listdir(research_dir):
+                    if filename.endswith(('.txt', '.json')):
+                        filepath = os.path.join(research_dir, filename)
+                        file_stat = os.stat(filepath)
+                        
+                        # Determine file type
+                        file_type = "unknown"
+                        if "research_package" in filename or "complete_research_package" in filename:
+                            file_type = "research_package"
+                        elif "chat_history" in filename:
+                            file_type = "chat_history"
+                        elif "research_design" in filename:
+                            file_type = "research_design"
+                        
+                        files.append({
+                            "filename": filename,
+                            "filepath": filepath,
+                            "type": file_type,
+                            "size": file_stat.st_size,
+                            "created": file_stat.st_mtime,
+                            "display_name": filename.replace("_", " ").replace(".txt", "").replace(".json", "")
+                        })
+                
+                # Sort by creation time (newest first)
+                files.sort(key=lambda x: x["created"], reverse=True)
+                
+                return JSONResponse({"files": files})
+                
+            except Exception as e:
+                logger.error(f"Error listing research files: {e}")
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"Error listing files: {str(e)}"}
+                )
+
+        @self.app.get("/api/download/{filename}")
+        async def download_file(filename: str):
+            """Download a specific research file"""
+            try:
+                # Security check - only allow files from research_outputs directory
+                if ".." in filename or "/" in filename or "\\" in filename:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": "Invalid filename"}
+                    )
+                
+                research_dir = "research_outputs"
+                filepath = os.path.join(research_dir, filename)
+                
+                if not os.path.exists(filepath):
+                    return JSONResponse(
+                        status_code=404,
+                        content={"error": "File not found"}
+                    )
+                
+                # Determine content type
+                if filename.endswith('.json'):
+                    media_type = 'application/json'
+                else:
+                    media_type = 'text/plain'
+                
+                return FileResponse(
+                    path=filepath,
+                    filename=filename,
+                    media_type=media_type,
+                    headers={
+                        "Content-Disposition": f"attachment; filename={filename}"
+                    }
+                )
+                
+            except Exception as e:
+                logger.error(f"Error downloading file {filename}: {e}")
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"Error downloading file: {str(e)}"}
+                )
+
+        @self.app.get("/api/download-latest/{file_type}")
+        async def download_latest_file(file_type: str):
+            """Download the latest file of a specific type (research_package, chat_history, etc.)"""
+            try:
+                research_dir = "research_outputs"
+                if not os.path.exists(research_dir):
+                    return JSONResponse(
+                        status_code=404,
+                        content={"error": "No research files found"}
+                    )
+                
+                # Find the latest file of the specified type
+                matching_files = []
+                for filename in os.listdir(research_dir):
+                    if file_type in filename and filename.endswith(('.txt', '.json')):
+                        filepath = os.path.join(research_dir, filename)
+                        file_stat = os.stat(filepath)
+                        matching_files.append({
+                            "filename": filename,
+                            "filepath": filepath,
+                            "created": file_stat.st_mtime
+                        })
+                
+                if not matching_files:
+                    return JSONResponse(
+                        status_code=404,
+                        content={"error": f"No {file_type} files found"}
+                    )
+                
+                # Get the latest file
+                latest_file = max(matching_files, key=lambda x: x["created"])
+                
+                # Determine content type
+                if latest_file["filename"].endswith('.json'):
+                    media_type = 'application/json'
+                else:
+                    media_type = 'text/plain'
+                
+                return FileResponse(
+                    path=latest_file["filepath"],
+                    filename=latest_file["filename"],
+                    media_type=media_type,
+                    headers={
+                        "Content-Disposition": f"attachment; filename={latest_file['filename']}"
+                    }
+                )
+                
+            except Exception as e:
+                logger.error(f"Error downloading latest {file_type}: {e}")
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"Error downloading latest file: {str(e)}"}
+                )
+
     async def process_message(self, user_message: str, session_id: str = "default", action_type: str = None):
         """Process a user message via WebSocket with enhanced screenshot validation."""
         try:
@@ -4189,53 +4662,17 @@ class OpenManusUI:
             if session_id in self.research_workflow.active_sessions:
                 session = self.research_workflow.active_sessions[session_id]
                 
-                # Special handling for research workflow - check if we're at the search stage
+                # ENHANCED: Handle initial search (Y response) with slideshow
                 if session.stage == ResearchStage.DESIGN_REVIEW and user_message.upper().strip() == 'Y':
-                    # User accepted design and we're about to search - this will capture URL screenshots
                     try:
                         # Process the research input which will capture screenshots of found URLs
                         response = await self.research_workflow.process_research_input(session_id, user_message)
                         
                         # After processing, check if we have screenshots to display
                         if hasattr(session, 'screenshots') and session.screenshots:
-                            logger.info(f"Broadcasting slideshow with {len(session.screenshots)} screenshots")
+                            logger.info(f"Broadcasting initial slideshow with {len(session.screenshots)} screenshots")
                             
                             # Send slideshow data to frontend
-                            await self.broadcast_message("slideshow_data", {
-                                "screenshots": session.screenshots,
-                                "total_count": len(session.screenshots),
-                                "research_topic": session.research_topic
-                            })
-                            
-                            # Also send the first screenshot to browser view
-                            if session.screenshots:
-                                await self.broadcast_message("browser_state", {
-                                    "base64_image": session.screenshots[0]['screenshot'],
-                                    "url": session.screenshots[0]['url'],
-                                    "title": session.screenshots[0]['title'],
-                                    "source_url": session.screenshots[0]['url']  # For Visit Site button
-                                })
-                        
-                        await self.broadcast_message("agent_message", {
-                            "content": response,
-                            "action_type": UserAction.BUILD_QUESTIONNAIRE.value,
-                            "session_id": session_id
-                        })
-                        return
-                        
-                    except Exception as e:
-                        logger.warning(f"Could not process research with screenshots: {e}")
-                
-                elif session.stage == ResearchStage.DECISION_POINT and user_message.upper().strip() == 'R':
-                    try:
-                        # Process the rebrowse which will capture additional screenshots
-                        response = await self.research_workflow.process_research_input(session_id, user_message)
-                        
-                        # After processing, check if we have updated screenshots to display
-                        if hasattr(session, 'screenshots') and session.screenshots:
-                            logger.info(f"Broadcasting updated slideshow with {len(session.screenshots)} screenshots")
-                            
-                            # Send updated slideshow data to frontend
                             await self.broadcast_message("slideshow_data", {
                                 "screenshots": session.screenshots,
                                 "total_count": len(session.screenshots),
@@ -4259,8 +4696,98 @@ class OpenManusUI:
                         return
                         
                     except Exception as e:
+                        logger.warning(f"Could not process initial search with screenshots: {e}")
+                
+                # ENHANCED: Handle rebrowse (R response) with updated slideshow
+                elif session.stage == ResearchStage.DECISION_POINT and user_message.upper().strip() == 'R':
+                    try:
+                        # Store screenshots count before rebrowse
+                        old_screenshot_count = len(session.screenshots) if hasattr(session, 'screenshots') and session.screenshots else 0
+                        
+                        # Process the rebrowse which will capture additional screenshots
+                        response = await self.research_workflow.process_research_input(session_id, user_message)
+                        
+                        # After processing, check if we have updated screenshots to display
+                        if hasattr(session, 'screenshots') and session.screenshots:
+                            new_screenshot_count = len(session.screenshots)
+                            logger.info(f"Broadcasting updated slideshow: {old_screenshot_count} -> {new_screenshot_count} screenshots")
+                            
+                            # Send updated slideshow data to frontend
+                            await self.broadcast_message("slideshow_data", {
+                                "screenshots": session.screenshots,
+                                "total_count": len(session.screenshots),
+                                "research_topic": session.research_topic,
+                                "is_update": True,  # Flag to indicate this is an update
+                                "new_screenshots_added": new_screenshot_count - old_screenshot_count
+                            })
+                            
+                            # Send the most recent screenshot to browser view (last added)
+                            if session.screenshots:
+                                latest_screenshot = session.screenshots[-1]  # Get the last (newest) screenshot
+                                await self.broadcast_message("browser_state", {
+                                    "base64_image": latest_screenshot['screenshot'],
+                                    "url": latest_screenshot['url'],
+                                    "title": latest_screenshot['title'],
+                                    "source_url": latest_screenshot['url']
+                                })
+                        
+                        await self.broadcast_message("agent_message", {
+                            "content": response,
+                            "action_type": UserAction.BUILD_QUESTIONNAIRE.value,
+                            "session_id": session_id
+                        })
+                        return
+                        
+                    except Exception as e:
                         logger.warning(f"Could not process rebrowse with screenshots: {e}")
-                # Regular research workflow processing
+                
+                # ENHANCED: Handle question selection responses that might trigger more rebrowsing
+                elif (session.stage == ResearchStage.DECISION_POINT and 
+                    hasattr(session, 'awaiting_selection') and session.awaiting_selection):
+                    try:
+                        # Store screenshots count before processing selection
+                        old_screenshot_count = len(session.screenshots) if hasattr(session, 'screenshots') and session.screenshots else 0
+                        
+                        # Process the selection input
+                        response = await self.research_workflow.process_research_input(session_id, user_message)
+                        
+                        # Check if screenshots were updated during selection processing
+                        if hasattr(session, 'screenshots') and session.screenshots:
+                            new_screenshot_count = len(session.screenshots)
+                            
+                            # If new screenshots were added, update the slideshow
+                            if new_screenshot_count > old_screenshot_count:
+                                logger.info(f"Selection processing added screenshots: {old_screenshot_count} -> {new_screenshot_count}")
+                                
+                                await self.broadcast_message("slideshow_data", {
+                                    "screenshots": session.screenshots,
+                                    "total_count": len(session.screenshots),
+                                    "research_topic": session.research_topic,
+                                    "is_update": True,
+                                    "new_screenshots_added": new_screenshot_count - old_screenshot_count
+                                })
+                                
+                                # Update browser view with latest screenshot
+                                if session.screenshots:
+                                    latest_screenshot = session.screenshots[-1]
+                                    await self.broadcast_message("browser_state", {
+                                        "base64_image": latest_screenshot['screenshot'],
+                                        "url": latest_screenshot['url'],
+                                        "title": latest_screenshot['title'],
+                                        "source_url": latest_screenshot['url']
+                                    })
+                        
+                        await self.broadcast_message("agent_message", {
+                            "content": response,
+                            "action_type": UserAction.BUILD_QUESTIONNAIRE.value,
+                            "session_id": session_id
+                        })
+                        return
+                        
+                    except Exception as e:
+                        logger.warning(f"Could not process selection with potential screenshots: {e}")
+                
+                # Regular research workflow processing for all other cases
                 response = await self.research_workflow.process_research_input(session_id, user_message)
                 
                 await self.broadcast_message("agent_message", {
@@ -4270,7 +4797,7 @@ class OpenManusUI:
                 })
                 return
 
-            # If no active session, detect intent
+            # If no active session, detect intent and handle as before
             if not action_type:
                 intent = detect_user_intent(user_message)
                 action_type = intent.value

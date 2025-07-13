@@ -185,7 +185,64 @@ pre {
 }
 
 @keyframes pulse {
-  0% { opacity: 1; }
-  50% { opacity: 0.5; }
-  100% { opacity: 1; }
+  0% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.05);
+    opacity: 0.8;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes fadeIn {
+  0% {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideInFromRight {
+  0% {
+    opacity: 0;
+    transform: translateX(20px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* Slideshow update indicator */
+.slideshow-update-indicator {
+  animation: pulse 2s ease-in-out;
+}
+
+/* New screenshot notification */
+.new-screenshot-badge {
+  animation: fadeIn 1s ease-in, pulse 3s ease-in-out 1s;
+}
+
+/* Enhanced progress bar glow */
+.progress-bar-updated {
+  box-shadow: 0 0 8px rgba(46, 196, 72, 0.4);
+  transition: box-shadow 2s ease-out;
+}
+
+/* Thumbnail update animation */
+.thumbnail-new {
+  animation: slideInFromRight 0.5s ease-out;
+}
+
+/* Browser view update animation */
+.browser-screenshot.updated {
+  animation: fadeIn 0.3s ease-in-out;
 }

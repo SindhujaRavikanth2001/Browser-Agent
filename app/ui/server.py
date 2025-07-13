@@ -77,12 +77,19 @@ class ResearchDesign(BaseModel):
     questionnaire_responses: Optional[Dict] = None
     chat_history: Optional[List[Dict]] = None
     
-    # NEW: URL management fields
-    all_collected_urls: Optional[List[str]] = None  # All 30 unique deep URLs
-    current_batch_index: int = 0  # Which batch of 6 we're currently on
-    browsed_urls: Optional[List[str]] = None  # URLs that have been processed
-    rebrowse_count: int = 0  # How many times user has rebrowsed
+    # URL management fields
+    all_collected_urls: Optional[List[str]] = None
+    current_batch_index: int = 0
+    browsed_urls: Optional[List[str]] = None
+    rebrowse_count: int = 0
     extracted_questions_with_sources: Optional[List[Dict]] = None
+    
+    # NEW: Question selection tracking
+    selected_questions_pool: Optional[List[Dict]] = None  # All questions found so far
+    user_selected_questions: Optional[List[Dict]] = None  # Questions user has selected
+    awaiting_selection: bool = False  # Flag to indicate we're waiting for user selection
+    max_selectable_questions: int = 30  # Maximum questions user can select
+    additional_questions: Optional[List[str]] = None
 
 class UserMessage(BaseModel):
     content: str
@@ -1482,7 +1489,7 @@ Please respond with:
             return False
 
     async def _search_database(self, session: ResearchDesign) -> str:
-        """Search internet and extract real questions with improved source formatting"""
+        """Search internet and present questions for selection"""
         try:
             extracted_questions, sources, screenshots = await self._search_internet_for_questions(
                 session.research_topic, session.target_population, session
@@ -1499,123 +1506,437 @@ Please respond with:
     - **E** (Exit) - Exit workflow
     """
             
-            # Store results - convert to simple format for compatibility
-            session.internet_questions = [q['question'] for q in extracted_questions]
+            # Initialize selection pool if first time
+            if session.selected_questions_pool is None:
+                session.selected_questions_pool = []
+            if session.user_selected_questions is None:
+                session.user_selected_questions = []
+            
+            # Add new questions to pool (avoiding duplicates)
+            existing_questions = {q['question'].lower().strip() for q in session.selected_questions_pool}
+            new_unique_questions = []
+            
+            for q_dict in extracted_questions:
+                question_text = q_dict['question'].lower().strip()
+                if question_text not in existing_questions:
+                    new_unique_questions.append(q_dict)
+                    existing_questions.add(question_text)
+            
+            session.selected_questions_pool.extend(new_unique_questions)
+            
+            # Store other session data
+            session.internet_questions = [q['question'] for q in session.selected_questions_pool]
             session.internet_sources = sources
             session.screenshots = screenshots
-            # Store detailed questions with sources for display
-            session.extracted_questions_with_sources = extracted_questions
+            session.extracted_questions_with_sources = session.selected_questions_pool
+            
+            # Move to selection stage
             session.stage = ResearchStage.DECISION_POINT
+            session.awaiting_selection = True
             
-            # Initialize extractor for formatting
-            if not hasattr(self, '_question_extractor'):
-                self._question_extractor = ImprovedQuestionExtractor()
+            # Format questions for selection with numbering
+            formatted_questions = self._format_questions_for_selection(session.selected_questions_pool)
             
-            # Format questions grouped by source with full URLs
-            formatted_questions = self._question_extractor.format_questions_by_source(extracted_questions)
-            
-            # Calculate progress info
             total_collected = len(session.all_collected_urls) if session.all_collected_urls else 0
             current_batch = session.current_batch_index
             processed_count = len(session.browsed_urls) if session.browsed_urls else 0
             
+            currently_selected_count = len(session.user_selected_questions)
+            remaining_selections = session.max_selectable_questions - currently_selected_count
+            
             return f"""
-    🔍 **Real Survey Questions Found (Batch {current_batch}/{(total_collected + 5) // 6})**
+    🔍 **Questions Found - Please Select (Batch {current_batch}/{(total_collected + 5) // 6})**
 
-    Found {len(extracted_questions)} actual survey questions from websites:
+    Found {len(new_unique_questions)} new questions from this batch.
+    **Total pool now: {len(session.selected_questions_pool)} questions**
 
     {formatted_questions}
 
-    **📊 Progress Summary:**
+    **📊 Selection Status:**
+    - **Currently selected:** {currently_selected_count}/{session.max_selectable_questions}
+    - **Remaining selections:** {remaining_selections}
     - **URLs processed:** {processed_count} of {total_collected} collected
-    - **Current batch:** {len(sources)} URLs processed in this batch
-    - **Questions extracted:** {len(extracted_questions)} real questions (not AI-generated)
-    - **Screenshots:** {len(screenshots)} quality screenshots captured
-    ---
 
-    **What would you like to do with these questions?**
+    **How to select questions:**
+    Enter question numbers separated by spaces (e.g., "1 3 5 7 12")
+    - Select up to {remaining_selections} more questions
+    - Enter "0" to select none from this batch
 
-    Reply with:
-    - **Y** (Yes) - Use these questions and build the questionnaire
-    - **R** (Rebrowse) - Search the next batch of URLs for more questions
+    **Options after selection:**
+    - **C** (Continue) - Proceed with selected questions
+    - **R** (Rebrowse) - Search more URLs after selection
     - **E** (Exit) - Exit workflow
+
+    **Please enter your question numbers:**
     """
             
         except Exception as e:
             logger.error(f"Error in database search: {e}")
             return f"❌ Search Error: {str(e)}"
-    
-    async def _handle_decision_point(self, session_id: str, user_input: str) -> str:
-        """Handle decision point with rebrowse limits"""
-        session = self.active_sessions[session_id]
-        response = user_input.upper().strip()
+
+    def _format_questions_for_selection(self, questions_pool: List[Dict]) -> str:
+        """Format questions with numbers for user selection"""
+        if not questions_pool:
+            return "No questions available for selection."
         
-        if response == 'Y':
-            # Use current questions and proceed to questionnaire builder
-            session.use_internet_questions = True
-            session.questions = session.internet_questions.copy()
+        # Group by source for better organization
+        source_groups = {}
+        for i, q_dict in enumerate(questions_pool, 1):
+            source_url = q_dict['source']
+            if source_url not in source_groups:
+                source_groups[source_url] = []
+            source_groups[source_url].append((i, q_dict['question']))
+        
+        formatted_output = []
+        
+        for source_num, (source_url, questions) in enumerate(source_groups.items(), 1):
+            try:
+                from urllib.parse import urlparse
+                domain = urlparse(source_url).netloc
+            except:
+                domain = source_url
+            
+            # FIXED: Always show full URL, not just domain
+            formatted_output.append(f"**Source {source_num}: {domain}**")
+            formatted_output.append(f"*Full URL: {source_url}*")
+            
+            for question_num, question_text in questions:
+                formatted_output.append(f"{question_num}. {question_text}")
+            
+            formatted_output.append("")  # Empty line between sources
+        
+        return "\n".join(formatted_output)
+
+    async def _handle_decision_point(self, session_id: str, user_input: str) -> str:
+        """Handle decision point with question selection logic"""
+        session = self.active_sessions[session_id]
+        response = user_input.strip()
+        
+        # FIXED: Handle "C" command universally - always go to questionnaire builder
+        if response.upper() == 'C':
+            # Set up questions for questionnaire builder
+            if session.user_selected_questions:
+                session.use_internet_questions = True
+                session.questions = [q['question'] for q in session.user_selected_questions]
+            else:
+                # No questions selected, use AI-only mode
+                session.use_internet_questions = False
+                session.questions = []
+            
             session.stage = ResearchStage.QUESTIONNAIRE_BUILDER
+            session.awaiting_selection = False  # Clear selection flag
             return await self._start_questionnaire_builder(session)
-        elif response == 'R':
+        
+        # If we're awaiting selection, handle the selection input
+        if session.awaiting_selection:
+            return await self._handle_question_selection(session_id, response)
+        
+        # Handle other responses
+        if response.upper() == 'R':
             # Check if rebrowse is still allowed
             if session.rebrowse_count >= 4:
-                return """
-    ❌ **Maximum Rebrowses Reached**
-
-    You have already browsed through all available URLs.
-
-    Please choose:
-    - **Y** (Yes) - Use the current questions and build the questionnaire
-    - **E** (Exit) - Exit workflow
-    """
-            # Rebrowse internet for more questions
+                return await self._show_final_selection_summary(session)
             return await self._rebrowse_internet(session)
-        elif response == 'E':
+        elif response.upper() == 'E':
             del self.active_sessions[session_id]
             return "Research design workflow ended. Thank you!"
         else:
-            # Check if rebrowse option should be shown
-            rebrowse_option = "- **R** (Rebrowse) - Search a few more URLs for additional questions" if session.rebrowse_count < 4 else ""
-            
-            return f"""
+            return """
     Please respond with:
-    - **Y** (Yes) - Use these questions and build the questionnaire
-    {rebrowse_option}
+    - **C** (Continue) - Proceed to questionnaire builder with selected questions
+    - **R** (Rebrowse) - Search more URLs for additional questions
     - **E** (Exit) - Exit workflow
     """
 
+    async def _handle_question_selection(self, session_id: str, user_input: str) -> str:
+        """Handle user's question selection input"""
+        session = self.active_sessions[session_id]
+        
+        # FIXED: Handle "C" command here too - always go to questionnaire builder
+        if user_input.upper().strip() == 'C':
+            # Set up questions for questionnaire builder
+            if session.user_selected_questions:
+                session.use_internet_questions = True
+                session.questions = [q['question'] for q in session.user_selected_questions]
+            else:
+                session.use_internet_questions = False
+                session.questions = []
+            
+            session.stage = ResearchStage.QUESTIONNAIRE_BUILDER
+            session.awaiting_selection = False
+            return await self._start_questionnaire_builder(session)
+        
+        try:
+            # Parse selection input
+            if user_input.strip() == "0":
+                # User selected none
+                selected_numbers = []
+            else:
+                import re
+                numbers = re.findall(r'\d+', user_input)
+                selected_numbers = [int(num) for num in numbers 
+                                 if 1 <= int(num) <= len(session.selected_questions_pool)]
+            
+            # Check selection limits
+            currently_selected_count = len(session.user_selected_questions)
+            remaining_selections = session.max_selectable_questions - currently_selected_count
+            
+            if len(selected_numbers) > remaining_selections:
+                return f"""
+❌ **Too Many Selections**
+
+You can only select {remaining_selections} more questions.
+You selected {len(selected_numbers)} questions.
+
+Please enter {remaining_selections} or fewer question numbers:
+"""
+            
+            # Add selected questions to user's selection
+            newly_selected = []
+            for num in selected_numbers:
+                question_dict = session.selected_questions_pool[num - 1]  # Convert to 0-based index
+                
+                # Check if already selected
+                already_selected = any(
+                    q['question'].lower().strip() == question_dict['question'].lower().strip() 
+                    for q in session.user_selected_questions
+                )
+                
+                if not already_selected:
+                    newly_selected.append(question_dict)
+            
+            session.user_selected_questions.extend(newly_selected)
+            session.awaiting_selection = False
+            
+            # Show selection summary
+            total_selected = len(session.user_selected_questions)
+            remaining_selections = session.max_selectable_questions - total_selected
+            
+            selected_questions_text = "\n".join(
+                f"{i+1}. {q['question']}" 
+                for i, q in enumerate(session.user_selected_questions)
+            )
+            
+            # Check if user has reached the maximum
+            if total_selected >= session.max_selectable_questions:
+                return f"""
+✅ **Maximum Questions Selected ({total_selected}/{session.max_selectable_questions})**
+
+**Your Selected Questions:**
+{selected_questions_text}
+
+You have reached the maximum number of selectable questions.
+
+**What would you like to do?**
+- **C** (Continue) - Proceed to questionnaire builder with these questions
+- **E** (Exit) - Exit workflow
+"""
+            
+            return f"""
+✅ **Questions Added to Selection**
+
+Added {len(newly_selected)} questions to your selection.
+
+**Your Selected Questions ({total_selected}/{session.max_selectable_questions}):**
+{selected_questions_text}
+
+**Remaining selections:** {remaining_selections}
+
+**What would you like to do?**
+- **C** (Continue) - Proceed to questionnaire builder with selected questions
+- **R** (Rebrowse) - Search more URLs for additional questions  
+- **E** (Exit) - Exit workflow
+"""
+            
+        except Exception as e:
+            logger.error(f"Error handling question selection: {e}")
+            return f"""
+❌ **Selection Error**
+
+Please enter question numbers separated by spaces (e.g., "1 3 5 7")
+Or enter "0" to select none from this batch.
+Or enter "C" to continue to questionnaire builder.
+
+Error: {str(e)}
+"""
+
+    async def _handle_additional_question_selection(self, session_id: str, user_input: str) -> str:
+        """Handle selection of additional questions and merge with main questions"""
+        session = self.active_sessions[session_id]
+        
+        if user_input.upper().strip() == 'A':
+            # Accept all additional questions
+            additional_questions = session.__dict__.get('additional_questions', [])
+            if additional_questions:
+                # Remove demographics from current questions temporarily
+                fixed_demographics = [
+                    "What is your age?",
+                    "What is your gender?",
+                    "What is your highest level of education?", 
+                    "What is your annual household income range?",
+                    "In which city/region do you currently live?"
+                ]
+                
+                main_questions = [q for q in session.questions if q not in fixed_demographics]
+                
+                # Add additional questions and put demographics back at the end
+                session.questions = main_questions + additional_questions + fixed_demographics
+                
+                return f"""
+✅ **All Additional Questions Added**
+
+**Your Complete Questionnaire ({len(session.questions)} questions):**
+
+**Main Questions ({len(main_questions)}):**
+{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(main_questions))}
+
+**Additional Questions ({len(additional_questions)}):**
+{chr(10).join(f"{i+len(main_questions)+1}. {q}" for i, q in enumerate(additional_questions))}
+
+**Demographics ({len(fixed_demographics)}):**
+{chr(10).join(f"{i+len(main_questions)+len(additional_questions)+1}. {q}" for i, q in enumerate(fixed_demographics))}
+
+---
+
+**Review your complete questionnaire:**
+- **A** (Accept) - Use these questions and proceed to testing
+- **R** (Revise) - Rephrase questions in different words
+- **M** (More) - Generate even more additional questions
+- **B** (Back) - Return to questionnaire builder menu
+"""
+            
+        elif user_input.upper().strip() == 'S':
+            # Select some additional questions
+            additional_questions = session.__dict__.get('additional_questions', [])
+            if not additional_questions:
+                return "No additional questions available for selection."
+            
+            return f"""
+📋 **Select Additional Questions**
+
+{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(additional_questions))}
+
+Enter the question numbers you want to add (separated by spaces):
+Example: "1 3 5 7"
+
+Enter your selection:
+"""
+            
+        elif user_input.upper().strip() == 'R':
+            # Regenerate additional questions
+            return await self._generate_more_questions(session)
+            
+        elif user_input.upper().strip() == 'B':
+            # Go back to main menu
+            return await self._show_current_questions(session)
+            
+        else:
+            # Handle number selection
+            try:
+                import re
+                numbers = re.findall(r'\d+', user_input)
+                additional_questions = session.__dict__.get('additional_questions', [])
+                selected_numbers = [int(num) for num in numbers 
+                                 if 1 <= int(num) <= len(additional_questions)]
+                
+                if not selected_numbers:
+                    return f"""
+Please enter valid question numbers from 1 to {len(additional_questions)}.
+
+{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(additional_questions))}
+
+Enter your selection:
+"""
+                
+                # Get selected additional questions
+                selected_additional = [additional_questions[i-1] for i in selected_numbers]
+                
+                # Remove demographics from current questions temporarily
+                fixed_demographics = [
+                    "What is your age?",
+                    "What is your gender?",
+                    "What is your highest level of education?",
+                    "What is your annual household income range?", 
+                    "In which city/region do you currently live?"
+                ]
+                
+                main_questions = [q for q in session.questions if q not in fixed_demographics]
+                
+                # Add selected additional questions and put demographics back at the end
+                session.questions = main_questions + selected_additional + fixed_demographics
+                
+                return f"""
+✅ **Selected Questions Added**
+
+Added {len(selected_additional)} questions to your questionnaire.
+
+**Your Complete Questionnaire ({len(session.questions)} questions):**
+
+**Main Questions ({len(main_questions)}):**
+{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(main_questions))}
+
+**Selected Additional Questions ({len(selected_additional)}):**
+{chr(10).join(f"{i+len(main_questions)+1}. {q}" for i, q in enumerate(selected_additional))}
+
+**Demographics ({len(fixed_demographics)}):**
+{chr(10).join(f"{i+len(main_questions)+len(selected_additional)+1}. {q}" for i, q in enumerate(fixed_demographics))}
+
+---
+
+**Review your complete questionnaire:**
+- **A** (Accept) - Use these questions and proceed to testing
+- **R** (Revise) - Rephrase questions in different words
+- **M** (More) - Generate even more additional questions
+- **B** (Back) - Return to questionnaire builder menu
+"""
+                
+            except Exception as e:
+                return f"""
+Error processing selection: {str(e)}
+
+Please enter question numbers separated by spaces.
+"""
+
+    async def _show_current_questions(self, session: ResearchDesign) -> str:
+        """Show current questions with options"""
+        if not session.questions:
+            return "No questions generated yet."
+        
+        fixed_demographics = [
+            "What is your age?",
+            "What is your gender?",
+            "What is your highest level of education?",
+            "What is your annual household income range?",
+            "In which city/region do you currently live?"
+        ]
+        
+        main_questions = [q for q in session.questions if q not in fixed_demographics]
+        demographic_questions = [q for q in session.questions if q in fixed_demographics]
+        
+        return f"""
+📋 **Current Questionnaire ({len(session.questions)} questions)**
+
+**Main Questions ({len(main_questions)}):**
+{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(main_questions))}
+
+**Demographics ({len(demographic_questions)}):**
+{chr(10).join(f"{i+len(main_questions)+1}. {q}" for i, q in enumerate(demographic_questions))}
+
+---
+
+**Review these questions:**
+- **A** (Accept) - Use these questions and proceed to testing
+- **R** (Revise) - Rephrase questions in different words
+- **M** (More) - Generate additional questions
+- **B** (Back) - Return to questionnaire builder menu
+"""
+
     async def _rebrowse_internet(self, session: ResearchDesign) -> str:
-        """Rebrowse next batch of URLs and extract real questions with improved formatting"""
+        """Rebrowse next batch and present new questions for selection"""
         try:
             # Check rebrowse limit
             if session.rebrowse_count >= 4:
-                total_questions = len(session.internet_questions) if session.internet_questions else 0
-                
-                # Format final results with full URLs
-                if hasattr(session, 'extracted_questions_with_sources') and session.extracted_questions_with_sources:
-                    if not hasattr(self, '_question_extractor'):
-                        self._question_extractor = ImprovedQuestionExtractor()
-                    formatted_final = self._question_extractor.format_questions_by_source(session.extracted_questions_with_sources)
-                else:
-                    formatted_final = chr(10).join(f"{i+1}. {q}" for i, q in enumerate(session.internet_questions or []))
-                
-                return f"""
-    📚 **All Relevant URLs Processed**
-
-    You have browsed through all the relevant URLs we found for your research topic.
-
-    **Final Results Summary:**
-    - **Total URLs collected:** {len(session.all_collected_urls) if session.all_collected_urls else 0}
-    - **Total URLs processed:** {len(session.browsed_urls) if session.browsed_urls else 0}
-    - **Total real questions extracted:** {total_questions}
-
-    **All Extracted Questions by Source:**
-    {formatted_final}
-
-    **Would you like to:**
-    - **Y** (Yes) - Use these questions and build the questionnaire
-    - **E** (Exit) - Exit workflow
-    """
+                return await self._show_final_selection_summary(session)
             
             # Increment rebrowse count
             session.rebrowse_count += 1
@@ -1626,98 +1947,117 @@ Please respond with:
             )
             
             if not new_extracted_questions:
-                # Format current results for display
-                if hasattr(session, 'extracted_questions_with_sources') and session.extracted_questions_with_sources:
-                    if not hasattr(self, '_question_extractor'):
-                        self._question_extractor = ImprovedQuestionExtractor()
-                    formatted_current = self._question_extractor.format_questions_by_source(session.extracted_questions_with_sources)
-                else:
-                    formatted_current = chr(10).join(f"{i+1}. {q}" for i, q in enumerate(session.internet_questions or []))
-                
-                return f"""
-    ❌ **No More Questions Found**
-
-    No additional survey questions found in the remaining URLs.
-
-    **Current Results by Source:**
-    {formatted_current}
-
-    **Would you like to:**
-    - **Y** (Yes) - Use the current questions and build the questionnaire
-    - **E** (Exit) - Exit workflow
-    """
+                return await self._show_final_selection_summary(session)
             
-            # SIMPLE FIX: Combine with uniqueness checking
-            old_detailed = getattr(session, 'extracted_questions_with_sources', [])
+            # Add new unique questions to pool
+            existing_questions = {q['question'].lower().strip() for q in session.selected_questions_pool}
+            new_unique_questions = []
             
-            # Create a set of existing questions for deduplication
-            existing_questions = set()
-            for old_q in old_detailed:
-                existing_questions.add(old_q['question'].lower().strip())
-            
-            # Filter new questions to only include truly unique ones
-            unique_new_questions = []
-            for new_q in new_extracted_questions:
-                question_text = new_q['question'].lower().strip()
+            for q_dict in new_extracted_questions:
+                question_text = q_dict['question'].lower().strip()
                 if question_text not in existing_questions:
-                    unique_new_questions.append(new_q)
-                    existing_questions.add(question_text)  # Add to set for next iteration
-                    logger.info(f"✅ Added unique rebrowse question: {new_q['question'][:50]}...")
-                else:
-                    logger.info(f"⚠️ Skipped duplicate rebrowse question: {new_q['question'][:50]}...")
+                    new_unique_questions.append(q_dict)
+                    existing_questions.add(question_text)
             
-            # Combine old and new questions (now guaranteed unique)
-            new_questions_simple = [q['question'] for q in unique_new_questions]
-            all_questions = (session.internet_questions or []) + new_questions_simple
-            all_sources = (session.internet_sources or []) + new_sources
-            all_screenshots = (session.screenshots or []) + new_screenshots
+            if not new_unique_questions:
+                return await self._show_final_selection_summary(session)
             
-            # Combine detailed questions with sources
-            all_detailed = old_detailed + unique_new_questions
-            session.extracted_questions_with_sources = all_detailed
+            session.selected_questions_pool.extend(new_unique_questions)
+            session.awaiting_selection = True
             
-            # Update session with combined results
-            session.internet_questions = all_questions
-            session.internet_sources = all_sources
-            session.screenshots = all_screenshots
+            # FIXED: Format NEW questions with full source URLs
+            new_questions_formatted = []
+            start_num = len(session.selected_questions_pool) - len(new_unique_questions) + 1
             
-            # Format all questions by source
-            if not hasattr(self, '_question_extractor'):
-                self._question_extractor = ImprovedQuestionExtractor()
-            formatted_all = self._question_extractor.format_questions_by_source(all_detailed)
+            # Group new questions by source for better display
+            source_groups = {}
+            for i, q_dict in enumerate(new_unique_questions):
+                question_num = start_num + i
+                source_url = q_dict['source']
+                if source_url not in source_groups:
+                    source_groups[source_url] = []
+                source_groups[source_url].append((question_num, q_dict['question']))
             
-            # Calculate progress
-            total_collected = len(session.all_collected_urls) if session.all_collected_urls else 0
-            current_batch = session.current_batch_index
-            processed_count = len(session.browsed_urls) if session.browsed_urls else 0
-            remaining_batches = max(0, ((total_collected + 5) // 6) - current_batch)
+            # Format with full URLs
+            for source_num, (source_url, questions) in enumerate(source_groups.items(), 1):
+                try:
+                    from urllib.parse import urlparse
+                    domain = urlparse(source_url).netloc
+                except:
+                    domain = source_url
+                
+                new_questions_formatted.append(f"**New Source {source_num}: {domain}**")
+                new_questions_formatted.append(f"*Full URL: {source_url}*")
+                
+                for question_num, question_text in questions:
+                    new_questions_formatted.append(f"{question_num}. {question_text}")
+                
+                new_questions_formatted.append("")  # Empty line between sources
+            
+            total_selected = len(session.user_selected_questions)
+            remaining_selections = session.max_selectable_questions - total_selected
             
             return f"""
-    🔍 **Extended Real Questions Found (Batch {current_batch}/{(total_collected + 5) // 6})**
+    🔍 **New Questions Found - Please Select (Rebrowse {session.rebrowse_count})**
 
-    **All UNIQUE Questions by Source:**
-    {formatted_all}
+    Found {len(new_unique_questions)} NEW unique questions:
 
-    **📊 Updated Progress:**
-    - **Total UNIQUE Questions:** {len(all_questions)} real questions extracted
-    - **New unique questions this batch:** {len(unique_new_questions)}
-    - **URLs processed:** {processed_count} of {total_collected} collected
-    - **Screenshots:** {len(all_screenshots)} quality screenshots captured
-    - **Remaining batches:** {remaining_batches}
-    - **Rebrowses used:** {session.rebrowse_count} of 4 maximum
-    ---
+    {chr(10).join(new_questions_formatted)}
 
-    **What would you like to do with these questions?**
+    **📊 Selection Status:**
+    - **Currently selected:** {total_selected}/{session.max_selectable_questions}
+    - **Remaining selections:** {remaining_selections}
+    - **Total questions in pool:** {len(session.selected_questions_pool)}
 
-    Reply with:
-    - **Y** (Yes) - Use all these questions and build the questionnaire
-    {"- **R** (Rebrowse) - Search the next batch of URLs for more questions" if session.rebrowse_count < 4 else ""}
+    **How to select from NEW questions:**
+    Enter question numbers separated by spaces (e.g., "{start_num} {start_num+1}")
+    - Select up to {remaining_selections} more questions
+    - Enter "0" to select none from this batch
+
+    **Options after selection:**
+    - **C** (Continue) - Proceed to questionnaire builder with selected questions
+    - **R** (Rebrowse) - Search more URLs ({4 - session.rebrowse_count} rebrowses left)
     - **E** (Exit) - Exit workflow
+
+    **Please enter your question numbers:**
     """
             
         except Exception as e:
-            logger.error(f"Error in rebrowse internet: {e}")
+            logger.error(f"Error in rebrowse: {e}")
             return f"❌ Rebrowse Error: {str(e)}"
+
+    async def _show_final_selection_summary(self, session: ResearchDesign) -> str:
+        """Show final selection summary when no more browsing is possible"""
+        total_selected = len(session.user_selected_questions)
+        
+        if total_selected == 0:
+            return """
+    📚 **No Questions Selected**
+
+    You haven't selected any questions from the internet search.
+
+    **Would you like to:**
+    - **C** (Continue) - Proceed to questionnaire builder with AI-generated questions only
+    - **E** (Exit) - Exit workflow
+    """
+        
+        selected_questions_text = "\n".join(
+            f"{i+1}. {q['question']}" 
+            for i, q in enumerate(session.user_selected_questions)
+        )
+        
+        return f"""
+    📚 **Final Question Selection Summary**
+
+    **Your Selected Questions ({total_selected}/{session.max_selectable_questions}):**
+    {selected_questions_text}
+
+    **Sources:** {len(set(q['source'] for q in session.user_selected_questions))} different websites
+
+    **Would you like to:**
+    - **C** (Continue) - Proceed to questionnaire builder with these {total_selected} selected questions
+    - **E** (Exit) - Exit workflow
+    """
 
     async def _start_questionnaire_builder(self, session: ResearchDesign) -> str:
         """Start the questionnaire builder process with step-by-step prompts"""
@@ -1797,7 +2137,7 @@ Please respond with:
     """
 
     async def _handle_questionnaire_builder(self, session_id: str, user_input: str) -> str:
-        """Handle questionnaire builder interactions with all options"""
+        """Handle questionnaire builder interactions with fixed flow"""
         session = self.active_sessions[session_id]
         
         # Initialize questionnaire responses safely
@@ -1807,7 +2147,17 @@ Please respond with:
         # Determine which mode we're in
         is_selection_mode = hasattr(session, 'selected_internet_questions') and session.selected_internet_questions
         is_include_all_mode = hasattr(session, 'include_all_internet_questions') and session.include_all_internet_questions
-        total_questions_flow = 5 if is_selection_mode else 4
+        total_questions_flow = 3 if is_selection_mode else 3  # CHANGED: Now 3 questions instead of 4/5
+        
+        # FIXED: Handle "More Questions" menu responses FIRST (after M command)
+        if session.__dict__.get('in_more_questions_menu', False):
+            session.__dict__['in_more_questions_menu'] = False  # Clear the flag
+            return await self._handle_more_questions_response(session_id, user_input)
+        
+        # FIXED: Handle additional question selection flow (M -> S flow)
+        if session.__dict__.get('awaiting_additional_selection', False):
+            session.__dict__['awaiting_additional_selection'] = False  # Clear the flag
+            return await self._handle_additional_question_selection(session_id, user_input)
         
         # Universal commands
         if user_input.upper().strip() == 'A':
@@ -1816,6 +2166,7 @@ Please respond with:
         elif user_input.upper().strip() == 'R':
             return await self._revise_questions(session)
         elif user_input.upper().strip() == 'M':
+            session.__dict__['in_more_questions_menu'] = True  # Set flag for next response
             return await self._generate_more_questions(session)
         elif user_input.upper().strip() == 'B':
             session.questionnaire_responses = {}
@@ -1836,20 +2187,20 @@ Please respond with:
                         session.questionnaire_responses['total_questions'] = number_value  # For generation purposes
                         
                         return f"""
-    **Question 2 of 4: Question Types Breakdown**
+    **Question 2 of 3: Question Types Breakdown**
     You will have {len(session.internet_questions or [])} internet questions + {number_value} additional questions = **{total_final} total questions**.
 
     How would you like to distribute the {number_value} ADDITIONAL questions?
 
     Examples:
-    - "3 demographic, 2 general, 0 open-ended" (for 5 additional)
-    - "no demographic, 8 general, 2 open-ended" (for 10 additional)
+    - "5 general, 0 open-ended" (for 5 additional) - Demographics are fixed
+    - "8 general, 2 open-ended" (for 10 additional) - Demographics are fixed
     - "all general questions" (for any additional count)
 
     **Question Types:**
-    - **Demographic**: Age, gender, education, income, location
     - **General**: Satisfaction, rating, frequency, importance (Likert scales)
     - **Open-ended**: What, why, suggestions, feelings
+    - **Demographics**: Fixed questions (age, gender, education, income, location) - automatically included
 
     Please specify your question breakdown for the {number_value} ADDITIONAL questions:
     """
@@ -1859,7 +2210,7 @@ Please respond with:
                         
                         if is_selection_mode:
                             return f"""
-    **Question 2 of 5: Select Internet Questions**
+    **Question 2 of 3: Select Internet Questions**
     Please enter the question numbers from the internet-generated questions you want to include AS EXTRAS.
 
     **Available Questions:**
@@ -1871,17 +2222,17 @@ Please respond with:
     """
                         else:
                             return f"""
-    **Question 2 of 4: Question Types Breakdown**
+    **Question 2 of 3: Question Types Breakdown**
     How would you like to distribute the {number_value} questions?
 
     Examples:
-    - "5 demographic, 3 general, 2 open-ended" (for 10 total)
+    - "5 general, 2 open-ended" (for 7 total) - Demographics are fixed
     - "all general questions" (for any total)
 
     **Question Types:**
-    - **Demographic**: Age, gender, education, income, location
     - **General**: Satisfaction, rating, frequency, importance (Likert scales)
     - **Open-ended**: What, why, suggestions, feelings
+    - **Demographics**: Fixed questions (age, gender, education, income, location) - automatically included
 
     Please specify your question breakdown:
     """
@@ -1926,7 +2277,7 @@ Please respond with:
                 total_final = base_questions + len(selected_questions)
                 
                 return f"""
-    **Question 3 of 5: Question Types Breakdown**
+    **Question 3 of 3: Style of Questioning**
     You have selected {len(selected_questions)} questions as extras.
 
     **Final Survey Structure:**
@@ -1934,9 +2285,15 @@ Please respond with:
     - Selected extras: {len(selected_questions)}
     - **Total final questions: {total_final}**
 
-    How would you like to distribute the {base_questions} BASE questions?
+    What style of questioning should be used?
 
-    Please specify your question breakdown for the {base_questions} BASE questions:
+    Examples:
+    - "professional and formal"
+    - "casual and friendly"  
+    - "academic research style"
+    - "customer feedback style"
+
+    Please specify the questioning style:
     """
             except Exception as e:
                 return f"""
@@ -1947,37 +2304,20 @@ Please respond with:
         elif 'question_breakdown' not in session.questionnaire_responses:
             session.questionnaire_responses['question_breakdown'] = user_input.strip()
             
-            next_q = 3 if is_include_all_mode else (4 if is_selection_mode else 3)
-            total_q = 4 if is_include_all_mode else (5 if is_selection_mode else 4)
+            next_q = 3 if is_include_all_mode else (3 if is_selection_mode else 3)
+            total_q = 3  # Always 3 questions now
             
             return f"""
-    **Question {next_q} of {total_q}: Survey Length**
-    How long should the survey take to complete?
+    **Question {next_q} of {total_q}: Style of Questioning**
+    What style of questioning should be used?
 
     Examples:
-    - "under 5 minutes"
-    - "under 10 minutes"  
-    - "under 15 minutes"
+    - "professional and formal"
+    - "casual and friendly"
+    - "academic research style"  
+    - "customer feedback style"
 
-    Please specify the target completion time:
-    """
-        
-        elif 'survey_length' not in session.questionnaire_responses:
-            session.questionnaire_responses['survey_length'] = user_input.strip()
-            
-            next_q = 4 if is_include_all_mode else (5 if is_selection_mode else 4)
-            total_q = 4 if is_include_all_mode else (5 if is_selection_mode else 4)
-            
-            return f"""
-    **Question {next_q} of {total_q}: Target Audience Style**
-    What audience style should the questions use?
-
-    Examples:
-    - "general audience"
-    - "senior-friendly"
-    - "mobile-friendly"
-
-    Please specify the audience style:
+    Please specify the questioning style:
     """
         
         elif 'audience_style' not in session.questionnaire_responses:
@@ -1987,46 +2327,66 @@ Please respond with:
         else:
             return "All questionnaire specifications completed."
 
-    async def _generate_ai_questions(self, session: ResearchDesign, count: int, breakdown: str, survey_length: str, audience_style: str) -> list:
-        """Generate AI questions with specified count and breakdown"""
+    async def _handle_more_questions_response(self, session_id: str, user_input: str) -> str:
+        """Handle responses to the More Questions menu"""
+        session = self.active_sessions[session_id]
+        response = user_input.upper().strip()
         
+        if response == 'A':
+            # Accept all additional questions
+            return await self._handle_additional_question_selection(session_id, 'A')
+        elif response == 'S':
+            # Select some - set flag and go to selection mode
+            session.__dict__['awaiting_additional_selection'] = True
+            return await self._handle_additional_question_selection(session_id, 'S')
+        elif response == 'R':
+            # Regenerate additional questions
+            return await self._generate_more_questions(session)
+        elif response == 'B':
+            # Go back to main questionnaire review
+            return await self._show_current_questions(session)
+        else:
+            # Invalid response
+            return """
+Please respond with:
+- **A** (Accept All) - Add all these to your questionnaire
+- **S** (Select Some) - Choose specific questions to add
+- **R** (Regenerate) - Create different additional questions
+- **B** (Back) - Return to previous menu
+"""
+
+    async def _generate_ai_questions(self, session: ResearchDesign, count: int, breakdown: str, audience_style: str) -> list:
+        """Generate AI questions with specified count and breakdown - NO demographics"""
+        import re
         if count <= 0:
             return []
         
-        # Parse breakdown
-        import re
-        demographic_count = 0
+        # Parse breakdown - REMOVED demographic parsing
         general_count = 0
         open_ended_count = 0
         
-        if "no demographic" in breakdown or "0 demographic" in breakdown:
-            demographic_count = 0
-        else:
-            demo_match = re.search(r'(\d+)\s+demographic', breakdown)
-            if demo_match:
-                demographic_count = int(demo_match.group(1))
-        
         if "all general" in breakdown:
-            general_count = count - demographic_count - open_ended_count
+            general_count = count
+            open_ended_count = 0
         else:
             general_match = re.search(r'(\d+)\s+general', breakdown)
             if general_match:
                 general_count = int(general_match.group(1))
-        
-        if "no open" in breakdown or "0 open" in breakdown:
-            open_ended_count = 0
-        else:
-            open_match = re.search(r'(\d+)\s+open[- ]?ended?', breakdown)
-            if open_match:
-                open_ended_count = int(open_match.group(1))
+            
+            if "no open" in breakdown or "0 open" in breakdown:
+                open_ended_count = 0
+            else:
+                open_match = re.search(r'(\d+)\s+open[- ]?ended?', breakdown)
+                if open_match:
+                    open_ended_count = int(open_match.group(1))
         
         # Adjust if breakdown doesn't add up
-        current_total = demographic_count + general_count + open_ended_count
+        current_total = general_count + open_ended_count
         if current_total != count:
-            general_count = count - demographic_count - open_ended_count
+            general_count = count - open_ended_count
             general_count = max(0, general_count)
         
-        # Generate questions
+        # Generate questions - UPDATED prompt to exclude demographics
         prompt = f"""
     Generate EXACTLY {count} survey questions for this research:
 
@@ -2035,11 +2395,11 @@ Please respond with:
 
     REQUIREMENTS:
     - EXACTLY {count} questions total
-    - EXACTLY {demographic_count} demographic questions
-    - EXACTLY {general_count} general questions
-    - EXACTLY {open_ended_count} open-ended questions
-    - Completion time: {survey_length}
-    - Audience: {audience_style}
+    - EXACTLY {general_count} general questions (satisfaction, frequency, rating, importance - Likert scales)
+    - EXACTLY {open_ended_count} open-ended questions (what, why, suggestions, feelings)
+    - DO NOT generate any demographic questions (age, gender, education, income, location)
+    - Demographics will be handled separately with fixed questions
+    - Questioning style: {audience_style}
 
     Return ONLY the numbered questions, nothing else.
     """
@@ -2089,7 +2449,7 @@ Please respond with:
             return [f"How satisfied are you with {session.research_topic}?" for _ in range(count)]
 
     async def _generate_questions_from_specifications(self, session: ResearchDesign) -> str:
-        """Generate questions based on specifications - handling all decision modes"""
+        """Generate questions based on specifications - handling all decision modes with fixed demographics"""
         
         # Determine which mode we're in
         is_selection_mode = hasattr(session, 'selected_internet_questions') and session.selected_internet_questions
@@ -2097,8 +2457,16 @@ Please respond with:
         
         # Get basic specifications
         breakdown = session.questionnaire_responses['question_breakdown'].lower()
-        survey_length = session.questionnaire_responses['survey_length']
         audience_style = session.questionnaire_responses['audience_style']
+        
+        # Fixed demographic questions
+        fixed_demographics = [
+            "What is your age?",
+            "What is your gender?",
+            "What is your highest level of education?",
+            "What is your annual household income range?",
+            "In which city/region do you currently live?"
+        ]
         
         if is_include_all_mode:
             # Y option: ALL internet questions + additional generated questions
@@ -2114,18 +2482,18 @@ Please respond with:
             # A option: Only generated questions
             questions_to_generate = session.questionnaire_responses['total_questions']
         
-        # Generate the required questions
+        # Generate the required questions (NO demographics in AI generation)
         if questions_to_generate > 0:
             generated_questions = await self._generate_ai_questions(
-                session, questions_to_generate, breakdown, survey_length, audience_style
+                session, questions_to_generate, breakdown, audience_style
             )
         else:
             generated_questions = []
         
-        # Combine questions based on mode
+        # Combine questions based on mode + ADD FIXED DEMOGRAPHICS
         if is_include_all_mode:
-            # Y option: Internet questions + generated questions
-            final_questions = (session.internet_questions or []) + generated_questions
+            # Y option: Internet questions + generated questions + demographics
+            final_questions = (session.internet_questions or []) + generated_questions + fixed_demographics
             
             display_info = f"""**All Internet Questions ({len(session.internet_questions or [])}):**
     {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(session.internet_questions or []))}
@@ -2133,16 +2501,20 @@ Please respond with:
     {"**Additional Generated Questions (" + str(len(generated_questions)) + "):**" if generated_questions else "**No Additional Questions Generated**"}
     {chr(10).join(f"{i+len(session.internet_questions or [])+1}. {q}" for i, q in enumerate(generated_questions)) if generated_questions else ""}
 
-    **Total Questions: {len(final_questions)}** ({len(session.internet_questions or [])} internet + {len(generated_questions)} generated)
+    **Fixed Demographic Questions ({len(fixed_demographics)}):**
+    {chr(10).join(f"{i+len(session.internet_questions or [])+len(generated_questions)+1}. {q}" for i, q in enumerate(fixed_demographics))}
+
+    **Total Questions: {len(final_questions)}** ({len(session.internet_questions or [])} internet + {len(generated_questions)} generated + {len(fixed_demographics)} demographics)
     """
             specs_info = f"""- Internet questions: {len(session.internet_questions or [])} (all included)
     - Additional generated: {len(generated_questions)}
+    - Fixed demographics: {len(fixed_demographics)}
     - Final total: {len(final_questions)}"""
             
         elif is_selection_mode:
-            # S option: Generated questions + selected questions as extras
+            # S option: Generated questions + selected questions as extras + demographics
             selected_questions = session.questionnaire_responses.get('selected_questions', [])
-            final_questions = generated_questions + selected_questions
+            final_questions = generated_questions + selected_questions + fixed_demographics
             
             display_info = f"""**Generated Questions ({len(generated_questions)}):**
     {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(generated_questions))}
@@ -2150,20 +2522,31 @@ Please respond with:
     **Selected Internet Questions Added as Extras ({len(selected_questions)}):**
     {chr(10).join(f"{i+len(generated_questions)+1}. {q}" for i, q in enumerate(selected_questions))}
 
-    **Total Questions: {len(final_questions)}** ({len(generated_questions)} generated + {len(selected_questions)} selected extras)
+    **Fixed Demographic Questions ({len(fixed_demographics)}):**
+    {chr(10).join(f"{i+len(generated_questions)+len(selected_questions)+1}. {q}" for i, q in enumerate(fixed_demographics))}
+
+    **Total Questions: {len(final_questions)}** ({len(generated_questions)} generated + {len(selected_questions)} selected extras + {len(fixed_demographics)} demographics)
     """
             specs_info = f"""- Generated questions: {len(generated_questions)}
     - Selected extras: {len(selected_questions)}
+    - Fixed demographics: {len(fixed_demographics)}
     - Final total: {len(final_questions)}"""
             
         else:
-            # A option: Only generated questions
-            final_questions = generated_questions
+            # A option: Only generated questions + demographics
+            final_questions = generated_questions + fixed_demographics
             
-            display_info = f"""**Generated Questions ({len(generated_questions)} total):**
+            display_info = f"""**Generated Questions ({len(generated_questions)}):**
     {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(generated_questions))}
+
+    **Fixed Demographic Questions ({len(fixed_demographics)}):**
+    {chr(10).join(f"{i+len(generated_questions)+1}. {q}" for i, q in enumerate(fixed_demographics))}
+
+    **Total Questions: {len(final_questions)}** ({len(generated_questions)} generated + {len(fixed_demographics)} demographics)
     """
-            specs_info = f"""- Total questions: {len(final_questions)}"""
+            specs_info = f"""- Generated questions: {len(generated_questions)}
+    - Fixed demographics: {len(fixed_demographics)}
+    - Total questions: {len(final_questions)}"""
         
         # Store final questions
         session.questions = final_questions
@@ -2175,8 +2558,7 @@ Please respond with:
 
     **Applied Specifications:**
     {specs_info}
-    - Target time: {survey_length}
-    - Audience: {audience_style}
+    - Questioning style: {audience_style}
 
     {display_info}
 
@@ -2184,7 +2566,7 @@ Please respond with:
 
     **Review these questions:**
     - **A** (Accept) - Use these questions and proceed to testing
-    - **R** (Revise) - Request modifications to the questions
+    - **R** (Revise) - Rephrase the same questions in different words
     - **M** (More) - Generate additional questions
     - **B** (Back) - Return to questionnaire builder menu
     """
@@ -2415,49 +2797,161 @@ Format as a structured test report. Keep response under 350 words and in English
 """
     
     async def _revise_questions(self, session: ResearchDesign) -> str:
-        """Handle question revision requests"""
-        return """
-✏️ **Revise Questions**
-
-Please specify what you'd like to change:
-
-1. **Modify specific questions** - Tell me which question numbers to change
-2. **Change question types** - Convert to different formats (multiple choice, Likert, etc.)
-3. **Add demographic questions** - Include age, gender, income, etc.
-4. **Remove questions** - Specify which questions to remove
-5. **Change difficulty level** - Make questions simpler or more detailed
-
-Please describe your revision needs:
-"""
-    
-    async def _generate_more_questions(self, session: ResearchDesign) -> str:
-        """Generate additional questions"""
+        """Rephrase existing questions in different words"""
+        if not session.questions:
+            return "No questions available to revise. Please generate questions first."
+        
+        # Separate demographics from other questions
+        fixed_demographics = [
+            "What is your age?",
+            "What is your gender?", 
+            "What is your highest level of education?",
+            "What is your annual household income range?",
+            "In which city/region do you currently live?"
+        ]
+        
+        # Find non-demographic questions to rephrase
+        questions_to_rephrase = []
+        demographic_questions = []
+        
+        for q in session.questions:
+            if q in fixed_demographics:
+                demographic_questions.append(q)
+            else:
+                questions_to_rephrase.append(q)
+        
+        if not questions_to_rephrase:
+            return "Only demographic questions found. Demographics cannot be revised as they are standardized."
+        
+        # Rephrase non-demographic questions
         prompt = f"""
-Generate 5 additional survey questions for this research:
+    Rephrase the following survey questions in different words while keeping the same meaning and intent:
 
-Topic: {session.research_topic}
-Target: {session.target_population}
+    Research Topic: {session.research_topic}
+    Target Population: {session.target_population}
 
-Focus on aspects not yet covered. Include demographic and behavioral questions. Respond in English only.
-"""
+    Original Questions:
+    {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(questions_to_rephrase))}
+
+    Requirements:
+    - Keep the same meaning and intent
+    - Use different wording and phrasing
+    - Maintain professional survey language
+    - Return the same number of questions
+    - Number each question
+
+    Rephrased Questions:
+    """
         
         try:
             response = await self.llm.ask(prompt, temperature=0.7)
             cleaned_response = remove_chinese_and_punct(str(response))
             
+            # Parse rephrased questions
+            lines = cleaned_response.split('\n')
+            rephrased_questions = []
+            
+            for line in lines:
+                line = line.strip()
+                if not line or len(line) < 10:
+                    continue
+                    
+                # Clean question
+                clean_line = re.sub(r'^[\d\.\-\•\*\s]*', '', line).strip()
+                
+                if clean_line and len(clean_line) > 15:
+                    if not clean_line.endswith('?'):
+                        clean_line += '?'
+                    rephrased_questions.append(clean_line)
+            
+            # Ensure we have the right number of questions
+            if len(rephrased_questions) < len(questions_to_rephrase):
+                # Fill missing questions
+                for i in range(len(rephrased_questions), len(questions_to_rephrase)):
+                    rephrased_questions.append(questions_to_rephrase[i])
+            elif len(rephrased_questions) > len(questions_to_rephrase):
+                rephrased_questions = rephrased_questions[:len(questions_to_rephrase)]
+            
+            # Combine rephrased questions with demographics
+            session.questions = rephrased_questions + demographic_questions
+            
             return f"""
-📝 **Additional Questions Generated**
+    ✏️ **Questions Revised**
 
-{cleaned_response}
+    **Rephrased Questions ({len(rephrased_questions)}):**
+    {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(rephrased_questions))}
 
----
+    **Fixed Demographics ({len(demographic_questions)}):**
+    {chr(10).join(f"{i+len(rephrased_questions)+1}. {q}" for i, q in enumerate(demographic_questions))}
 
-**Options:**
-- **A** (Accept All) - Add these to your questionnaire
-- **S** (Select Some) - Choose specific questions to add
-- **R** (Regenerate) - Create different additional questions
-- **B** (Back) - Return to previous menu
-"""
+    **Total Questions: {len(session.questions)}**
+
+    ---
+
+    **Review these revised questions:**
+    - **A** (Accept) - Use these questions and proceed to testing
+    - **R** (Revise) - Rephrase again in different words
+    - **M** (More) - Generate additional questions
+    - **B** (Back) - Return to questionnaire builder menu
+    """
+            
+        except Exception as e:
+            logger.error(f"Error revising questions: {e}")
+            return "Unable to revise questions. Please try again or use the original questions."
+    
+    async def _generate_more_questions(self, session: ResearchDesign) -> str:
+        """Generate additional questions and prepare for selection"""
+        prompt = f"""
+    Generate 8 additional survey questions for this research:
+
+    Topic: {session.research_topic}
+    Target: {session.target_population}
+
+    Focus on aspects not yet covered. Include general satisfaction, behavioral, and preference questions.
+    DO NOT include demographic questions (age, gender, education, income, location).
+    Respond in English only.
+    """
+        
+        try:
+            response = await self.llm.ask(prompt, temperature=0.7)
+            cleaned_response = remove_chinese_and_punct(str(response))
+            
+            # Parse additional questions
+            lines = cleaned_response.split('\n')
+            additional_questions = []
+            
+            for line in lines:
+                line = line.strip()
+                if not line or len(line) < 10:
+                    continue
+                    
+                # Clean question
+                clean_line = re.sub(r'^[\d\.\-\•\*\s]*', '', line).strip()
+                
+                if clean_line and len(clean_line) > 15:
+                    if not clean_line.endswith('?'):
+                        clean_line += '?'
+                    additional_questions.append(clean_line)
+                    
+                    if len(additional_questions) >= 8:
+                        break
+            
+            # Store additional questions in session for selection
+            session.additional_questions = additional_questions
+            
+            return f"""
+    📝 **Additional Questions Generated**
+
+    {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(additional_questions))}
+
+    ---
+
+    **Options:**
+    - **A** (Accept All) - Add all these to your questionnaire
+    - **S** (Select Some) - Choose specific questions to add
+    - **R** (Regenerate) - Create different additional questions
+    - **B** (Back) - Return to previous menu
+    """
         except Exception as e:
             logger.error(f"Error generating additional questions: {e}")
             return "Unable to generate additional questions. Please try again."

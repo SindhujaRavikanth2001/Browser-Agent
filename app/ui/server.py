@@ -65,6 +65,7 @@ class ResearchStage(Enum):
 class ResearchDesign(BaseModel):
     research_topic: Optional[str] = None
     objectives: Optional[List[str]] = None
+    research_motivation: Optional[str] = None  # NEW FIELD
     target_population: Optional[str] = None
     timeframe: Optional[str] = None
     questions: Optional[List[str]] = None
@@ -826,25 +827,20 @@ GENERATE {num_needed} SURVEY QUESTIONS:
             return []
     
     async def start_research_design(self, session_id: str) -> str:
-        """Start the research design process"""
+        """Start the research design process with improved prompting"""
         self.active_sessions[session_id] = ResearchDesign(
             stage=ResearchStage.DESIGN_INPUT,
             chat_history=[]
         )
         
+        # Updated initial response - removed examples
         initial_response = """
     🔬 **Research Design Workflow Started**
 
     Let's design your research study step by step. I'll ask you a series of questions to help create a comprehensive research design.
 
-    **Question 1 of 3: Research Topic**
+    **Question 1 of 4: Research Topic**
     What are you looking to find out? Please describe your research topic or area of interest.
-
-    Examples:
-    - Consumer preferences for sustainable products
-    - Impact of remote work on employee productivity
-    - Student attitudes toward online learning
-    - Healthcare access in rural communities
 
     Please provide your research topic:
     """
@@ -974,7 +970,7 @@ Please respond with:
 """
     
     async def _export_complete_research_package(self, session: ResearchDesign) -> str:
-        """Export complete research package with LLM-generated content"""
+        """Export complete research package with LLM-generated content including motivation"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"complete_research_package_{timestamp}.txt"
         
@@ -982,7 +978,7 @@ Please respond with:
             os.makedirs("research_outputs", exist_ok=True)
             
             # Get the research design content
-            research_design_content = await self._generate_research_design(session)
+            research_design_content = await self._generate_research_design_with_motivation(session)
             
             # Use ALL questions from session
             final_questions = session.questions or []
@@ -1011,7 +1007,7 @@ Please respond with:
             # Export chat history
             chat_filepath = self._export_chat_history(session, timestamp)
             
-            # Create comprehensive research package
+            # Create comprehensive research package with motivation
             package_content = f"""COMPLETE RESEARCH DESIGN PACKAGE
     Generated on: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
@@ -1023,6 +1019,8 @@ Please respond with:
 
     Research Objectives:
     {chr(10).join(f"• {obj}" for obj in (session.objectives or []))}
+
+    Research Motivation: {session.research_motivation or 'Not specified'}
 
     Target Population: {session.target_population}
 
@@ -1099,7 +1097,7 @@ Please respond with:
             for key in session_keys_to_remove:
                 del self.active_sessions[key]
             
-            # Enhanced response with breakdown
+            # Enhanced response with breakdown including motivation
             chat_info = f"\nChat file: `{chat_filepath.split('/')[-1] if chat_filepath else 'Export failed'}`" if chat_filepath else "\n⚠️ Chat history export failed"
             
             return f"""
@@ -1118,6 +1116,7 @@ Please respond with:
 
     **Your Research Summary:**
     - **Topic:** {session.research_topic}
+    - **Motivation:** {session.research_motivation}
     - **Questions:** {len(final_questions)} validated questions
     - **Target:** {session.target_population}
     - **Timeline:** {session.timeframe}
@@ -1350,7 +1349,7 @@ Please respond with:
         logger.info(f"Logged chat interaction for session {session_id}, total interactions: {len(session.chat_history)}")
 
     async def _handle_design_input(self, session_id: str, user_input: str) -> str:
-        """Handle user input during design input phase - now 3 questions instead of 4"""
+        """Handle user input during design input phase - now 4 questions with new 'why' question"""
         session = self.active_sessions[session_id]
         
         if not session.user_responses:
@@ -1364,17 +1363,12 @@ Please respond with:
             
             logger.info(f"Session {session_id}: Saved topic - {session.research_topic}")
             
-            return """
-    **Question 2 of 3: Research Objectives**
-    What specific objectives do you want to achieve with this research? 
+            # Updated objectives question - removed examples and changed wording
+            return f"""
+    **Question 2 of 4: Research Objectives**
+    What specific things do you want to know about {session.research_topic}?
 
-    Examples:
-    - Understand customer satisfaction levels
-    - Identify factors influencing purchasing decisions
-    - Measure the effectiveness of a new program
-    - Compare different groups or conditions
-
-    Please list your research objectives (you can provide multiple objectives):
+    Please list what you want to find out (you can provide multiple objectives):
     """
         
         elif 'objectives' not in session.user_responses:
@@ -1394,29 +1388,44 @@ Please respond with:
             
             logger.info(f"Session {session_id}: Saved objectives - {session.objectives}")
             
+            # NEW Question 3: Why is this topic interesting?
+            return f"""
+    **Question 3 of 4: Research Motivation**
+    Why is {session.research_topic} interesting to you?
+
+    Please describe your motivation for conducting this research:
+    """
+        
+        elif 'motivation' not in session.user_responses:
+            # This is the response to Question 3 (motivation) - NEW QUESTION
+            session.user_responses['motivation'] = user_input.strip()
+            session.research_motivation = user_input.strip()
+            
+            logger.info(f"Session {session_id}: Saved motivation - {session.research_motivation}")
+            
+            # Updated target population question with new examples
             return """
-    **Question 3 of 3: Target Population**
+    **Question 4 of 4: Target Population**
     Who is your target population or study participants?
 
     Examples:
-    - Adults aged 18-65 in urban areas
-    - College students at public universities
-    - Small business owners in the technology sector
-    - Parents of children under 12
+    - All Americans
+    - Women in Urban Areas  
+    - 18-29 Year Olds
 
     Please describe your target population:
     """
         
         elif 'target_population' not in session.user_responses:
-            # This is the response to Question 3 (target population) - final question
+            # This is the response to Question 4 (target population) - final question
             session.user_responses['target_population'] = user_input.strip()
             session.target_population = user_input.strip()
             
             logger.info(f"Session {session_id}: Saved target population - {session.target_population}")
-            logger.info(f"Session {session_id}: All 3 questions completed, generating research design")
+            logger.info(f"Session {session_id}: All 4 questions completed, generating research design")
             
-            # Generate research design summary
-            research_design = await self._generate_research_design(session)
+            # Generate research design summary with motivation included
+            research_design = await self._generate_research_design_with_motivation(session)
             session.stage = ResearchStage.DESIGN_REVIEW
             
             return f"""
@@ -1426,6 +1435,8 @@ Please respond with:
 
     **Objectives:**
     {chr(10).join(f"• {obj}" for obj in session.objectives)}
+
+    **Motivation:** {session.research_motivation}
 
     **Target Population:** {session.target_population}
 
@@ -1447,6 +1458,33 @@ Please respond with:
             logger.warning(f"Session {session_id}: Unexpected state - all questions answered but still in DESIGN_INPUT stage")
             return "All research design questions have been completed. Please proceed with the review."
     
+    async def _generate_research_design_with_motivation(self, session: ResearchDesign) -> str:
+        """Generate a comprehensive research design using LLM including motivation"""
+        prompt = f"""
+    Generate a comprehensive research design based on the following information:
+
+    Topic: {session.research_topic}
+    Objectives: {', '.join(session.objectives)}
+    Motivation: {session.research_motivation}
+    Target Population: {session.target_population}
+
+    Please provide:
+    1. Research methodology recommendations
+    2. Key variables to measure
+    3. Potential limitations and considerations
+    4. Recommended sample size
+
+    Keep the response concise but comprehensive (under 300 words). Focus on online survey methodology as the primary approach. Respond in English only.
+    """
+        
+        try:
+            response = await self.llm.ask(prompt, temperature=0.7)
+            cleaned_response = remove_chinese_and_punct(str(response))
+            return cleaned_response
+        except Exception as e:
+            logger.error(f"Error generating research design: {e}")
+            return "Unable to generate research design automatically. Please review your inputs manually."
+
     async def _generate_research_design(self, session: ResearchDesign) -> str:
         """Generate a comprehensive research design using LLM without specifying data collection modes"""
         prompt = f"""

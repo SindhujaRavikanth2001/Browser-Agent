@@ -18,7 +18,8 @@ import {
   LinearProgress,
   Chip,
   Drawer,
-  CircularProgress
+  CircularProgress,
+  Checkbox
 } from '@mui/material';
 import { alpha } from '@mui/material/styles';
 import SendIcon from '@mui/icons-material/Send';
@@ -139,6 +140,29 @@ type DownloadFile = {
   display_name: string;
 };
 
+// Question selection types
+type QuestionData = {
+  id: string;
+  index: number;
+  question: string;
+  source: string;
+  extraction_method: string;
+};
+
+type SourceData = {
+  id: string;
+  domain: string;
+  full_url: string;
+  question_count: number;
+  questions: QuestionData[];
+};
+
+type UISelectionData = {
+  questions: QuestionData[];
+  sources: SourceData[];
+  total_count: number;
+};
+
 function App() {
   const theme = useTheme();
   const [socket, setSocket] = useState<WebSocket | null>(null);
@@ -180,6 +204,12 @@ function App() {
     message: '', 
     severity: 'success' as 'success' | 'error' | 'warning' | 'info'
   });
+
+  // Question selection state
+  const [uiSelectionData, setUISelectionData] = useState<UISelectionData | null>(null);
+  const [selectedQuestionIds, setSelectedQuestionIds] = useState<Set<string>>(new Set());
+  const [showQuestionSelection, setShowQuestionSelection] = useState(false);
+  const [selectionMode, setSelectionMode] = useState<'initial' | 'rebrowse'>('initial');
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const actionsEndRef = useRef<HTMLDivElement>(null);
@@ -280,6 +310,128 @@ function App() {
 
   const showDownloadNotification = (message: string, severity: 'success' | 'error' | 'warning' | 'info' = 'success') => {
     setDownloadNotification({ open: true, message, severity });
+  };
+
+  // Question selection functions
+  const handleQuestionToggle = (questionId: string) => {
+    const newSelected = new Set(selectedQuestionIds);
+    
+    if (newSelected.has(questionId)) {
+      newSelected.delete(questionId);
+    } else {
+      // Check if we've reached the maximum (30 questions)
+      if (newSelected.size >= 30) {
+        showDownloadNotification('Maximum 30 questions can be selected', 'warning');
+        return;
+      }
+      newSelected.add(questionId);
+    }
+    
+    setSelectedQuestionIds(newSelected);
+  };
+
+  const handleSelectAllFromSource = (sourceId: string) => {
+    if (!uiSelectionData) return;
+    
+    const source = uiSelectionData.sources.find(s => s.id === sourceId);
+    if (!source) return;
+    
+    const newSelected = new Set(selectedQuestionIds);
+    let addedCount = 0;
+    
+    for (const question of source.questions) {
+      if (!newSelected.has(question.id) && newSelected.size + addedCount < 30) {
+        newSelected.add(question.id);
+        addedCount++;
+      }
+    }
+    
+    if (addedCount === 0 && newSelected.size >= 30) {
+      showDownloadNotification('Maximum 30 questions can be selected', 'warning');
+    }
+    
+    setSelectedQuestionIds(newSelected);
+  };
+
+  const handleDeselectAllFromSource = (sourceId: string) => {
+    if (!uiSelectionData) return;
+    
+    const source = uiSelectionData.sources.find(s => s.id === sourceId);
+    if (!source) return;
+    
+    const newSelected = new Set(selectedQuestionIds);
+    for (const question of source.questions) {
+      newSelected.delete(question.id);
+    }
+    
+    setSelectedQuestionIds(newSelected);
+  };
+
+  const submitQuestionSelection = () => {
+    if (selectedQuestionIds.size === 0) {
+      showDownloadNotification('Please select at least one question', 'warning');
+      return;
+    }
+
+    const selectionData = {
+      selected_questions: Array.from(selectedQuestionIds)
+    };
+
+    // Send selection via WebSocket or HTTP
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ 
+        content: JSON.stringify(selectionData)
+      }));
+    } else {
+      fetch('/api/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          content: JSON.stringify(selectionData)
+        })
+      });
+    }
+
+    // Close selection panel
+    setShowQuestionSelection(false);
+    setSelectedQuestionIds(new Set());
+    setUISelectionData(null);
+    setIsLoading(true);
+  };
+
+  const handleContinueWithoutSelection = () => {
+    // Send continue command
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ content: 'Continue' }));
+    } else {
+      fetch('/api/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'Continue' })
+      });
+    }
+
+    setShowQuestionSelection(false);
+    setSelectedQuestionIds(new Set());
+    setUISelectionData(null);
+    setIsLoading(true);
+  };
+
+  const handleRebrowseForMore = () => {
+    // Send rebrowse command
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ content: 'Rebrowse' }));
+    } else {
+      fetch('/api/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'Rebrowse' })
+      });
+    }
+    
+    setSelectionMode('rebrowse');
+    setIsLoading(true);
+    // Keep the selection panel open to show new questions when they arrive
   };
 
   // Initialize Speech Recognition
@@ -579,6 +731,31 @@ function App() {
         setIsLoading(false);
         setActiveTab(0);
         
+        // Handle UI selection data
+        if (data.ui_selection_data) {
+          console.log('Received UI selection data:', data.ui_selection_data);
+          setUISelectionData(data.ui_selection_data);
+          setShowQuestionSelection(true);
+          setSelectionMode('initial');
+        }
+        
+        // Alternative: Check for UI selection trigger flag
+        if (data.show_question_selection) {
+          console.log('Received show_question_selection flag');
+          setShowQuestionSelection(true);
+        }
+        
+        // Also check for UI selection trigger in message content
+        if (data.content && data.content.includes('[UI_SELECTION_TRIGGER]')) {
+          console.log('Detected UI selection trigger in message content');
+          // The UI selection data should be in the same message
+          if (data.ui_selection_data) {
+            setUISelectionData(data.ui_selection_data);
+            setShowQuestionSelection(true);
+            setSelectionMode('initial');
+          }
+        }
+        
         // Handle screenshot in agent message response
         if (data.base64_image) {
           console.log('Received screenshot with agent message');
@@ -679,6 +856,14 @@ function App() {
             setCurrentImageTitle(targetScreenshot.title || '');
             setCurrentSlideIndex(targetIndex);
           }
+        }
+        
+        // Handle UI selection data in slideshow updates
+        if (data.ui_selection_data) {
+          console.log('Received updated UI selection data with slideshow');
+          setUISelectionData(data.ui_selection_data);
+          setShowQuestionSelection(true);
+          setSelectionMode('rebrowse');
         }
         
       } else if (data.type === 'agent_message_stream_start') {
@@ -785,6 +970,30 @@ function App() {
                 timestamp: Date.now()
               }
             ]);
+          }
+          
+          // Handle UI selection data from HTTP API
+          if (data.ui_selection_data) {
+            console.log('Received UI selection data from HTTP API');
+            setUISelectionData(data.ui_selection_data);
+            setShowQuestionSelection(true);
+            setSelectionMode('initial');
+          }
+          
+          // Also check for show_question_selection flag
+          if (data.show_question_selection) {
+            console.log('Received show_question_selection flag from HTTP API');
+            setShowQuestionSelection(true);
+          }
+          
+          // Check for UI selection trigger in response content
+          if (data.response && data.response.includes('[UI_SELECTION_TRIGGER]')) {
+            console.log('Detected UI selection trigger in HTTP response');
+            if (data.ui_selection_data) {
+              setUISelectionData(data.ui_selection_data);
+              setShowQuestionSelection(true);
+              setSelectionMode('initial');
+            }
           }
           
           // Handle slideshow data from HTTP API
@@ -959,6 +1168,212 @@ function App() {
     </Drawer>
   );
 
+  // Question Selection Panel Component
+  const QuestionSelectionPanel = () => (
+    <Drawer
+      anchor="bottom"
+      open={showQuestionSelection}
+      onClose={() => setShowQuestionSelection(false)}
+      sx={{
+        '& .MuiDrawer-paper': {
+          height: '70vh',
+          maxHeight: '600px',
+          p: 0
+        }
+      }}
+    >
+      <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+        {/* Header */}
+        <Box sx={{ 
+          p: 3, 
+          borderBottom: `1px solid ${theme.palette.divider}`,
+          backgroundColor: alpha(theme.palette.background.paper, 0.9),
+          flexShrink: 0
+        }}>
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+            <Typography variant="h6" fontWeight="600">
+              Select Research Questions
+              {selectionMode === 'rebrowse' && (
+                <Chip
+                  label="Updated"
+                  size="small"
+                  color="success"
+                  sx={{ ml: 1 }}
+                />
+              )}
+            </Typography>
+            <IconButton onClick={() => setShowQuestionSelection(false)}>
+              <CloseIcon />
+            </IconButton>
+          </Box>
+          
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+            <Typography variant="body2" color="text.secondary">
+              Select up to 30 questions from the found research sources
+            </Typography>
+            <Chip
+              label={`${selectedQuestionIds.size}/30 selected`}
+              size="small"
+              color={selectedQuestionIds.size >= 30 ? 'error' : 'primary'}
+            />
+          </Box>
+
+          {/* Action buttons */}
+          <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+            <Button
+              variant="contained"
+              onClick={submitQuestionSelection}
+              disabled={selectedQuestionIds.size === 0 || isLoading}
+              sx={{ textTransform: 'none' }}
+            >
+              Continue with {selectedQuestionIds.size} Questions
+            </Button>
+            <Button
+              variant="outlined"
+              onClick={handleContinueWithoutSelection}
+              disabled={isLoading}
+              sx={{ textTransform: 'none' }}
+            >
+              Continue without Selection
+            </Button>
+            {uiSelectionData && uiSelectionData.sources.length > 0 && (
+              <Button
+                variant="text"
+                onClick={handleRebrowseForMore}
+                disabled={isLoading}
+                sx={{ textTransform: 'none' }}
+              >
+                Find More Questions
+              </Button>
+            )}
+          </Box>
+
+          {isLoading && (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 1 }}>
+              <CircularProgress size={16} />
+              <Typography variant="caption" color="text.secondary">
+                Processing your selection...
+              </Typography>
+            </Box>
+          )}
+        </Box>
+
+        {/* Questions content */}
+        <Box sx={{ flexGrow: 1, overflow: 'auto', p: 2 }}>
+          {uiSelectionData && uiSelectionData.sources.length > 0 ? (
+            uiSelectionData.sources.map((source, sourceIndex) => (
+              <Paper
+                key={source.id}
+                elevation={0}
+                sx={{
+                  mb: 3,
+                  border: `1px solid ${theme.palette.divider}`,
+                  borderRadius: 2,
+                  overflow: 'hidden'
+                }}
+              >
+                {/* Source header */}
+                <Box sx={{
+                  p: 2,
+                  backgroundColor: alpha(theme.palette.primary.main, 0.05),
+                  borderBottom: `1px solid ${theme.palette.divider}`
+                }}>
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <Box>
+                      <Typography variant="subtitle1" fontWeight="600">
+                        {source.domain}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                        {source.full_url}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {source.question_count} questions found
+                      </Typography>
+                    </Box>
+                    <Box sx={{ display: 'flex', gap: 1 }}>
+                      <Button
+                        size="small"
+                        onClick={() => handleSelectAllFromSource(source.id)}
+                        disabled={selectedQuestionIds.size >= 30}
+                        sx={{ textTransform: 'none' }}
+                      >
+                        Select All
+                      </Button>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        onClick={() => handleDeselectAllFromSource(source.id)}
+                        sx={{ textTransform: 'none' }}
+                      >
+                        Deselect All
+                      </Button>
+                    </Box>
+                  </Box>
+                </Box>
+
+                {/* Questions list */}
+                <Box sx={{ p: 2 }}>
+                  {source.questions.map((question, questionIndex) => (
+                    <Box
+                      key={question.id}
+                      sx={{
+                        display: 'flex',
+                        alignItems: 'flex-start',
+                        gap: 2,
+                        p: 1.5,
+                        borderRadius: 1,
+                        '&:hover': {
+                          backgroundColor: alpha(theme.palette.primary.main, 0.02)
+                        },
+                        borderBottom: questionIndex < source.questions.length - 1 
+                          ? `1px solid ${alpha(theme.palette.divider, 0.5)}` 
+                          : 'none'
+                      }}
+                    >
+                      <Checkbox
+                        checked={selectedQuestionIds.has(question.id)}
+                        onChange={() => handleQuestionToggle(question.id)}
+                        disabled={!selectedQuestionIds.has(question.id) && selectedQuestionIds.size >= 30}
+                        sx={{
+                          mt: -0.5,
+                          '&.Mui-disabled': {
+                            color: theme.palette.action.disabled
+                          }
+                        }}
+                      />
+                      <Box sx={{ flexGrow: 1 }}>
+                        <Typography 
+                          variant="body2" 
+                          sx={{ 
+                            fontWeight: selectedQuestionIds.has(question.id) ? 600 : 400,
+                            color: selectedQuestionIds.has(question.id) 
+                              ? theme.palette.primary.main 
+                              : theme.palette.text.primary
+                          }}
+                        >
+                          {question.question}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
+                          Method: {question.extraction_method.replace('_', ' ')}
+                        </Typography>
+                      </Box>
+                    </Box>
+                  ))}
+                </Box>
+              </Paper>
+            ))
+          ) : (
+            <Box sx={{ textAlign: 'center', py: 4 }}>
+              <Typography variant="body1" color="text.secondary">
+                No questions available for selection
+              </Typography>
+            </Box>
+          )}
+        </Box>
+      </Box>
+    </Drawer>
+  );
+
   return (
     <Box
       sx={{
@@ -1007,7 +1422,60 @@ function App() {
           </Box>
           
           {/* Download Button */}
-          <Box sx={{ ml: 'auto' }}>
+          <Box sx={{ ml: 'auto', display: 'flex', gap: 1 }}>
+            {/* Debug button to test question selection UI */}
+            <Tooltip title="Test Question Selection UI (Debug)">
+              <IconButton
+                onClick={() => {
+                  // Create mock UI selection data for testing
+                  const mockUISelectionData = {
+                    questions: [
+                      { id: 'q_1', index: 0, question: 'How satisfied are you with our service?', source: 'https://example.com/survey1', extraction_method: 'regex_pattern' },
+                      { id: 'q_2', index: 1, question: 'What is your age group?', source: 'https://example.com/survey1', extraction_method: 'simple_pattern' },
+                      { id: 'q_3', index: 2, question: 'How often do you use our product?', source: 'https://example.com/survey2', extraction_method: 'llm_extraction' },
+                      { id: 'q_4', index: 3, question: 'Would you recommend us to others?', source: 'https://example.com/survey2', extraction_method: 'regex_pattern' },
+                    ],
+                    sources: [
+                      {
+                        id: 'source_1',
+                        domain: 'example.com',
+                        full_url: 'https://example.com/survey1',
+                        question_count: 2,
+                        questions: [
+                          { id: 'q_1', index: 0, question: 'How satisfied are you with our service?', source: 'https://example.com/survey1', extraction_method: 'regex_pattern' },
+                          { id: 'q_2', index: 1, question: 'What is your age group?', source: 'https://example.com/survey1', extraction_method: 'simple_pattern' }
+                        ]
+                      },
+                      {
+                        id: 'source_2',
+                        domain: 'example.com',
+                        full_url: 'https://example.com/survey2',
+                        question_count: 2,
+                        questions: [
+                          { id: 'q_3', index: 2, question: 'How often do you use our product?', source: 'https://example.com/survey2', extraction_method: 'llm_extraction' },
+                          { id: 'q_4', index: 3, question: 'Would you recommend us to others?', source: 'https://example.com/survey2', extraction_method: 'regex_pattern' }
+                        ]
+                      }
+                    ],
+                    total_count: 4
+                  };
+                  
+                  setUISelectionData(mockUISelectionData);
+                  setShowQuestionSelection(true);
+                  setSelectionMode('initial');
+                  console.log('Triggered test question selection UI');
+                }}
+                sx={{
+                  backgroundColor: alpha(theme.palette.warning.main, 0.1),
+                  '&:hover': {
+                    backgroundColor: alpha(theme.palette.warning.main, 0.2)
+                  }
+                }}
+              >
+                <Typography variant="caption" sx={{ fontSize: '10px' }}>TEST</Typography>
+              </IconButton>
+            </Tooltip>
+            
             <Tooltip title="Download Research Files">
               <IconButton
                 onClick={() => {
@@ -1763,6 +2231,9 @@ function App() {
 
       {/* Download Panel */}
       <DownloadPanel />
+
+      {/* Question Selection Panel */}
+      <QuestionSelectionPanel />
     </Box>
   );
 }

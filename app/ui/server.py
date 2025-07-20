@@ -749,7 +749,7 @@ class ResearchWorkflow:
             
             logger.info(f"✅ Successfully scraped {len(cleaned_text)} characters from {url}")
             logger.info(f"Content: {cleaned_text[:8000]}")
-            return cleaned_text[:8000]  # Limit to 8000 characters
+            return cleaned_text[:12000]  # Limit to 8000 characters
             
         except Exception as e:
             logger.warning(f"Failed to scrape {url}: {e}")
@@ -958,32 +958,158 @@ GENERATE {num_needed} SURVEY QUESTIONS:
             # User wants modifications - go back to questionnaire builder
             session.stage = ResearchStage.QUESTIONNAIRE_BUILDER
             return await self._start_questionnaire_builder(session)
+        elif response == 'F':
+            # Fix issues based on synthetic feedback
+            return await self._regenerate_questions_from_feedback(session)
         elif response == 'T':
             # Test again
             return await self._test_questions(session)
         else:
             return """
-Please respond with:
-- **Y** (Yes) - Finalize and export complete research package
-- **N** (No) - Make additional modifications  
-- **T** (Test Again) - Run another round of testing
-"""
+    Please respond with:
+    - **Y** (Yes) - Finalize and export complete research package
+    - **N** (No) - Make additional modifications  
+    - **F** (Fix Issues) - Regenerate questions based on synthetic feedback
+    - **T** (Test Again) - Run another round of testing
+    """
     
+    async def _regenerate_questions_from_feedback(self, session: ResearchDesign) -> str:
+        """Regenerate questions based on synthetic feedback"""
+        
+        # Get the stored feedback
+        synthetic_feedback = session.__dict__.get('last_synthetic_feedback', '')
+        
+        if not synthetic_feedback:
+            return "No feedback available. Please run testing first."
+        
+        # Identify non-demographic questions to regenerate
+        fixed_demographics = [
+            "What is your age?",
+            "What is your gender?", 
+            "What is your highest level of education?",
+            "What is your annual household income range?",
+            "In which city/region do you currently live?"
+        ]
+        
+        questions_to_regenerate = []
+        demographic_questions = []
+        
+        for q in session.questions:
+            if q in fixed_demographics:
+                demographic_questions.append(q)
+            else:
+                questions_to_regenerate.append(q)
+        
+        if not questions_to_regenerate:
+            return "Only demographic questions found. Demographics cannot be regenerated."
+        
+        # Generate improved questions based on feedback
+        prompt = f"""
+    Based on the synthetic respondent feedback below, regenerate improved survey questions:
+
+    Research Topic: {session.research_topic}
+    Target Population: {session.target_population}
+
+    ORIGINAL QUESTIONS TO IMPROVE:
+    {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(questions_to_regenerate))}
+
+    SYNTHETIC FEEDBACK RECEIVED:
+    {synthetic_feedback}
+
+    INSTRUCTIONS:
+    - Address the specific issues mentioned in the feedback
+    - Improve clarity and reduce confusion
+    - Fix any missing answer options
+    - Simplify complex terminology
+    - Keep the same number of questions ({len(questions_to_regenerate)})
+    - Maintain the research objectives
+    - Use professional survey language
+
+    Generate {len(questions_to_regenerate)} improved questions:
+    """
+        
+        try:
+            response = await self.llm.ask(prompt, temperature=0.7)
+            cleaned_response = remove_chinese_and_punct(str(response))
+            
+            # Parse improved questions
+            lines = cleaned_response.split('\n')
+            improved_questions = []
+            
+            for line in lines:
+                line = line.strip()
+                if not line or len(line) < 10:
+                    continue
+                    
+                # Clean question
+                clean_line = re.sub(r'^[\d\.\-\•\*\s]*', '', line).strip()
+                
+                if clean_line and len(clean_line) > 15:
+                    if not clean_line.endswith('?') and ')' not in clean_line:
+                        clean_line += '?'
+                    improved_questions.append(clean_line)
+            
+            # Ensure we have the right number of questions
+            if len(improved_questions) < len(questions_to_regenerate):
+                # Fill missing questions
+                for i in range(len(improved_questions), len(questions_to_regenerate)):
+                    improved_questions.append(questions_to_regenerate[i])
+            elif len(improved_questions) > len(questions_to_regenerate):
+                improved_questions = improved_questions[:len(questions_to_regenerate)]
+            
+            # Combine improved questions with demographics
+            session.questions = improved_questions + demographic_questions
+            
+            return f"""
+    ✏️ **Questions Improved Based on Feedback**
+
+    **Improved Questions ({len(improved_questions)}):**
+    {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(improved_questions))}
+
+    **Fixed Demographics ({len(demographic_questions)}):**
+    {chr(10).join(f"{i+len(improved_questions)+1}. {q}" for i, q in enumerate(demographic_questions))}
+
+    **Total Questions: {len(session.questions)}**
+
+    The questions have been improved to address the issues identified in synthetic testing.
+
+    ---
+
+    **Review these improved questions:**
+    - **A** (Accept) - Use these questions and proceed to testing
+    - **R** (Revise) - Make additional manual revisions
+    - **T** (Test Now) - Test the improved questions with synthetic respondents
+    - **B** (Back) - Return to questionnaire builder menu
+    """
+            
+        except Exception as e:
+            logger.error(f"Error regenerating questions from feedback: {e}")
+            return "Unable to regenerate questions from feedback. Please try manual revisions or proceed with current questions."
+
     async def _export_complete_research_package(self, session: ResearchDesign) -> str:
-        """Export complete research package with LLM-generated content including motivation"""
+        """Export complete research package with saved content and minimal LLM calls"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"complete_research_package_{timestamp}.txt"
         
         try:
             os.makedirs("research_outputs", exist_ok=True)
             
-            # Get the research design content
-            research_design_content = await self._generate_research_design_with_motivation(session)
+            # Use SAVED research design content (don't regenerate)
+            if hasattr(session, '__dict__') and 'saved_research_design' in session.__dict__:
+                research_design_content = session.__dict__['saved_research_design']
+            else:
+                # Fallback: create basic design from saved data without LLM
+                research_design_content = f"""
+    **Research Methodology:** Online survey methodology recommended for {session.target_population}
+    **Key Variables:** Based on {len(session.questions or [])} questions covering the research objectives
+    **Sample Size:** Recommended minimum sample size should be calculated based on target population and desired confidence level
+    **Data Collection:** Online survey platform with secure data storage and privacy compliance
+    """
             
-            # Use ALL questions from session
+            # Use APPROVED questions exactly as they are (don't regenerate)
             final_questions = session.questions or []
             
-            # Remove duplicates while preserving order
+            # Remove duplicates while preserving order (but don't regenerate)
             seen = set()
             unique_final_questions = []
             for q in final_questions:
@@ -994,20 +1120,23 @@ Please respond with:
             
             final_questions = unique_final_questions
             
-            # Create comprehensive question breakdown
-            question_source_info = await self._create_comprehensive_question_breakdown(session, final_questions)
+            # Create question breakdown from saved session data (no LLM calls)
+            question_source_info = self._create_saved_question_breakdown(session, final_questions)
             
-            # Generate implementation recommendations using LLM
+            # ONLY make LLM calls for these 3 sections:
+            # 1. Implementation recommendations
             implementation_content = await self._generate_implementation_recommendations(session)
             
-            # Generate ethics and timeline content using LLM
+            # 2. Ethics and considerations 
             ethics_content = await self._generate_ethics_content(session)
-            timeline_content = await self._generate_timeline_content(session)
             
-            # Export chat history
+            # 3. Research checklist
+            checklist_content = await self._generate_research_checklist(session)
+            
+            # Export chat history (no LLM call)
             chat_filepath = self._export_chat_history(session, timestamp)
             
-            # Create comprehensive research package with motivation
+            # Create comprehensive research package using SAVED content
             package_content = f"""COMPLETE RESEARCH DESIGN PACKAGE
     Generated on: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
@@ -1024,19 +1153,19 @@ Please respond with:
 
     Target Population: {session.target_population}
 
-    Research Timeframe: {session.timeframe}
+    Research Timeframe: {session.timeframe or 'Not specified'}
 
     ================================================================================
-    METHODOLOGY AND APPROACH
+    APPROVED METHODOLOGY AND APPROACH
     ================================================================================
 
     {research_design_content}
 
     ================================================================================
-    QUESTIONNAIRE QUESTIONS
+    APPROVED QUESTIONNAIRE QUESTIONS
     ================================================================================
 
-    The following questions have been designed and tested for your research:
+    The following questions have been designed, tested, and approved for your research:
 
     {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(final_questions))}
 
@@ -1051,7 +1180,7 @@ Please respond with:
     ================================================================================
 
     This research package includes the following exported files:
-    • Research Package: {filename}
+    - Research Package: {filename}
     {f"• Chat History: {chat_filepath.split('/')[-1] if chat_filepath else 'Chat export failed'}" if chat_filepath else ""}
 
     ================================================================================
@@ -1067,15 +1196,15 @@ Please respond with:
     {ethics_content}
 
     ================================================================================
-    EXPECTED TIMELINE
+    RESEARCH VERIFICATION CHECKLIST
     ================================================================================
 
-    {timeline_content}
+    {checklist_content}
 
     ================================================================================
 
     This research package is ready for implementation. All questions have been
-    tested and validated. The methodology is sound and appropriate for your
+    tested, approved, and validated. The methodology is sound and appropriate for your
     research objectives.
 
     For the complete conversation history that led to this research design,
@@ -1097,7 +1226,7 @@ Please respond with:
             for key in session_keys_to_remove:
                 del self.active_sessions[key]
             
-            # Enhanced response with breakdown including motivation
+            # Enhanced response with breakdown
             chat_info = f"\nChat file: `{chat_filepath.split('/')[-1] if chat_filepath else 'Export failed'}`" if chat_filepath else "\n⚠️ Chat history export failed"
             
             return f"""
@@ -1107,22 +1236,21 @@ Please respond with:
     **`{filepath}`**{chat_info}
 
     **Package Contents:**
-    ✅ Complete research design and methodology
-    ✅ Tested and validated questionnaire questions  
+    ✅ Approved research design and methodology (saved from session)
+    ✅ {len(final_questions)} approved and tested questionnaire questions  
     ✅ LLM-generated implementation recommendations
-    ✅ Data analysis guidelines
-    ✅ Ethics and privacy considerations
+    ✅ LLM-generated ethics and privacy considerations
+    ✅ LLM-generated research verification checklist
     ✅ Complete conversation history exported
 
     **Your Research Summary:**
     - **Topic:** {session.research_topic}
     - **Motivation:** {session.research_motivation}
-    - **Questions:** {len(final_questions)} validated questions
+    - **Questions:** {len(final_questions)} approved questions
     - **Target:** {session.target_population}
-    - **Timeline:** {session.timeframe}
     - **Chat interactions:** {len(session.chat_history) if session.chat_history else 0} recorded
 
-    {await self._create_comprehensive_question_breakdown(session, final_questions)}
+    {self._create_saved_question_breakdown(session, final_questions)}
 
     Both files are ready for download from the research_outputs directory.
     Session completed successfully!
@@ -1132,6 +1260,76 @@ Please respond with:
             logger.error(f"Error exporting research package: {str(e)}", exc_info=True)
             return f"Error creating research package: {str(e)}. Please check logs and try again."
     
+    def _create_saved_question_breakdown(self, session: ResearchDesign, final_questions: List[str]) -> str:
+        """Create question breakdown from saved session data without LLM calls"""
+        
+        # Get different question types from session data
+        custom_questions = session.__dict__.get('custom_questions', [])
+        selected_questions = []
+        generated_questions = []
+        
+        # Fixed demographics
+        fixed_demographics = [
+            "What is your age?",
+            "What is your gender?",
+            "What is your highest level of education?",
+            "What is your annual household income range?",
+            "In which city/region do you currently live?"
+        ]
+        
+        # Identify selected internet questions from session
+        if (hasattr(session, 'user_selected_questions') and 
+            session.user_selected_questions):
+            selected_questions = [q['question'] for q in session.user_selected_questions]
+            selected_sources = list(set(q['source'] for q in session.user_selected_questions))
+        elif (session.questionnaire_responses and 
+            'selected_questions' in session.questionnaire_responses):
+            selected_questions = session.questionnaire_responses['selected_questions']
+            selected_sources = session.internet_sources or []
+        else:
+            selected_sources = []
+        
+        # Count demographics
+        demographic_count = sum(1 for q in final_questions if q in fixed_demographics)
+        
+        # Identify generated questions (everything else that's not custom, selected, or demographic)
+        for q in final_questions:
+            if q not in custom_questions and q not in selected_questions and q not in fixed_demographics:
+                generated_questions.append(q)
+        
+        # Build comprehensive breakdown
+        breakdown_lines = []
+        
+        if generated_questions:
+            breakdown_lines.append(f"AI Generated Questions: {len(generated_questions)}")
+            breakdown_lines.append(f"  • Created based on research topic and methodology")
+            breakdown_lines.append("")
+        
+        if selected_questions:
+            breakdown_lines.append(f"Internet Research Questions: {len(selected_questions)}")
+            breakdown_lines.append(f"  • Selected from {len(selected_sources)} websites")
+            if selected_sources:
+                breakdown_lines.append(f"  • Sources included:")
+                for source in selected_sources[:5]:  # Show up to 5 sources
+                    breakdown_lines.append(f"    - {source}")
+                if len(selected_sources) > 5:
+                    breakdown_lines.append(f"    - ... and {len(selected_sources) - 5} more sources")
+            breakdown_lines.append("")
+        
+        if custom_questions:
+            breakdown_lines.append(f"Custom Questions (User-Provided): {len(custom_questions)}")
+            breakdown_lines.append(f"  • Questions you added during the questionnaire building process")
+            breakdown_lines.append("")
+        
+        if demographic_count > 0:
+            breakdown_lines.append(f"Fixed Demographics: {demographic_count}")
+            breakdown_lines.append(f"  • Standard demographic questions automatically included")
+            breakdown_lines.append("")
+        
+        breakdown_lines.append(f"Total Approved Questions: {len(final_questions)}")
+        
+        return "\n".join(breakdown_lines)
+
     async def _create_comprehensive_question_breakdown(self, session: ResearchDesign, final_questions: List[str]) -> str:
         """Create comprehensive breakdown of all question sources"""
         
@@ -1282,38 +1480,50 @@ Please respond with:
     - Follow institutional review board guidelines if applicable
     """
 
-    async def _generate_timeline_content(self, session: ResearchDesign) -> str:
-        """Generate timeline content using LLM"""
+    async def _generate_research_checklist(self, session: ResearchDesign) -> str:
+        """Generate a research verification checklist using LLM"""
         
         prompt = f"""
-    Generate a realistic research timeline for this study:
+        Generate a comprehensive research verification checklist for this study:
 
-    Research Topic: {session.research_topic}
-    Target Population: {session.target_population}
-    Questions: {len(session.questions or [])} total questions
+        Research Topic: {session.research_topic}
+        Target Population: {session.target_population}
+        Questions: {len(session.questions or [])} total questions
 
-    Create a week-by-week timeline covering:
-    - Questionnaire finalization
-    - Data collection period
-    - Analysis phase
-    - Reporting phase
+        Create a detailed checklist of items that should be verified and completed during and after the research process. Include:
+        - Pre-launch verification items
+        - Data collection checkpoints  
+        - Data quality verification
+        - Analysis verification
+        - Reporting verification
+        - Ethical compliance checks
 
-    Make timeline realistic and appropriate for the research scope.
-    Respond in English only.
-    """
+        Format as a clear checklist with checkboxes (☐) that researchers can use to ensure quality.
+        Be specific and actionable for this research context.
+        Respond in English only.
+        """
         
         try:
             response = await self.llm.ask(prompt, temperature=0.6)
             return remove_chinese_and_punct(str(response))
         except Exception as e:
-            logger.error(f"Error generating timeline content: {e}")
+            logger.error(f"Error generating research checklist: {e}")
             return """
-    Week 1-2: Finalize questionnaire and setup survey platform
-    Week 3-8: Data collection period
-    Week 9-10: Data analysis and preliminary results
-    Week 11-12: Final report preparation and presentation
-
-    Adjust timeline based on your specific requirements and target population size.
+    ☐ Questionnaire has been pilot tested with sample respondents
+    ☐ All questions are clear and unambiguous
+    ☐ Response options are comprehensive and mutually exclusive
+    ☐ Target sample size has been calculated and achieved
+    ☐ Data collection method ensures representative sampling
+    ☐ Participant consent has been obtained where required
+    ☐ Data is being collected and stored securely
+    ☐ Response rate is being monitored and is acceptable
+    ☐ Data quality checks are being performed regularly
+    ☐ Missing data patterns have been analyzed
+    ☐ Statistical analysis plan has been followed
+    ☐ Results have been validated and cross-checked
+    ☐ Findings are properly interpreted within study limitations
+    ☐ Report includes methodology, results, and recommendations
+    ☐ Ethical guidelines have been followed throughout
     """
 
     def _log_chat_interaction(self, session_id: str, user_message: str, bot_response: str):
@@ -1366,7 +1576,7 @@ Please respond with:
             # Updated objectives question - removed examples and changed wording
             return f"""
     **Question 2 of 4: Research Objectives**
-    What specific things do you want to know about {session.research_topic}?
+    What specific things do you want to know about this topic?
 
     Please list what you want to find out (you can provide multiple objectives):
     """
@@ -1391,7 +1601,7 @@ Please respond with:
             # NEW Question 3: Why is this topic interesting?
             return f"""
     **Question 3 of 4: Research Motivation**
-    Why is {session.research_topic} interesting to you?
+    Why is this topic interesting to you?
 
     Please describe your motivation for conducting this research:
     """
@@ -1459,31 +1669,202 @@ Please respond with:
             return "All research design questions have been completed. Please proceed with the review."
     
     async def _generate_research_design_with_motivation(self, session: ResearchDesign) -> str:
-        """Generate a comprehensive research design using LLM including motivation"""
+        """Generate a comprehensive research design using LLM including motivation and related research links"""
+        
+        # First, search for related research
+        related_research = await self._search_related_research(session.research_topic)
+        
         prompt = f"""
-    Generate a comprehensive research design based on the following information:
+        Generate a comprehensive research design based on the following information:
 
-    Topic: {session.research_topic}
-    Objectives: {', '.join(session.objectives)}
-    Motivation: {session.research_motivation}
-    Target Population: {session.target_population}
+        Topic: {session.research_topic}
+        Objectives: {', '.join(session.objectives)}
+        Motivation: {session.research_motivation}
+        Target Population: {session.target_population}
 
-    Please provide:
-    1. Research methodology recommendations
-    2. Key variables to measure
-    3. Potential limitations and considerations
-    4. Recommended sample size
+        Please provide:
+        1. Research methodology recommendations
+        2. Key variables to measure
+        3. Potential limitations and considerations
+        4. Recommended sample size
 
-    Keep the response concise but comprehensive (under 300 words). Focus on online survey methodology as the primary approach. Respond in English only.
-    """
+        Keep the response concise but comprehensive (under 300 words). Focus on online survey methodology as the primary approach. Respond in English only.
+        """
         
         try:
             response = await self.llm.ask(prompt, temperature=0.7)
             cleaned_response = remove_chinese_and_punct(str(response))
+            
+            # Append related research if found
+            if related_research:
+                cleaned_response += f"\n\n**Related Research Studies:**\n{related_research}"
+            
             return cleaned_response
         except Exception as e:
             logger.error(f"Error generating research design: {e}")
             return "Unable to generate research design automatically. Please review your inputs manually."
+
+    async def _summarize_research_content(self, content: str, title: str) -> str:
+        """Summarize research content to extract key findings in one line only"""
+        
+        # Limit content length for processing
+        content_sample = content[:4000]
+        
+        prompt = f"""
+        Summarize this research study in EXACTLY ONE sentence (maximum 15 words):
+
+        Study Title: {title}
+        Content: {content_sample}
+
+        Focus ONLY on the main finding or conclusion. Do NOT mention sample size, methodology, or participants.
+        
+        EXAMPLES:
+        - "Shows 73% of parents consider school safety their top concern"
+        - "Finds strong public support for background checks on gun purchases"
+        - "Reports declining confidence in school security measures"
+
+        Provide EXACTLY ONE sentence under 15 words about the main finding:
+        """
+        
+        try:
+            response = await self.llm.ask(prompt, temperature=0.3)  # Lower temperature for consistency
+            summary = remove_chinese_and_punct(str(response)).strip()
+            
+            # Clean up and ensure it's a single sentence
+            summary = summary.split('.')[0]  # Take only first sentence
+            if summary:
+                summary = summary.strip()
+                if not summary.endswith('.'):
+                    summary += '.'
+            
+            # Limit to 15 words maximum
+            words = summary.split()
+            if len(words) > 15:
+                summary = ' '.join(words[:15]) + '.'
+                
+            return summary if summary else "Research study with relevant findings for your topic."
+        except Exception as e:
+            logger.error(f"Error summarizing research content: {e}")
+            return "Research study with relevant findings for your topic."
+
+    async def _search_related_research(self, research_topic: str) -> str:
+        """Search for related research studies and provide links with concise summaries"""
+        
+        if not self.search_service:
+            return ""
+        
+        try:
+            # Search for academic research on the topic
+            search_query = f"{research_topic} survey research study results"
+            
+            search_result = self.search_service.cse().list(
+                q=search_query,
+                cx=self.google_cse_id,
+                num=10,
+                safe='active',
+                fields='items(title,link,snippet)'
+            ).execute()
+            
+            if 'items' not in search_result:
+                return ""
+            
+            # Filter for legitimate research sources
+            research_links = []
+            for item in search_result['items']:
+                link = item.get('link', '')
+                title = item.get('title', '')
+                snippet = item.get('snippet', '')
+                
+                # Check if it looks like legitimate research
+                if self._is_legitimate_research_source(link, title, snippet):
+                    research_links.append({
+                        'title': title,
+                        'link': link,
+                        'snippet': snippet
+                    })
+                    
+                    if len(research_links) >= 3:
+                        break
+            
+            if not research_links:
+                return ""
+            
+            # Scrape and summarize the research links
+            research_summaries = []
+            for research in research_links:
+                try:
+                    # Scrape the content
+                    content = await self._scrape_page_content(research['link'])
+                    if content and len(content) > 300:  # Lower threshold
+                        # Summarize the research (one line only)
+                        summary = await self._summarize_research_content(content, research['title'])
+                        research_summaries.append({
+                            'title': research['title'],
+                            'link': research['link'],
+                            'summary': summary
+                        })
+                    else:
+                        # Use snippet if content scraping fails
+                        research_summaries.append({
+                            'title': research['title'],
+                            'link': research['link'],
+                            'summary': research['snippet'][:100] + "..." if len(research['snippet']) > 100 else research['snippet']
+                        })
+                except Exception as e:
+                    logger.warning(f"Failed to process research link {research['link']}: {e}")
+                    # Use snippet as fallback
+                    research_summaries.append({
+                        'title': research['title'],
+                        'link': research['link'],
+                        'summary': research['snippet'][:100] + "..." if len(research['snippet']) > 100 else research['snippet']
+                    })
+                    continue
+            
+            # Format the research findings - SIMPLIFIED FORMAT
+            if research_summaries:
+                formatted_research = []
+                for i, research in enumerate(research_summaries, 1):
+                    # Truncate title if too long
+                    title = research['title']
+                    if len(title) > 60:
+                        title = title[:60] + "..."
+                    
+                    formatted_research.append(f"{i}. **[{title}]({research['link']})** - {research['summary']}")
+                
+                return "\n".join(formatted_research)
+            
+            return ""
+            
+        except Exception as e:
+            logger.error(f"Error searching for related research: {e}")
+            return ""
+
+    def _is_legitimate_research_source(self, url: str, title: str, snippet: str) -> bool:
+        """Check if a source appears to be legitimate research"""
+        
+        # Academic and research domains
+        trusted_domains = [
+            'edu', 'org', 'gov', 'researchgate.net', 'scholar.google.com',
+            'pubmed.ncbi.nlm.nih.gov', 'jstor.org', 'springer.com',
+            'tandfonline.com', 'sage', 'wiley.com', 'plos.org', 'com'
+        ]
+        
+        # Research indicators in title/snippet
+        research_indicators = [
+            'study', 'research', 'survey', 'analysis', 'findings',
+            'results', 'data', 'methodology', 'sample', 'participants',
+            'questionnaire', 'statistical', 'empirical'
+        ]
+        
+        # Check domain
+        url_lower = url.lower()
+        domain_match = any(domain in url_lower for domain in trusted_domains)
+        
+        # Check content indicators
+        text_lower = (title + ' ' + snippet).lower()
+        content_match = sum(1 for indicator in research_indicators if indicator in text_lower) >= 2
+        
+        return domain_match or content_match
 
     async def _generate_research_design(self, session: ResearchDesign) -> str:
         """Generate a comprehensive research design using LLM without specifying data collection modes"""
@@ -1512,11 +1893,18 @@ Please respond with:
             return "Unable to generate research design automatically. Please review your inputs manually."
     
     async def _handle_design_review(self, session_id: str, user_input: str) -> str:
-        """Handle user response during design review"""
+        """Handle user response during design review and save approved content"""
         session = self.active_sessions[session_id]
         response = user_input.upper().strip()
         
         if response == 'Y':
+            # SAVE the approved research design for later use in export
+            if hasattr(session, '__dict__'):
+                # Get the research design that was shown to user
+                research_design = await self._generate_research_design_with_motivation(session)
+                session.__dict__['saved_research_design'] = research_design
+                logger.info("Saved approved research design for export")
+            
             session.stage = ResearchStage.DATABASE_SEARCH
             return await self._search_database(session)
         elif response == 'N':
@@ -1524,20 +1912,24 @@ Please respond with:
             session.user_responses = {}
             return await self.start_research_design(session_id)
         elif response == 'S':
+            # Also save when user chooses to save
+            if hasattr(session, '__dict__'):
+                research_design = await self._generate_research_design_with_motivation(session)
+                session.__dict__['saved_research_design'] = research_design
             return await self._save_and_export(session)
         elif response == 'E':
             del self.active_sessions[session_id]
             return "Research design workflow ended. Thank you!"
         else:
             return """
-Please respond with:
-- **Y** (Yes) - Proceed to search for relevant questions and data
-- **N** (No) - Revise the research design
-- **S** (Save) - Save and export this design
-- **E** (Exit) - Exit the workflow
-"""
-    # Enhanced URL filtering to only include deep URLs
+    Please respond with:
+    - **Y** (Yes) - Proceed to search for relevant questions and data
+    - **N** (No) - Revise the research design
+    - **S** (Save) - Save and export this design
+    - **E** (Exit) - Exit the workflow
+    """
 
+    # Enhanced URL filtering to only include deep URLs
     def _is_deep_url(self, url: str) -> bool:
         """
         Check if URL is a deep URL (not just root domain)
@@ -1652,7 +2044,7 @@ Please respond with:
             return False
 
     async def _search_database(self, session: ResearchDesign) -> str:
-        """Search internet and present questions for selection"""
+        """Search internet and present questions for selection with UI data"""
         try:
             extracted_questions, sources, screenshots = await self._search_internet_for_questions(
                 session.research_topic, session.target_population, session
@@ -1697,8 +2089,14 @@ Please respond with:
             session.stage = ResearchStage.DECISION_POINT
             session.awaiting_selection = True
             
-            # Format questions for selection with numbering
-            formatted_questions = self._format_questions_for_selection(session.selected_questions_pool)
+            # Format questions for UI selection
+            ui_selection_data = self._format_questions_for_ui_selection(session.selected_questions_pool)
+            
+            # Store UI data in session for frontend access
+            session.__dict__['ui_selection_data'] = ui_selection_data
+            
+            # IMPORTANT: Set a flag to trigger UI
+            session.__dict__['trigger_question_selection_ui'] = True
             
             total_collected = len(session.all_collected_urls) if session.all_collected_urls else 0
             current_batch = session.current_batch_index
@@ -1707,31 +2105,27 @@ Please respond with:
             currently_selected_count = len(session.user_selected_questions)
             remaining_selections = session.max_selectable_questions - currently_selected_count
             
-            return f"""
-    🔍 **Questions Found - Please Select (Batch {current_batch}/{(total_collected + 5) // 6})**
+            # Add a special marker for the frontend to detect
+            response_text = f"""🔍 **Questions Found - Please Select (Batch {current_batch}/{(total_collected + 5) // 6})**
 
     Found {len(new_unique_questions)} new questions from this batch.
     **Total pool now: {len(session.selected_questions_pool)} questions**
-
-    {formatted_questions}
 
     **📊 Selection Status:**
     - **Currently selected:** {currently_selected_count}/{session.max_selectable_questions}
     - **Remaining selections:** {remaining_selections}
     - **URLs processed:** {processed_count} of {total_collected} collected
 
-    **How to select questions:**
-    Enter question numbers separated by spaces (e.g., "1 3 5 7 12")
-    - Select up to {remaining_selections} more questions
-    - Enter "0" to select none from this batch
+    Use the checkboxes in the interface to select up to {remaining_selections} more questions.
 
     **Options after selection:**
-    - **C** (Continue) - Proceed with selected questions
-    - **R** (Rebrowse) - Search more URLs after selection
-    - **E** (Exit) - Exit workflow
+    - **Continue** - Proceed with selected questions
+    - **Rebrowse** - Search more URLs after selection
+    - **Exit** - Exit workflow
 
-    **Please enter your question numbers:**
-    """
+    [UI_SELECTION_TRIGGER]"""  # Special marker for frontend
+            
+            return response_text
             
         except Exception as e:
             logger.error(f"Error in database search: {e}")
@@ -1770,13 +2164,63 @@ Please respond with:
         
         return "\n".join(formatted_output)
 
+    def _format_questions_for_ui_selection(self, questions_pool: List[Dict]) -> Dict:
+        """Format questions for UI selection with structured data"""
+        if not questions_pool:
+            return {"questions": [], "sources": []}
+        
+        # Group by source for better organization
+        source_groups = {}
+        formatted_questions = []
+        
+        for i, q_dict in enumerate(questions_pool):
+            source_url = q_dict['source']
+            question_id = f"q_{i+1}"
+            
+            if source_url not in source_groups:
+                source_groups[source_url] = []
+            
+            question_data = {
+                "id": question_id,
+                "index": i,
+                "question": q_dict['question'],
+                "source": source_url,
+                "extraction_method": q_dict.get('extraction_method', 'unknown')
+            }
+            
+            source_groups[source_url].append(question_data)
+            formatted_questions.append(question_data)
+        
+        # Format sources for display
+        formatted_sources = []
+        for source_num, (source_url, questions) in enumerate(source_groups.items(), 1):
+            try:
+                from urllib.parse import urlparse
+                domain = urlparse(source_url).netloc
+            except:
+                domain = source_url
+            
+            formatted_sources.append({
+                "id": f"source_{source_num}",
+                "domain": domain,
+                "full_url": source_url,
+                "question_count": len(questions),
+                "questions": questions
+            })
+        
+        return {
+            "questions": formatted_questions,
+            "sources": formatted_sources,
+            "total_count": len(formatted_questions)
+        }
+
     async def _handle_decision_point(self, session_id: str, user_input: str) -> str:
         """Handle decision point with question selection logic"""
         session = self.active_sessions[session_id]
         response = user_input.strip()
         
-        # FIXED: Handle "C" command universally - always go to questionnaire builder
-        if response.upper() == 'C':
+        # FIXED: Handle "C" or "Continue" command universally - always go to questionnaire builder
+        if response.upper() in ['C', 'CONTINUE']:
             # Set up questions for questionnaire builder
             if session.user_selected_questions:
                 session.use_internet_questions = True
@@ -1795,28 +2239,119 @@ Please respond with:
             return await self._handle_question_selection(session_id, response)
         
         # Handle other responses
-        if response.upper() == 'R':
+        if response.upper() in ['R', 'REBROWSE']:
             # Check if rebrowse is still allowed
             if session.rebrowse_count >= 4:
                 return await self._show_final_selection_summary(session)
             return await self._rebrowse_internet(session)
-        elif response.upper() == 'E':
+        elif response.upper() in ['E', 'EXIT']:
             del self.active_sessions[session_id]
             return "Research design workflow ended. Thank you!"
         else:
             return """
     Please respond with:
-    - **C** (Continue) - Proceed to questionnaire builder with selected questions
-    - **R** (Rebrowse) - Search more URLs for additional questions
-    - **E** (Exit) - Exit workflow
+    - **Continue** - Proceed to questionnaire builder with selected questions
+    - **Rebrowse** - Search more URLs for additional questions
+    - **Exit** - Exit workflow
+
+    Or use the question selection interface to choose specific questions.
     """
 
     async def _handle_question_selection(self, session_id: str, user_input: str) -> str:
-        """Handle user's question selection input"""
+        """Handle user's question selection input from UI or text"""
         session = self.active_sessions[session_id]
         
-        # FIXED: Handle "C" command here too - always go to questionnaire builder
-        if user_input.upper().strip() == 'C':
+        # Check if input is from UI (JSON format with selected question IDs)
+        if user_input.strip().startswith('{') and 'selected_questions' in user_input:
+            try:
+                import json
+                selection_data = json.loads(user_input)
+                selected_question_ids = selection_data.get('selected_questions', [])
+                
+                # Convert question IDs to question dictionaries
+                newly_selected = []
+                for question_id in selected_question_ids:
+                    # Extract index from question ID (e.g., "q_5" -> index 4)
+                    try:
+                        index = int(question_id.split('_')[1]) - 1
+                        if 0 <= index < len(session.selected_questions_pool):
+                            question_dict = session.selected_questions_pool[index]
+                            
+                            # Check if already selected
+                            already_selected = any(
+                                q['question'].lower().strip() == question_dict['question'].lower().strip() 
+                                for q in session.user_selected_questions
+                            )
+                            
+                            if not already_selected:
+                                newly_selected.append(question_dict)
+                    except (ValueError, IndexError):
+                        continue
+                
+                # Check selection limits
+                currently_selected_count = len(session.user_selected_questions)
+                remaining_selections = session.max_selectable_questions - currently_selected_count
+                
+                if len(newly_selected) > remaining_selections:
+                    # Don't change awaiting_selection state, stay in selection mode
+                    return f"""
+    ❌ **Too Many Selections**
+
+    You can only select {remaining_selections} more questions.
+    You selected {len(newly_selected)} questions.
+
+    Please select {remaining_selections} or fewer questions using the interface.
+    """
+                
+                # Add selected questions to user's selection
+                session.user_selected_questions.extend(newly_selected)
+                session.awaiting_selection = False  # Selection complete
+                
+                # Show selection summary
+                total_selected = len(session.user_selected_questions)
+                remaining_selections = session.max_selectable_questions - total_selected
+                
+                selected_questions_text = "\n".join(
+                    f"{i+1}. {q['question']}" 
+                    for i, q in enumerate(session.user_selected_questions)
+                )
+                
+                # Check if user has reached the maximum
+                if total_selected >= session.max_selectable_questions:
+                    return f"""
+    ✅ **Maximum Questions Selected ({total_selected}/{session.max_selectable_questions})**
+
+    **Your Selected Questions:**
+    {selected_questions_text}
+
+    You have reached the maximum number of selectable questions.
+
+    **What would you like to do?**
+    - **Continue** - Proceed to questionnaire builder with these questions
+    - **Exit** - Exit workflow
+    """
+                
+                return f"""
+    ✅ **Questions Added to Selection**
+
+    Added {len(newly_selected)} questions to your selection.
+
+    **Your Selected Questions ({total_selected}/{session.max_selectable_questions}):**
+    {selected_questions_text}
+
+    **Remaining selections:** {remaining_selections}
+
+    **What would you like to do?**
+    - **Continue** - Proceed to questionnaire builder with selected questions
+    - **Rebrowse** - Search more URLs for additional questions  
+    - **Exit** - Exit workflow
+    """
+                
+            except json.JSONDecodeError:
+                pass  # Fall through to text-based processing
+        
+        # Handle text commands
+        if user_input.upper().strip() in ['C', 'CONTINUE']:
             # Set up questions for questionnaire builder
             if session.user_selected_questions:
                 session.use_internet_questions = True
@@ -1829,16 +2364,24 @@ Please respond with:
             session.awaiting_selection = False
             return await self._start_questionnaire_builder(session)
         
+        elif user_input.upper().strip() in ['R', 'REBROWSE']:
+            # Trigger rebrowse while maintaining selection state
+            session.awaiting_selection = False  # Temporarily clear for rebrowse
+            return await self._rebrowse_internet(session)
+        
+        elif user_input.upper().strip() in ['E', 'EXIT']:
+            del self.active_sessions[session_id]
+            return "Research design workflow ended. Thank you!"
+        
+        # Handle text-based selection (fallback for backward compatibility)
         try:
-            # Parse selection input
             if user_input.strip() == "0":
-                # User selected none
                 selected_numbers = []
             else:
                 import re
                 numbers = re.findall(r'\d+', user_input)
                 selected_numbers = [int(num) for num in numbers 
-                                 if 1 <= int(num) <= len(session.selected_questions_pool)]
+                                if 1 <= int(num) <= len(session.selected_questions_pool)]
             
             # Check selection limits
             currently_selected_count = len(session.user_selected_questions)
@@ -1846,20 +2389,19 @@ Please respond with:
             
             if len(selected_numbers) > remaining_selections:
                 return f"""
-❌ **Too Many Selections**
+    ❌ **Too Many Selections**
 
-You can only select {remaining_selections} more questions.
-You selected {len(selected_numbers)} questions.
+    You can only select {remaining_selections} more questions.
+    You selected {len(selected_numbers)} questions.
 
-Please enter {remaining_selections} or fewer question numbers:
-"""
+    Please select {remaining_selections} or fewer questions.
+    """
             
             # Add selected questions to user's selection
             newly_selected = []
             for num in selected_numbers:
-                question_dict = session.selected_questions_pool[num - 1]  # Convert to 0-based index
+                question_dict = session.selected_questions_pool[num - 1]
                 
-                # Check if already selected
                 already_selected = any(
                     q['question'].lower().strip() == question_dict['question'].lower().strip() 
                     for q in session.user_selected_questions
@@ -1880,48 +2422,34 @@ Please enter {remaining_selections} or fewer question numbers:
                 for i, q in enumerate(session.user_selected_questions)
             )
             
-            # Check if user has reached the maximum
-            if total_selected >= session.max_selectable_questions:
-                return f"""
-✅ **Maximum Questions Selected ({total_selected}/{session.max_selectable_questions})**
-
-**Your Selected Questions:**
-{selected_questions_text}
-
-You have reached the maximum number of selectable questions.
-
-**What would you like to do?**
-- **C** (Continue) - Proceed to questionnaire builder with these questions
-- **E** (Exit) - Exit workflow
-"""
-            
             return f"""
-✅ **Questions Added to Selection**
+    ✅ **Questions Added to Selection**
 
-Added {len(newly_selected)} questions to your selection.
+    Added {len(newly_selected)} questions to your selection.
 
-**Your Selected Questions ({total_selected}/{session.max_selectable_questions}):**
-{selected_questions_text}
+    **Your Selected Questions ({total_selected}/{session.max_selectable_questions}):**
+    {selected_questions_text}
 
-**Remaining selections:** {remaining_selections}
+    **Remaining selections:** {remaining_selections}
 
-**What would you like to do?**
-- **C** (Continue) - Proceed to questionnaire builder with selected questions
-- **R** (Rebrowse) - Search more URLs for additional questions  
-- **E** (Exit) - Exit workflow
-"""
+    **What would you like to do?**
+    - **Continue** - Proceed to questionnaire builder with selected questions
+    - **Rebrowse** - Search more URLs for additional questions  
+    - **Exit** - Exit workflow
+    """
             
         except Exception as e:
             logger.error(f"Error handling question selection: {e}")
             return f"""
-❌ **Selection Error**
+    ❌ **Selection Error**
 
-Please enter question numbers separated by spaces (e.g., "1 3 5 7")
-Or enter "0" to select none from this batch.
-Or enter "C" to continue to questionnaire builder.
+    Please use the checkboxes in the interface to select questions, or enter one of these commands:
+    - **Continue** - Proceed with current selection
+    - **Rebrowse** - Find more questions
+    - **Exit** - Exit workflow
 
-Error: {str(e)}
-"""
+    Error: {str(e)}
+    """
 
     async def _handle_additional_question_selection(self, session_id: str, user_input: str) -> str:
         """Handle selection of additional questions and merge with main questions"""
@@ -2095,7 +2623,7 @@ Please enter question numbers separated by spaces.
 """
 
     async def _rebrowse_internet(self, session: ResearchDesign) -> str:
-        """Rebrowse next batch and present new questions for selection"""
+        """Rebrowse next batch and present new questions for selection with UI support"""
         try:
             # Check rebrowse limit
             if session.rebrowse_count >= 4:
@@ -2135,40 +2663,13 @@ Please enter question numbers separated by spaces.
                 # Add new screenshots to the existing slideshow
                 session.screenshots.extend(new_screenshots)
                 logger.info(f"Added {len(new_screenshots)} new screenshots to slideshow. Total: {len(session.screenshots)}")
-                
-                # IMPORTANT: Trigger slideshow update to UI if this is being called during WebSocket processing
-                # This will be handled by the UI server when it processes the rebrowse request
+            
+            # IMPORTANT: Update UI selection data for rebrowse
+            ui_selection_data = self._format_questions_for_ui_selection(session.selected_questions_pool)
+            session.__dict__['ui_selection_data'] = ui_selection_data
+            session.__dict__['trigger_question_selection_ui'] = True  # Set trigger for UI
             
             session.awaiting_selection = True
-            
-            # FIXED: Format NEW questions with full source URLs
-            new_questions_formatted = []
-            start_num = len(session.selected_questions_pool) - len(new_unique_questions) + 1
-            
-            # Group new questions by source for better display
-            source_groups = {}
-            for i, q_dict in enumerate(new_unique_questions):
-                question_num = start_num + i
-                source_url = q_dict['source']
-                if source_url not in source_groups:
-                    source_groups[source_url] = []
-                source_groups[source_url].append((question_num, q_dict['question']))
-            
-            # Format with full URLs
-            for source_num, (source_url, questions) in enumerate(source_groups.items(), 1):
-                try:
-                    from urllib.parse import urlparse
-                    domain = urlparse(source_url).netloc
-                except:
-                    domain = source_url
-                
-                new_questions_formatted.append(f"**New Source {source_num}: {domain}**")
-                new_questions_formatted.append(f"*Full URL: {source_url}*")
-                
-                for question_num, question_text in questions:
-                    new_questions_formatted.append(f"{question_num}. {question_text}")
-                
-                new_questions_formatted.append("")  # Empty line between sources
             
             total_selected = len(session.user_selected_questions)
             remaining_selections = session.max_selectable_questions - total_selected
@@ -2178,8 +2679,6 @@ Please enter question numbers separated by spaces.
 
     Found {len(new_unique_questions)} NEW unique questions from {len(new_screenshots) if new_screenshots else 0} additional websites:
 
-    {chr(10).join(new_questions_formatted)}
-
     📸 **Slideshow Updated**: Added {len(new_screenshots) if new_screenshots else 0} new screenshots (Total: {len(session.screenshots) if hasattr(session, 'screenshots') and session.screenshots else 0})
 
     **📊 Selection Status:**
@@ -2188,18 +2687,14 @@ Please enter question numbers separated by spaces.
     - **Total questions in pool:** {len(session.selected_questions_pool)}
     - **Total websites browsed:** {len(session.screenshots) if hasattr(session, 'screenshots') and session.screenshots else 0}
 
-    **How to select from NEW questions:**
-    Enter question numbers separated by spaces (e.g., "{start_num} {start_num+1}")
-    - Select up to {remaining_selections} more questions
-    - Enter "0" to select none from this batch
+    Use the checkboxes in the interface to select from all {len(session.selected_questions_pool)} available questions.
 
     **Options after selection:**
-    - **C** (Continue) - Proceed to questionnaire builder with selected questions
-    - **R** (Rebrowse) - Search more URLs ({4 - session.rebrowse_count} rebrowses left)
-    - **E** (Exit) - Exit workflow
+    - **Continue** - Proceed to questionnaire builder with selected questions
+    - **Rebrowse** - Search more URLs ({4 - session.rebrowse_count} rebrowses left)
+    - **Exit** - Exit workflow
 
-    **Please enter your question numbers:**
-    """
+    [UI_SELECTION_TRIGGER]"""
             
         except Exception as e:
             logger.error(f"Error in rebrowse: {e}")
@@ -2516,14 +3011,16 @@ Please enter question numbers separated by spaces.
     How would you like to distribute the {number_value} ADDITIONAL questions?
 
     Examples:
-    - "5 general, 0 open-ended" (for 5 additional) - Demographics are fixed
-    - "8 general, 2 open-ended" (for 10 additional) - Demographics are fixed
+    - "5 general, 0 open-ended" (for 5 additional)
+    - "8 general, 2 open-ended" (for 10 additional) 
     - "all general questions" (for any additional count)
 
     **Question Types:**
     - **General**: Satisfaction, rating, frequency, importance (Likert scales)
     - **Open-ended**: What, why, suggestions, feelings
-    - **Demographics**: Fixed questions (age, gender, education, income, location) - automatically included
+    - **Close-ended**: Yes/No, multiple choice with options
+
+    **Note:** 5 demographic questions (age, gender, education, income, location) will be automatically added at the end.
 
     Please specify your question breakdown for the {number_value} ADDITIONAL questions:
     """
@@ -2677,58 +3174,79 @@ Please respond with:
 - **R** (Regenerate) - Create different additional questions
 - **B** (Back) - Return to previous menu
 """
-
-    async def _generate_ai_questions(self, session: ResearchDesign, count: int, breakdown: str, audience_style: str) -> list:
-        """Generate AI questions with specified count and breakdown - NO demographics"""
-        import re
-        if count <= 0:
-            return []
+    async def _generate_specific_question_type(self, session: ResearchDesign, question_type: str, count: int, audience_style: str, avoid_duplicates: list = None) -> list:
+        """Generate specific type of questions with choices for close-ended on same line"""
         
-        # Parse breakdown - REMOVED demographic parsing
-        general_count = 0
-        open_ended_count = 0
+        avoid_list = ""
+        if avoid_duplicates:
+            avoid_list = f"\nAVOID creating questions similar to these existing ones:\n{chr(10).join(f'- {q}' for q in avoid_duplicates[-10:])}"
         
-        if "all general" in breakdown:
-            general_count = count
-            open_ended_count = 0
-        else:
-            general_match = re.search(r'(\d+)\s+general', breakdown)
-            if general_match:
-                general_count = int(general_match.group(1))
-            
-            if "no open" in breakdown or "0 open" in breakdown:
-                open_ended_count = 0
-            else:
-                open_match = re.search(r'(\d+)\s+open[- ]?ended?', breakdown)
-                if open_match:
-                    open_ended_count = int(open_match.group(1))
-        
-        # Adjust if breakdown doesn't add up
-        current_total = general_count + open_ended_count
-        if current_total != count:
-            general_count = count - open_ended_count
-            general_count = max(0, general_count)
-        
-        # Generate questions - UPDATED prompt to exclude demographics
-        prompt = f"""
-    Generate EXACTLY {count} survey questions for this research:
+        if question_type == "general":
+            prompt = f"""
+    Generate EXACTLY {count} general survey questions (satisfaction, frequency, rating, importance - Likert scales) for this research:
 
     Research Topic: {session.research_topic}
     Target Population: {session.target_population}
+    Questioning style: {audience_style}
 
     REQUIREMENTS:
-    - EXACTLY {count} questions total
-    - EXACTLY {general_count} general questions (satisfaction, frequency, rating, importance - Likert scales)
-    - EXACTLY {open_ended_count} open-ended questions (what, why, suggestions, feelings)
-    - DO NOT generate any demographic questions (age, gender, education, income, location)
-    - Demographics will be handled separately with fixed questions
-    - Questioning style: {audience_style}
+    - EXACTLY {count} questions
+    - All questions should use Likert scales (1-5 or 1-7 rating scales)
+    - Include satisfaction, frequency, importance, and rating questions
+    - Each question should be unique and distinct
+    - NO demographic questions
+    - Return ONLY the questions, numbered 1-{count}{avoid_list}
 
-    Return ONLY the numbered questions, nothing else.
+    Generate exactly {count} general survey questions:
+    """
+        
+        elif question_type == "open_ended":
+            prompt = f"""
+    Generate EXACTLY {count} open-ended survey questions for this research:
+
+    Research Topic: {session.research_topic}
+    Target Population: {session.target_population}
+    Questioning style: {audience_style}
+
+    REQUIREMENTS:
+    - EXACTLY {count} questions
+    - All questions should be open-ended (What, Why, How, Describe, Explain)
+    - Each question should encourage detailed responses
+    - Each question should be unique and distinct
+    - NO demographic questions
+    - Return ONLY the questions, numbered 1-{count}{avoid_list}
+
+    Generate exactly {count} open-ended questions:
+    """
+        
+        elif question_type == "close_ended":
+            prompt = f"""
+    Generate EXACTLY {count} close-ended survey questions with multiple choice options for this research:
+
+    Research Topic: {session.research_topic}
+    Target Population: {session.target_population}
+    Questioning style: {audience_style}
+
+    REQUIREMENTS:
+    - EXACTLY {count} questions
+    - All questions should be close-ended with 3-5 multiple choice options
+    - Include Yes/No questions and multiple choice questions
+    - Each question should be unique and distinct
+    - NO demographic questions
+    - CRITICAL: Put all options on the SAME LINE as the question
+    - Format: "Question text? A) Option 1 B) Option 2 C) Option 3 D) Option 4"
+    - Do NOT put options on separate lines
+    - Return ONLY the questions with choices, numbered 1-{count}{avoid_list}
+
+    EXAMPLE FORMAT:
+    1. Do you support gun control measures? A) Yes B) No C) Somewhat D) Not sure
+    2. How often do you feel safe at school? A) Always B) Usually C) Sometimes D) Rarely E) Never
+
+    Generate exactly {count} close-ended questions with choices ON THE SAME LINE:
     """
         
         try:
-            response = await self.llm.ask(prompt, temperature=0.6)
+            response = await self.llm.ask(prompt, temperature=0.7)
             cleaned_response = remove_chinese_and_punct(str(response))
             
             # Parse questions
@@ -2741,38 +3259,145 @@ Please respond with:
                     continue
                     
                 # Skip instructional text
-                if any(skip in line.lower() for skip in ['note:', 'requirements:', 'instructions:']):
+                if any(skip in line.lower() for skip in ['note:', 'requirements:', 'instructions:', 'generate', 'example']):
                     continue
                 
                 # Clean question
                 clean_line = re.sub(r'^[\d\.\-\•\*\s]*', '', line).strip()
                 
                 if clean_line and len(clean_line) > 15:
-                    if not clean_line.endswith('?'):
-                        clean_line += '?'
+                    # For close-ended questions, don't add ? if it already has options
+                    if question_type == "close_ended":
+                        # Check if it already has options (contains A) or B) etc.)
+                        if not re.search(r'[A-E]\)', clean_line):
+                            if not clean_line.endswith('?'):
+                                clean_line += '?'
+                    else:
+                        # For other types, add ? if missing
+                        if not clean_line.endswith('?'):
+                            clean_line += '?'
+                    
                     questions.append(clean_line)
                     
                     if len(questions) >= count:
                         break
             
-            # Ensure exact count
-            if len(questions) > count:
-                questions = questions[:count]
-            elif len(questions) < count:
-                # Fill with basic questions
-                needed = count - len(questions)
-                for i in range(needed):
+            # Fill with fallback if needed
+            while len(questions) < count:
+                if question_type == "general":
                     questions.append(f"How satisfied are you with {session.research_topic}?")
+                elif question_type == "open_ended":
+                    questions.append(f"What improvements would you suggest for {session.research_topic}?")
+                elif question_type == "close_ended":
+                    questions.append(f"Do you support {session.research_topic} policies? A) Yes B) No C) Not sure")
             
-            return questions
+            return questions[:count]
             
         except Exception as e:
-            logger.error(f"Error generating AI questions: {e}")
-            # Return basic fallback questions
-            return [f"How satisfied are you with {session.research_topic}?" for _ in range(count)]
+            logger.error(f"Error generating {question_type} questions: {e}")
+            # Return fallback questions
+            fallback_questions = []
+            for i in range(count):
+                if question_type == "general":
+                    fallback_questions.append(f"How satisfied are you with {session.research_topic}?")
+                elif question_type == "open_ended":
+                    fallback_questions.append(f"What improvements would you suggest for {session.research_topic}?")
+                elif question_type == "close_ended":
+                    fallback_questions.append(f"Do you support {session.research_topic} policies? A) Yes B) No C) Not sure")
+            return fallback_questions
+
+    async def _generate_ai_questions(self, session: ResearchDesign, count: int, breakdown: str, audience_style: str) -> list:
+        """Generate AI questions with specified count and breakdown - NO demographics, strict type adherence"""
+        import re
+        if count <= 0:
+            return []
+        
+        # Parse breakdown more strictly - only handle general, open-ended, and close-ended
+        general_count = 0
+        open_ended_count = 0
+        close_ended_count = 0
+        
+        if "all general" in breakdown.lower():
+            general_count = count
+            open_ended_count = 0
+            close_ended_count = 0
+        else:
+            # Extract counts for each type
+            general_match = re.search(r'(\d+)\s+general', breakdown.lower())
+            if general_match:
+                general_count = int(general_match.group(1))
+            
+            open_match = re.search(r'(\d+)\s+open[- ]?ended?', breakdown.lower())
+            if open_match:
+                open_ended_count = int(open_match.group(1))
+                
+            close_match = re.search(r'(\d+)\s+close[- ]?ended?', breakdown.lower())
+            if close_match:
+                close_ended_count = int(close_match.group(1))
+        
+        # Adjust if breakdown doesn't add up
+        current_total = general_count + open_ended_count + close_ended_count
+        if current_total != count:
+            remaining = count - open_ended_count - close_ended_count
+            general_count = max(0, remaining)
+        
+        all_questions = []
+        
+        # Generate each type separately to avoid duplicates
+        if general_count > 0:
+            general_questions = await self._generate_specific_question_type(
+                session, "general", general_count, audience_style
+            )
+            all_questions.extend(general_questions)
+        
+        if open_ended_count > 0:
+            open_ended_questions = await self._generate_specific_question_type(
+                session, "open_ended", open_ended_count, audience_style
+            )
+            all_questions.extend(open_ended_questions)
+            
+        if close_ended_count > 0:
+            close_ended_questions = await self._generate_specific_question_type(
+                session, "close_ended", close_ended_count, audience_style
+            )
+            all_questions.extend(close_ended_questions)
+        
+        # Ensure no duplicates using set-based deduplication
+        seen_questions = set()
+        unique_questions = []
+        
+        for question in all_questions:
+            question_lower = question.lower().strip()
+            # Create a normalized version for comparison
+            normalized = re.sub(r'[^\w\s]', '', question_lower)
+            if normalized not in seen_questions:
+                seen_questions.add(normalized)
+                unique_questions.append(question)
+        
+        # If we lost questions due to deduplication, generate more
+        while len(unique_questions) < count:
+            additional_needed = count - len(unique_questions)
+            additional_questions = await self._generate_specific_question_type(
+                session, "general", additional_needed, audience_style, avoid_duplicates=unique_questions
+            )
+            
+            for question in additional_questions:
+                question_lower = question.lower().strip()
+                normalized = re.sub(r'[^\w\s]', '', question_lower)
+                if normalized not in seen_questions:
+                    seen_questions.add(normalized)
+                    unique_questions.append(question)
+                    if len(unique_questions) >= count:
+                        break
+            
+            # Prevent infinite loop
+            if len(additional_questions) == 0:
+                break
+        
+        return unique_questions[:count]
 
     async def _generate_questions_from_specifications(self, session: ResearchDesign) -> str:
-        """Generate questions based on specifications - handling all decision modes with fixed demographics"""
+        """Generate questions based on specifications - handling all decision modes with fixed demographics automatically added"""
         
         # Determine which mode we're in
         is_selection_mode = hasattr(session, 'selected_internet_questions') and session.selected_internet_questions
@@ -2782,7 +3407,7 @@ Please respond with:
         breakdown = session.questionnaire_responses['question_breakdown'].lower()
         audience_style = session.questionnaire_responses['audience_style']
         
-        # Fixed demographic questions
+        # Fixed demographic questions - these will ALWAYS be added at the end
         fixed_demographics = [
             "What is your age?",
             "What is your gender?",
@@ -2805,7 +3430,7 @@ Please respond with:
             # A option: Only generated questions
             questions_to_generate = session.questionnaire_responses['total_questions']
         
-        # Generate the required questions (NO demographics in AI generation)
+        # Generate the required questions (NO demographics in AI generation - they're added automatically)
         if questions_to_generate > 0:
             generated_questions = await self._generate_ai_questions(
                 session, questions_to_generate, breakdown, audience_style
@@ -2813,9 +3438,9 @@ Please respond with:
         else:
             generated_questions = []
         
-        # Combine questions based on mode + ADD FIXED DEMOGRAPHICS
+        # Combine questions based on mode + AUTOMATICALLY ADD FIXED DEMOGRAPHICS AT THE END
         if is_include_all_mode:
-            # Y option: Internet questions + generated questions + demographics
+            # Y option: Internet questions + generated questions + demographics (auto-added)
             final_questions = (session.internet_questions or []) + generated_questions + fixed_demographics
             
             display_info = f"""**All Internet Questions ({len(session.internet_questions or [])}):**
@@ -2824,18 +3449,18 @@ Please respond with:
     {"**Additional Generated Questions (" + str(len(generated_questions)) + "):**" if generated_questions else "**No Additional Questions Generated**"}
     {chr(10).join(f"{i+len(session.internet_questions or [])+1}. {q}" for i, q in enumerate(generated_questions)) if generated_questions else ""}
 
-    **Fixed Demographic Questions ({len(fixed_demographics)}):**
+    **Fixed Demographic Questions ({len(fixed_demographics)}) - Automatically Added:**
     {chr(10).join(f"{i+len(session.internet_questions or [])+len(generated_questions)+1}. {q}" for i, q in enumerate(fixed_demographics))}
 
     **Total Questions: {len(final_questions)}** ({len(session.internet_questions or [])} internet + {len(generated_questions)} generated + {len(fixed_demographics)} demographics)
     """
             specs_info = f"""- Internet questions: {len(session.internet_questions or [])} (all included)
     - Additional generated: {len(generated_questions)}
-    - Fixed demographics: {len(fixed_demographics)}
+    - Fixed demographics: {len(fixed_demographics)} (automatically added)
     - Final total: {len(final_questions)}"""
             
         elif is_selection_mode:
-            # S option: Generated questions + selected questions as extras + demographics
+            # S option: Generated questions + selected questions as extras + demographics (auto-added)
             selected_questions = session.questionnaire_responses.get('selected_questions', [])
             final_questions = generated_questions + selected_questions + fixed_demographics
             
@@ -2845,30 +3470,30 @@ Please respond with:
     **Selected Internet Questions Added as Extras ({len(selected_questions)}):**
     {chr(10).join(f"{i+len(generated_questions)+1}. {q}" for i, q in enumerate(selected_questions))}
 
-    **Fixed Demographic Questions ({len(fixed_demographics)}):**
+    **Fixed Demographic Questions ({len(fixed_demographics)}) - Automatically Added:**
     {chr(10).join(f"{i+len(generated_questions)+len(selected_questions)+1}. {q}" for i, q in enumerate(fixed_demographics))}
 
     **Total Questions: {len(final_questions)}** ({len(generated_questions)} generated + {len(selected_questions)} selected extras + {len(fixed_demographics)} demographics)
     """
             specs_info = f"""- Generated questions: {len(generated_questions)}
     - Selected extras: {len(selected_questions)}
-    - Fixed demographics: {len(fixed_demographics)}
+    - Fixed demographics: {len(fixed_demographics)} (automatically added)
     - Final total: {len(final_questions)}"""
             
         else:
-            # A option: Only generated questions + demographics
+            # A option: Only generated questions + demographics (auto-added)
             final_questions = generated_questions + fixed_demographics
             
             display_info = f"""**Generated Questions ({len(generated_questions)}):**
     {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(generated_questions))}
 
-    **Fixed Demographic Questions ({len(fixed_demographics)}):**
+    **Fixed Demographic Questions ({len(fixed_demographics)}) - Automatically Added:**
     {chr(10).join(f"{i+len(generated_questions)+1}. {q}" for i, q in enumerate(fixed_demographics))}
 
     **Total Questions: {len(final_questions)}** ({len(generated_questions)} generated + {len(fixed_demographics)} demographics)
     """
             specs_info = f"""- Generated questions: {len(generated_questions)}
-    - Fixed demographics: {len(fixed_demographics)}
+    - Fixed demographics: {len(fixed_demographics)} (automatically added)
     - Total questions: {len(final_questions)}"""
         
         # Store final questions
@@ -2884,6 +3509,8 @@ Please respond with:
     - Questioning style: {audience_style}
 
     {display_info}
+
+    **Note:** The 5 demographic questions are automatically included in every survey and cannot be modified.
 
     ---
 
@@ -3038,6 +3665,9 @@ Enter your specifications:
             # Create detailed breakdown for testing report
             breakdown_info = await self._create_question_breakdown_for_testing(session, all_test_questions)
             
+            # Store the feedback for potential regeneration
+            session.__dict__['last_synthetic_feedback'] = synthetic_feedback
+            
             return f"""
     🧪 **Testing Questionnaire with Synthetic Respondents**
 
@@ -3050,9 +3680,10 @@ Enter your specifications:
 
     ---
 
-    **Are you satisfied with the questionnaire?**
+    **Review the feedback above. What would you like to do?**
     - **Y** (Yes) - Finalize and export complete research package
-    - **N** (No) - Make additional modifications
+    - **N** (No) - Make additional modifications to questionnaire
+    - **F** (Fix Issues) - Regenerate questions based on synthetic feedback
     - **T** (Test Again) - Run another round of testing
     """
         except Exception as e:
@@ -3070,9 +3701,10 @@ Enter your specifications:
 
     ---
 
-    **Are you satisfied with the questionnaire?**
+    **Review these results. What would you like to do?**
     - **Y** (Yes) - Finalize and export complete research package
-    - **N** (No) - Make additional modifications
+    - **N** (No) - Make additional modifications to questionnaire
+    - **F** (Fix Issues) - Regenerate questions based on feedback
     - **T** (Test Again) - Run another round of testing
     """
     
@@ -3115,64 +3747,83 @@ Enter your specifications:
             return "(AI generated questions)"
 
     async def _generate_synthetic_respondent_feedback_all(self, session: ResearchDesign, all_questions: List[str]) -> str:
-        """Generate realistic synthetic respondent feedback using AI for all questions"""
+        """Generate realistic synthetic respondent feedback using AI for all questions - concise format"""
         
         questions_text = "\n".join(f"{i+1}. {q}" for i, q in enumerate(all_questions))
         
         prompt = f"""
-You are simulating 5 different synthetic respondents testing a survey questionnaire. 
+    You are simulating 5 different synthetic respondents testing a survey questionnaire. 
 
-Research Topic: {session.research_topic}
-Target Population: {session.target_population}
-Total Questions: {len(all_questions)}
+    Research Topic: {session.research_topic}
+    Target Population: {session.target_population}
+    Total Questions: {len(all_questions)}
 
-Questions to test:
-{questions_text}
+    Questions to test:
+    {questions_text}
 
-For each synthetic respondent, provide:
-1. Brief demographic profile
-2. How long it took them to complete -- Keep it short
-3. Any confusion or issues they encountered -- Keep it very short
-4. Suggestions for improvement -- Keep it short
-5. Overall feedback -- Keep it very short
+    For each respondent, provide EXACTLY one short line for each of these 5 points:
+    1. Demographics: (age, background - one line)
+    2. Completion time: (one line only)
+    3. Confusion/issues: (one line only, or "None")
+    4. Suggestions: (one line only, or "None") 
+    5. Overall feedback: (one line only)
 
-Create diverse respondents (different ages, backgrounds, experiences) that match the target population. Be realistic about potential issues like unclear wording, missing answer options, or confusing flow.
+    Keep each line under 15 words. Be realistic about potential issues.
 
-Format as a structured test report. Keep response under 350 words and in English only.
-"""
+    Format as:
+    **Respondent 1:** [age/background]
+    - Time: [completion time]
+    - Issues: [confusion or "None"]
+    - Suggestions: [improvements or "None"]
+    - Overall: [brief feedback]
+
+    Create 5 diverse respondents. Total response under 200 words.
+    """
         
         try:
-            response = await self.llm.ask(prompt, temperature=0.8)  # Higher temperature for diversity
+            response = await self.llm.ask(prompt, temperature=0.8)
             cleaned_response = remove_chinese_and_punct(str(response))
             return cleaned_response
         except Exception as e:
             logger.error(f"Error generating synthetic feedback: {e}")
             return """
-**Synthetic Respondent Test Results:**
+    **Respondent 1:** Age 25, Tech worker
+    - Time: 7 minutes
+    - Issues: Rating scale needs clearer labels
+    - Suggestions: Add "Not Applicable" options
+    - Overall: Questions are clear but need minor improvements
 
-**Respondent 1** (Age 25, Tech-savvy): Completed in 7 minutes. Found questions clear but suggested adding "mobile app experience" options.
+    **Respondent 2:** Age 35, Parent
+    - Time: 11 minutes 
+    - Issues: Some technical terms unclear
+    - Suggestions: Simplify language for broader audience
+    - Overall: Good flow but vocabulary too complex
 
-**Respondent 2** (Age 35, Moderate tech use): Completed in 11 minutes. Confused by rating scale - suggested clearer labels.
+    **Respondent 3:** Age 45, Manager
+    - Time: 9 minutes
+    - Issues: None
+    - Suggestions: Add progress indicator
+    - Overall: Professional and comprehensive
 
-**Respondent 3** (Age 45, Low tech use): Completed in 15 minutes. Needed help with some terminology. Suggested simpler language.
+    **Respondent 4:** Age 28, Student
+    - Time: 8 minutes
+    - Issues: Missing mobile-friendly options
+    - Suggestions: Test on mobile devices
+    - Overall: Content good, format needs work
 
-**Overall Issues Found:**
-- Some technical terms need definitions
-- Rating scales could be more intuitive
-- Missing "Not Applicable" options for some questions
-
-**Recommendations:**
-- Add help text for technical terms
-- Include "N/A" options where appropriate
-- Test with actual target demographic
-"""
+    **Respondent 5:** Age 52, Retiree  
+    - Time: 15 minutes
+    - Issues: Font size and button clarity
+    - Suggestions: Larger text and buttons
+    - Overall: Accessible design needed
+    """
     
     async def _revise_questions(self, session: ResearchDesign) -> str:
-        """Rephrase existing questions in different words"""
+        """Rephrase existing questions in different words - demographics remain unchanged"""
         if not session.questions:
             return "No questions available to revise. Please generate questions first."
         
-        # Separate demographics from other questions
+        # Separate demographics from other questions - demographics are never revised
         fixed_demographics = [
             "What is your age?",
             "What is your gender?", 
@@ -3192,9 +3843,9 @@ Format as a structured test report. Keep response under 350 words and in English
                 questions_to_rephrase.append(q)
         
         if not questions_to_rephrase:
-            return "Only demographic questions found. Demographics cannot be revised as they are standardized."
+            return "Only demographic questions found. Demographics are fixed and cannot be revised."
         
-        # Rephrase non-demographic questions
+        # Rephrase non-demographic questions only
         prompt = f"""
     Rephrase the following survey questions in different words while keeping the same meaning and intent:
 
@@ -3210,6 +3861,7 @@ Format as a structured test report. Keep response under 350 words and in English
     - Maintain professional survey language
     - Return the same number of questions
     - Number each question
+    - DO NOT modify or include demographic questions
 
     Rephrased Questions:
     """
@@ -3231,7 +3883,7 @@ Format as a structured test report. Keep response under 350 words and in English
                 clean_line = re.sub(r'^[\d\.\-\•\*\s]*', '', line).strip()
                 
                 if clean_line and len(clean_line) > 15:
-                    if not clean_line.endswith('?'):
+                    if not clean_line.endswith('?') and ')' not in clean_line:
                         clean_line += '?'
                     rephrased_questions.append(clean_line)
             
@@ -3243,7 +3895,7 @@ Format as a structured test report. Keep response under 350 words and in English
             elif len(rephrased_questions) > len(questions_to_rephrase):
                 rephrased_questions = rephrased_questions[:len(questions_to_rephrase)]
             
-            # Combine rephrased questions with demographics
+            # Combine rephrased questions with unchanged demographics at the end
             session.questions = rephrased_questions + demographic_questions
             
             return f"""
@@ -3252,10 +3904,12 @@ Format as a structured test report. Keep response under 350 words and in English
     **Rephrased Questions ({len(rephrased_questions)}):**
     {chr(10).join(f"{i+1}. {q}" for i, q in enumerate(rephrased_questions))}
 
-    **Fixed Demographics ({len(demographic_questions)}):**
+    **Fixed Demographics ({len(demographic_questions)}) - Unchanged:**
     {chr(10).join(f"{i+len(rephrased_questions)+1}. {q}" for i, q in enumerate(demographic_questions))}
 
     **Total Questions: {len(session.questions)}**
+
+    **Note:** Demographic questions remain fixed and unchanged as they are standardized.
 
     ---
 
@@ -4369,55 +5023,30 @@ class OpenManusUI:
                 if session_id in self.research_workflow.active_sessions:
                     session = self.research_workflow.active_sessions[session_id]
                     slideshow_data = None
+                    ui_selection_data = None
                     
-                    # Special handling for research workflow screenshot capture
-                    if session.stage == ResearchStage.DESIGN_REVIEW and request.content.upper().strip() == 'Y':
-                        # User accepted design and we're about to search - capture URL screenshots
-                        try:
-                            response_content = await self.research_workflow.process_research_input(
-                                session_id, request.content
-                            )
-                            
-                            # Check if we have screenshots to include
-                            if hasattr(session, 'screenshots') and session.screenshots:
-                                slideshow_data = {
-                                    "screenshots": session.screenshots,
-                                    "total_count": len(session.screenshots),
-                                    "research_topic": session.research_topic
-                                }
-                                
-                        except Exception as e:
-                            logger.warning(f"Could not capture screenshots: {e}")
-                            response_content = await self.research_workflow.process_research_input(
-                                session_id, request.content
-                            )
+                    # Process the research input
+                    response_content = await self.research_workflow.process_research_input(
+                        session_id, request.content
+                    )
                     
-                    # Special handling for rebrowse option
-                    elif session.stage == ResearchStage.DECISION_POINT and request.content.upper().strip() == 'R':
-                        try:
-                            response_content = await self.research_workflow.process_research_input(
-                                session_id, request.content
-                            )
-                            
-                            # Check if we have updated screenshots to include
-                            if hasattr(session, 'screenshots') and session.screenshots:
-                                slideshow_data = {
-                                    "screenshots": session.screenshots,
-                                    "total_count": len(session.screenshots),
-                                    "research_topic": session.research_topic
-                                }
-                                
-                        except Exception as e:
-                            logger.warning(f"Could not capture rebrowse screenshots: {e}")
-                            response_content = await self.research_workflow.process_research_input(
-                                session_id, request.content
-                            )
+                    # Check if we have screenshots to include
+                    if hasattr(session, 'screenshots') and session.screenshots:
+                        slideshow_data = {
+                            "screenshots": session.screenshots,
+                            "total_count": len(session.screenshots),
+                            "research_topic": session.research_topic
+                        }
                     
-                    # Regular research workflow processing for all other cases
-                    else:
-                        response_content = await self.research_workflow.process_research_input(
-                            session_id, request.content
-                        )
+                    # ALWAYS check for UI selection data after processing
+                    if (hasattr(session, '__dict__') and 
+                        'ui_selection_data' in session.__dict__ and
+                        session.__dict__.get('trigger_question_selection_ui', False)):
+                        
+                        ui_selection_data = session.__dict__['ui_selection_data']
+                        # Clear the trigger flag
+                        session.__dict__['trigger_question_selection_ui'] = False
+                        logger.info(f"Sending UI selection data with {len(ui_selection_data.get('questions', []))} questions")
                     
                     # Prepare the result
                     result = {
@@ -4427,10 +5056,15 @@ class OpenManusUI:
                         "session_id": session_id
                     }
                     
+                    # Add UI selection data if available
+                    if ui_selection_data:
+                        result["ui_selection_data"] = ui_selection_data
+                        result["show_question_selection"] = True  # Explicit flag for frontend
+                        logger.info("Added UI selection data to response")
+                    
                     # Add slideshow data if we have screenshots
                     if slideshow_data:
                         result["slideshow_data"] = slideshow_data
-                        # Also include first screenshot as main browser image
                         if slideshow_data["screenshots"]:
                             result["base64_image"] = slideshow_data["screenshots"][0]["screenshot"]
                             result["image_url"] = slideshow_data["screenshots"][0]["url"]
@@ -4706,6 +5340,16 @@ class OpenManusUI:
                         # Process the research input which will capture screenshots of found URLs
                         response = await self.research_workflow.process_research_input(session_id, user_message)
                         
+                        # Check for UI selection data AFTER processing
+                        ui_selection_data = None
+                        if (hasattr(session, '__dict__') and 
+                            'ui_selection_data' in session.__dict__ and
+                            session.__dict__.get('trigger_question_selection_ui', False)):
+                            
+                            ui_selection_data = session.__dict__['ui_selection_data']
+                            session.__dict__['trigger_question_selection_ui'] = False
+                            logger.info(f"Broadcasting UI selection data with {len(ui_selection_data.get('questions', []))} questions")
+                        
                         # After processing, check if we have screenshots to display
                         if hasattr(session, 'screenshots') and session.screenshots:
                             logger.info(f"Broadcasting initial slideshow with {len(session.screenshots)} screenshots")
@@ -4726,11 +5370,20 @@ class OpenManusUI:
                                     "source_url": session.screenshots[0]['url']
                                 })
                         
-                        await self.broadcast_message("agent_message", {
+                        # Send the main response with UI selection data if available
+                        message_data = {
                             "content": response,
                             "action_type": UserAction.BUILD_QUESTIONNAIRE.value,
                             "session_id": session_id
-                        })
+                        }
+                        
+                        # Add UI selection data if available
+                        if ui_selection_data:
+                            message_data["ui_selection_data"] = ui_selection_data
+                            message_data["show_question_selection"] = True
+                            logger.info("Added UI selection data to agent message")
+                        
+                        await self.broadcast_message("agent_message", message_data)
                         return
                         
                     except Exception as e:
@@ -4744,6 +5397,16 @@ class OpenManusUI:
                         
                         # Process the rebrowse which will capture additional screenshots
                         response = await self.research_workflow.process_research_input(session_id, user_message)
+                        
+                        # Check for UI selection data AFTER processing
+                        ui_selection_data = None
+                        if (hasattr(session, '__dict__') and 
+                            'ui_selection_data' in session.__dict__ and
+                            session.__dict__.get('trigger_question_selection_ui', False)):
+                            
+                            ui_selection_data = session.__dict__['ui_selection_data']
+                            session.__dict__['trigger_question_selection_ui'] = False
+                            logger.info(f"Broadcasting updated UI selection data with {len(ui_selection_data.get('questions', []))} questions")
                         
                         # After processing, check if we have updated screenshots to display
                         if hasattr(session, 'screenshots') and session.screenshots:
@@ -4769,11 +5432,20 @@ class OpenManusUI:
                                     "source_url": latest_screenshot['url']
                                 })
                         
-                        await self.broadcast_message("agent_message", {
+                        # Send the main response with UI selection data if available
+                        message_data = {
                             "content": response,
                             "action_type": UserAction.BUILD_QUESTIONNAIRE.value,
                             "session_id": session_id
-                        })
+                        }
+                        
+                        # Add UI selection data if available
+                        if ui_selection_data:
+                            message_data["ui_selection_data"] = ui_selection_data
+                            message_data["show_question_selection"] = True
+                            logger.info("Added updated UI selection data to agent message")
+                        
+                        await self.broadcast_message("agent_message", message_data)
                         return
                         
                     except Exception as e:
@@ -4788,6 +5460,16 @@ class OpenManusUI:
                         
                         # Process the selection input
                         response = await self.research_workflow.process_research_input(session_id, user_message)
+                        
+                        # Check for UI selection data AFTER processing
+                        ui_selection_data = None
+                        if (hasattr(session, '__dict__') and 
+                            'ui_selection_data' in session.__dict__ and
+                            session.__dict__.get('trigger_question_selection_ui', False)):
+                            
+                            ui_selection_data = session.__dict__['ui_selection_data']
+                            session.__dict__['trigger_question_selection_ui'] = False
+                            logger.info(f"Broadcasting selection UI data with {len(ui_selection_data.get('questions', []))} questions")
                         
                         # Check if screenshots were updated during selection processing
                         if hasattr(session, 'screenshots') and session.screenshots:
@@ -4815,11 +5497,20 @@ class OpenManusUI:
                                         "source_url": latest_screenshot['url']
                                     })
                         
-                        await self.broadcast_message("agent_message", {
+                        # Send the main response with UI selection data if available
+                        message_data = {
                             "content": response,
                             "action_type": UserAction.BUILD_QUESTIONNAIRE.value,
                             "session_id": session_id
-                        })
+                        }
+                        
+                        # Add UI selection data if available
+                        if ui_selection_data:
+                            message_data["ui_selection_data"] = ui_selection_data
+                            message_data["show_question_selection"] = True
+                            logger.info("Added selection UI data to agent message")
+                        
+                        await self.broadcast_message("agent_message", message_data)
                         return
                         
                     except Exception as e:
@@ -4828,11 +5519,30 @@ class OpenManusUI:
                 # Regular research workflow processing for all other cases
                 response = await self.research_workflow.process_research_input(session_id, user_message)
                 
-                await self.broadcast_message("agent_message", {
+                # ALWAYS check for UI selection data after ANY processing
+                ui_selection_data = None
+                if (hasattr(session, '__dict__') and 
+                    'ui_selection_data' in session.__dict__ and
+                    session.__dict__.get('trigger_question_selection_ui', False)):
+                    
+                    ui_selection_data = session.__dict__['ui_selection_data']
+                    session.__dict__['trigger_question_selection_ui'] = False
+                    logger.info(f"Broadcasting general UI selection data with {len(ui_selection_data.get('questions', []))} questions")
+                
+                # Send the main response
+                message_data = {
                     "content": response,
                     "action_type": UserAction.BUILD_QUESTIONNAIRE.value,
                     "session_id": session_id
-                })
+                }
+                
+                # Add UI selection data if available
+                if ui_selection_data:
+                    message_data["ui_selection_data"] = ui_selection_data
+                    message_data["show_question_selection"] = True
+                    logger.info("Added general UI selection data to agent message")
+                
+                await self.broadcast_message("agent_message", message_data)
                 return
 
             # If no active session, detect intent and handle as before

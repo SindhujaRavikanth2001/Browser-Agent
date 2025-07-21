@@ -77,6 +77,7 @@ class ResearchDesign(BaseModel):
     user_responses: Optional[Dict] = None
     questionnaire_responses: Optional[Dict] = None
     chat_history: Optional[List[Dict]] = None
+    research_screenshots: Optional[List[Dict]] = None
     
     # URL management fields
     all_collected_urls: Optional[List[str]] = None
@@ -96,6 +97,478 @@ class UserMessage(BaseModel):
     content: str
     action_type: Optional[str] = None
     research_session_id: Optional[str] = None
+
+class URLProcessor:
+    """Unified URL processor that scrapes content once and validates everything simultaneously"""
+    
+    def __init__(self, llm_instance, browser_tool=None):
+        self.llm = llm_instance
+        self.browser_tool = browser_tool
+        self.question_extractor = ImprovedQuestionExtractor()
+        # Cache to store scraped content and avoid re-scraping
+        self.content_cache = {}
+        self.screenshot_cache = {}
+        # NEW: Track processed URLs to avoid overlap between research and internet search
+        self.processed_research_urls = set()
+        self.processed_internet_urls = set()
+    
+    def mark_research_url_processed(self, url: str):
+        """Mark a URL as processed during research phase"""
+        self.processed_research_urls.add(url)
+    
+    def mark_internet_url_processed(self, url: str):
+        """Mark a URL as processed during internet search phase"""
+        self.processed_internet_urls.add(url)
+    
+    def is_url_already_processed_for_research(self, url: str) -> bool:
+        """Check if URL was already processed in research phase"""
+        return url in self.processed_research_urls
+    
+    def is_url_already_processed_for_internet(self, url: str) -> bool:
+        """Check if URL was already processed in internet search phase"""
+        return url in self.processed_internet_urls
+    
+    async def process_urls_for_research(self, urls: List[str], research_topic: str, target_count: int = 3) -> Dict:
+        """Process URLs for research summaries - mark as research URLs"""
+        research_summaries = []
+        screenshots = []
+        processed_urls = []
+        
+        for i, url in enumerate(urls):
+            if len(research_summaries) >= target_count:
+                break
+                
+            # Mark as research URL
+            self.mark_research_url_processed(url)
+            logger.info(f"Processing RESEARCH URL {i+1}/{len(urls)}: {url}")
+            
+            try:
+                # Step 1: Check if URL is valid and deep
+                if not self._is_valid_url(url) or not self._is_deep_url(url):
+                    logger.info(f"❌ URL validation failed: {url}")
+                    continue
+                
+                # Step 2: Scrape content once (check cache first)
+                content = await self._get_or_scrape_content(url)
+                if not content or len(content) < 300:
+                    logger.info(f"❌ Insufficient content: {url}")
+                    continue
+                
+                # Step 3: Validate content relevance using LLM
+                is_relevant = await self._validate_content_relevance(content, research_topic, url)
+                if not is_relevant:
+                    logger.info(f"❌ Content not relevant to topic: {url}")
+                    continue
+                
+                # Step 4: Content is valid - store it and create summary
+                self.content_cache[url] = content
+                summary = await self._create_individual_research_summary(content, url, research_topic)
+                
+                if summary:
+                    research_summaries.append({
+                        'url': url,
+                        'summary': summary,
+                        'domain': self._extract_domain(url),
+                        'content': content  # Store content for potential reuse
+                    })
+                    processed_urls.append(url)
+                    
+                    # Step 5: Take screenshot since content is valid
+                    screenshot = await self._get_or_capture_screenshot(url)
+                    if screenshot:
+                        screenshots.append({
+                            'url': url,
+                            'screenshot': screenshot,
+                            'title': f"Research Study - {self._extract_domain(url)}"
+                        })
+                        logger.info(f"✅ RESEARCH URL processed successfully: {url}")
+                    
+            except Exception as e:
+                logger.error(f"Error processing research URL {url}: {e}")
+                continue
+        
+        return {
+            'research_summaries': research_summaries,
+            'screenshots': screenshots,
+            'processed_urls': processed_urls,
+            'cached_content': {url: self.content_cache[url] for url in processed_urls}
+        }
+    
+    async def process_urls_for_questions(self, urls: List[str], research_topic: str, target_population: str, target_count: int = 6) -> Dict:
+        """Process URLs for question extraction - mark as internet URLs and avoid research URLs"""
+        extracted_questions = []
+        screenshots = []
+        processed_urls = []
+        seen_questions = set()
+        
+        for i, url in enumerate(urls):
+            if len(processed_urls) >= target_count:
+                break
+            
+            # IMPORTANT: Skip if this URL was already processed for research
+            if self.is_url_already_processed_for_research(url):
+                logger.info(f"⏭️ Skipping {url} - already processed for research")
+                continue
+                
+            # Mark as internet search URL
+            self.mark_internet_url_processed(url)
+            logger.info(f"Processing INTERNET SEARCH URL {i+1}/{len(urls)}: {url}")
+            
+            try:
+                # Step 1: Check if URL is valid and deep
+                if not self._is_valid_url(url) or not self._is_deep_url(url):
+                    logger.info(f"❌ URL validation failed: {url}")
+                    continue
+                
+                # Step 2: Scrape content once (check cache first)
+                content = await self._get_or_scrape_content(url)
+                if not content or len(content) < 200:
+                    logger.info(f"❌ Insufficient content: {url}")
+                    continue
+                
+                # Step 3: Validate content relevance using LLM
+                is_relevant = await self._validate_content_relevance(content, research_topic, url)
+                if not is_relevant:
+                    logger.info(f"❌ Content not relevant to topic: {url}")
+                    continue
+                
+                # Step 4: Content is valid - store it and extract questions
+                self.content_cache[url] = content
+                url_questions = await self._extract_questions_from_content(content, url)
+                
+                # Filter unique questions
+                unique_questions = []
+                for q_dict in url_questions:
+                    question_text = q_dict['question'].lower().strip()
+                    if question_text not in seen_questions and len(question_text) > 15:
+                        seen_questions.add(question_text)
+                        unique_questions.append(q_dict)
+                
+                if unique_questions:
+                    extracted_questions.extend(unique_questions)
+                    processed_urls.append(url)
+                    
+                    # Step 5: Take screenshot since content is valid
+                    screenshot = await self._get_or_capture_screenshot(url)
+                    if screenshot:
+                        screenshots.append({
+                            'url': url,
+                            'screenshot': screenshot,
+                            'title': f"Survey Research - {self._extract_domain(url)}"
+                        })
+                        
+                    logger.info(f"✅ Found {len(unique_questions)} unique questions from INTERNET SEARCH: {url}")
+                else:
+                    logger.info(f"⚠️ No unique questions found in: {url}")
+                    
+            except Exception as e:
+                logger.error(f"Error processing internet search URL {url}: {e}")
+                continue
+        
+        return {
+            'extracted_questions': extracted_questions,
+            'screenshots': screenshots,
+            'processed_urls': processed_urls,
+            'cached_content': {url: self.content_cache[url] for url in processed_urls}
+        }
+    
+    async def _get_or_scrape_content(self, url: str) -> str:
+        """Get content from cache or scrape it once"""
+        if url in self.content_cache:
+            logger.info(f"📋 Using cached content for: {url}")
+            return self.content_cache[url]
+        
+        logger.info(f"🔍 Scraping new content for: {url}")
+        content = await self._scrape_page_content(url)
+        if content:
+            self.content_cache[url] = content
+        return content
+    
+    async def _get_or_capture_screenshot(self, url: str) -> Optional[str]:
+        """Get screenshot from cache or capture it once"""
+        if url in self.screenshot_cache:
+            logger.info(f"📸 Using cached screenshot for: {url}")
+            return self.screenshot_cache[url]
+        
+        if self.browser_tool:
+            logger.info(f"📸 Capturing new screenshot for: {url}")
+            screenshot = await capture_url_screenshot(url, self.browser_tool)
+            if screenshot:
+                is_valid = await self.validate_screenshot(screenshot, url)
+                if is_valid:
+                    self.screenshot_cache[url] = screenshot
+                    return screenshot
+        return None
+    
+    async def _validate_content_relevance(self, content: str, research_topic: str, url: str) -> bool:
+        """Use LLM to determine if content is related to research topic"""
+        content_sample = content[:2000]  # Limit for efficiency
+        
+        prompt = f"""
+        Determine if this webpage content is related to the research topic "{research_topic}".
+        
+        Content sample from {url}:
+        {content_sample}
+        
+        Respond with ONLY "YES" if the content is clearly related to "{research_topic}" research, studies, or surveys.
+        Respond with ONLY "NO" if the content is not related.
+        
+        Response:
+        """
+        
+        try:
+            response = await self.llm.ask(prompt, temperature=0.1)
+            cleaned_response = remove_chinese_and_punct(str(response)).strip().upper()
+            return "YES" in cleaned_response
+        except Exception as e:
+            logger.error(f"Error checking content relevance for {url}: {e}")
+            return False
+    
+    async def _extract_questions_from_content(self, content: str, url: str) -> List[Dict]:
+        """Extract questions from already scraped content"""
+        # Use pattern-based extraction first
+        pattern_questions = self.question_extractor.extract_questions_with_sources(content, url)
+        
+        if len(pattern_questions) >= 3:
+            return pattern_questions[:6]  # Limit to 6 questions per URL
+        
+        # Fallback to LLM if pattern matching doesn't find enough
+        llm_questions = await self._llm_extract_questions(content, url)
+        pattern_questions.extend(llm_questions)
+        
+        # Remove duplicates
+        unique_questions = []
+        seen = set()
+        for q_dict in pattern_questions:
+            question_text = q_dict['question'].lower().strip()
+            if question_text not in seen and len(question_text) > 15:
+                seen.add(question_text)
+                unique_questions.append(q_dict)
+        
+        return unique_questions[:6]
+    
+    async def _llm_extract_questions(self, content: str, url: str) -> List[Dict]:
+        """Extract questions using LLM from already scraped content"""
+        content_sample = content[:3000]
+        
+        prompt = f"""
+        Extract EXISTING survey questions from this webpage content. Find questions that already exist - do NOT create new ones.
+
+        WEBPAGE: {url}
+        CONTENT: {content_sample}
+
+        EXTRACTION RULES:
+        1. Only extract questions that already exist in the content
+        2. Questions must end with "?"
+        3. Questions should be 20-200 characters long
+        4. Return maximum 6 questions
+        5. Format: One question per line, no numbering
+        6. If no actual questions found, return "NO_QUESTIONS_FOUND"
+
+        EXISTING QUESTIONS:
+        """
+        
+        try:
+            response = await self.llm.ask(prompt, temperature=0.1)
+            cleaned_response = remove_chinese_and_punct(str(response))
+            
+            if "NO_QUESTIONS_FOUND" in cleaned_response.upper():
+                return []
+            
+            lines = cleaned_response.split('\n')
+            questions_found = []
+            
+            for line in lines:
+                line = line.strip()
+                if not line or len(line) < 20:
+                    continue
+                
+                # Clean up formatting
+                line = re.sub(r'^\d+[\.\)]\s*', '', line)
+                line = re.sub(r'^[-•*]\s*', '', line)
+                line = line.strip()
+                
+                if line.endswith('?') and len(line) > 20 and len(line) < 250:
+                    questions_found.append({
+                        'question': line,
+                        'source': url,
+                        'extraction_method': 'llm_extraction'
+                    })
+                    
+                    if len(questions_found) >= 6:
+                        break
+            
+            return questions_found
+            
+        except Exception as e:
+            logger.error(f"LLM extraction error for {url}: {e}")
+            return []
+    
+    async def _create_individual_research_summary(self, content: str, url: str, research_topic: str) -> str:
+        """Create summary from already scraped content"""
+        content_sample = content[:4000]
+        
+        prompt = f"""
+        Create a concise one-sentence summary of this research study related to "{research_topic}".
+        
+        Research URL: {url}
+        Content: {content_sample}
+        
+        Requirements:
+        - EXACTLY one sentence (maximum 20 words)
+        - Focus ONLY on the main finding or conclusion
+        - Do NOT mention methodology, sample size, or participants
+        - Be specific about what was discovered or concluded
+        
+        Summary:
+        """
+        
+        try:
+            response = await self.llm.ask(prompt, temperature=0.3)
+            summary = remove_chinese_and_punct(str(response)).strip()
+            
+            # Clean up and ensure it's a single sentence
+            summary = summary.split('.')[0]
+            if summary:
+                summary = summary.strip()
+                if not summary.endswith('.'):
+                    summary += '.'
+            
+            # Limit to 20 words maximum
+            words = summary.split()
+            if len(words) > 20:
+                summary = ' '.join(words[:20]) + '.'
+                
+            return summary if summary else "Research study with relevant findings."
+            
+        except Exception as e:
+            logger.error(f"Error creating research summary for {url}: {e}")
+            return "Research study with relevant findings."
+    
+    def _is_valid_url(self, url: str) -> bool:
+        """Enhanced URL validation"""
+        try:
+            problematic_patterns = [
+                'accounts.google.com', 'login.', 'signin.', 'auth.', 'captcha',
+                '.pdf', '.doc', '.zip', 'javascript:', 'mailto:', 'tel:', 'ftp:'
+            ]
+            
+            url_lower = url.lower()
+            for pattern in problematic_patterns:
+                if pattern in url_lower:
+                    return False
+            
+            if not url.startswith(('http://', 'https://')):
+                return False
+            
+            if len(url) > 500:
+                return False
+            
+            return True
+            
+        except Exception:
+            return False
+    
+    def _is_deep_url(self, url: str) -> bool:
+        """Check if URL is a deep URL (not just root domain)"""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            path = parsed.path.strip('/')
+            
+            if not path or len(path) < 3:
+                return False
+            
+            path_segments = [seg for seg in path.split('/') if seg and seg.strip()]
+            if len(path_segments) < 1:
+                return False
+            
+            # Check for content indicators
+            content_indicators = [
+                'survey', 'research', 'study', 'questionnaire', 'poll',
+                'article', 'blog', 'post', 'report', 'analysis'
+            ]
+            
+            first_segment_lower = path_segments[0].lower()
+            for indicator in content_indicators:
+                if indicator in first_segment_lower:
+                    return True
+            
+            return len(path_segments) >= 2 or len(path) >= 15
+            
+        except Exception:
+            return False
+    
+    def _extract_domain(self, url: str) -> str:
+        """Extract domain from URL"""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            return parsed.netloc
+        except:
+            return "Unknown"
+    
+    async def _scrape_page_content(self, url: str) -> str:
+        """Scrape page content (same as existing implementation)"""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Remove unwanted elements
+            for element in soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe', 'noscript']):
+                element.decompose()
+            
+            # Try to find content in common containers first
+            content_selectors = [
+                'main', '.content', '.main-content', '.post-content', 
+                '.article-content', '.entry-content', '.page-content',
+                'article', '.survey-questions', '.questions', '.form-content'
+            ]
+            
+            main_content = ""
+            for selector in content_selectors:
+                elements = soup.select(selector)
+                if elements:
+                    main_content = ' '.join([elem.get_text() for elem in elements])
+                    break
+            
+            if not main_content:
+                main_content = soup.get_text()
+            
+            # Clean up text
+            lines = (line.strip() for line in main_content.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            cleaned_text = ' '.join(chunk for chunk in chunks if chunk)
+            cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+            
+            return cleaned_text[:12000]  # Limit to 12K characters
+            
+        except Exception as e:
+            logger.warning(f"Failed to scrape {url}: {e}")
+            return ""
+    
+    async def validate_screenshot(self, screenshot_base64: str, url: str) -> bool:
+        """Simple screenshot validation"""
+        try:
+            if len(screenshot_base64) < 10000:
+                return False
+            
+            image_data = base64.b64decode(screenshot_base64)
+            if len(image_data) < 5000:
+                return False
+            
+            data_sample = image_data[:1000]
+            unique_bytes = len(set(data_sample))
+            return unique_bytes >= 20
+            
+        except Exception:
+            return False
 
 class ImprovedQuestionExtractor:
     """Improved question extraction with better pattern recognition and source attribution"""
@@ -258,13 +731,15 @@ class ResearchWorkflow:
     def __init__(self, llm_instance):
         self.llm = llm_instance
         self.active_sessions: Dict[str, ResearchDesign] = {}
-        self.browser_tool = None  # Will be set by UI server
+        self.browser_tool = None
+        
+        # Initialize URL processor for optimized processing
+        self._url_processor = None
         
         # Google Custom Search API configuration
         self.google_api_key = os.getenv('GOOGLE_API_KEY')
         self.google_cse_id = os.getenv('GOOGLE_CSE_ID')
         
-        # Initialize Google Custom Search service
         if self.google_api_key and self.google_cse_id:
             try:
                 self.search_service = build("customsearch", "v1", developerKey=self.google_api_key)
@@ -276,25 +751,35 @@ class ResearchWorkflow:
             logger.warning("Google API credentials not found. Using fallback search.")
             self.search_service = None
 
+    def _get_url_processor(self):
+        """Get or create URL processor instance"""
+        if self._url_processor is None:
+            self._url_processor = URLProcessor(self.llm, self.browser_tool)
+        return self._url_processor
+
     async def _collect_all_urls(self, research_topic: str) -> List[str]:
-        """Collect 30 unique deep URLs upfront for the research topic"""
+        """Collect 30 unique deep URLs for INTERNET SEARCH - FIXED to exclude research URLs"""
         try:
             if not self.search_service:
                 logger.warning("Google Custom Search API not available")
                 return []
             
-            search_query = f"Surveys on {research_topic}"
-            logger.info(f"Collecting URLs for: {search_query}")
+            # Get URL processor to check for research URLs
+            url_processor = self._get_url_processor()
+            
+            # INTERNET SEARCH-SPECIFIC search query (different from research)
+            search_query = f"survey questionnaire questions about {research_topic}"
+            logger.info(f"Collecting INTERNET SEARCH URLs for: {search_query}")
             
             all_unique_urls = []
             seen_urls = set()
             
-            # Try multiple search variations to get 30 unique URLs
+            # INTERNET SEARCH-SPECIFIC search variations (completely different from research)
             search_variations = [
-                f"Surveys on {research_topic}",
-                f"{research_topic} questionnaire research",
-                f"{research_topic} survey methodology",
-                f"{research_topic} study questions"
+                f"survey questionnaire questions about {research_topic}",
+                f"{research_topic} survey instrument questions",
+                f"{research_topic} questionnaire examples forms",
+                f"{research_topic} poll questions survey tools"
             ]
             
             for search_term in search_variations:
@@ -316,11 +801,16 @@ class ResearchWorkflow:
                             title = item.get('title', '')
                             
                             if link and link not in seen_urls:
+                                # CRITICAL CHECK: Skip if this URL was already processed for research
+                                if url_processor.is_url_already_processed_for_research(link):
+                                    logger.info(f"⏭️ Skipping research URL: {link}")
+                                    continue
+                                
                                 # Check if it's a valid deep URL
                                 if self._is_valid_url(link):
                                     all_unique_urls.append(link)
                                     seen_urls.add(link)
-                                    logger.info(f"✅ Collected deep URL #{len(all_unique_urls)}: {title}")
+                                    logger.info(f"✅ Collected INTERNET SEARCH URL #{len(all_unique_urls)}: {title}")
                                     
                                     if len(all_unique_urls) >= 30:
                                         break
@@ -331,17 +821,18 @@ class ResearchWorkflow:
                     await asyncio.sleep(1)
                     
                 except Exception as api_error:
-                    logger.error(f"Search API error for '{search_term}': {api_error}")
+                    logger.error(f"Internet search API error for '{search_term}': {api_error}")
                     continue
             
-            logger.info(f"URL collection results:")
+            logger.info(f"INTERNET SEARCH URL collection results:")
             logger.info(f"  - Total unique deep URLs collected: {len(all_unique_urls)}")
             logger.info(f"  - Target was: 30 URLs")
+            logger.info(f"  - Research URLs excluded from collection")
             
             return all_unique_urls[:30]  # Ensure we don't exceed 30
             
         except Exception as e:
-            logger.error(f"Error collecting URLs: {e}")
+            logger.error(f"Error collecting internet search URLs: {e}")
             return []
 
     async def _extract_actual_questions_from_content(self, scraped_content: str, url: str) -> List[Dict]:
@@ -479,128 +970,48 @@ class ResearchWorkflow:
             return []
 
     async def _search_internet_for_questions(self, research_topic: str, target_population: str, session: ResearchDesign) -> tuple[List[Dict], List[str], List[Dict]]:
-        """Process the next batch of 6 URLs and extract actual questions"""
+        """Optimized internet search using unified processor - scrape once, validate once, extract once"""
+        
         try:
-            # If this is the first time, collect all URLs
+            # Get URL processor
+            url_processor = self._get_url_processor()
+            
+            # If first time, collect all URLs
             if session.all_collected_urls is None:
-                logger.info("First time search - collecting all URLs")
                 session.all_collected_urls = await self._collect_all_urls(research_topic)
                 session.current_batch_index = 0
                 session.browsed_urls = []
                 
                 if not session.all_collected_urls:
-                    logger.warning("No URLs collected")
                     return [], [], []
             
-            # Check if we've exhausted all URLs
+            # Get current batch
             total_urls = len(session.all_collected_urls)
             start_index = session.current_batch_index * 6
             
             if start_index >= total_urls:
-                logger.warning("All collected URLs have been processed")
                 return [], [], []
             
-            # Get the next batch of 6 URLs
             end_index = min(start_index + 6, total_urls)
             current_batch_urls = session.all_collected_urls[start_index:end_index]
             
-            logger.info(f"Processing batch {session.current_batch_index + 1}")
-            logger.info(f"URLs {start_index + 1}-{end_index} of {total_urls} total collected URLs")
+            # Process URLs with unified approach - validate topic relevance AND extract questions
+            result = await url_processor.process_urls_for_questions(
+                current_batch_urls, research_topic, target_population, target_count=6
+            )
             
-            # Process the current batch
-            all_extracted_questions = []
-            scraped_sources = []
-            valid_screenshots = []
-            
-            # SIMPLE FIX: Track already seen questions across ALL sessions
-            seen_questions = set()
-            
-            # Add previously found questions to seen set
-            if hasattr(session, 'extracted_questions_with_sources') and session.extracted_questions_with_sources:
-                for prev_q in session.extracted_questions_with_sources:
-                    seen_questions.add(prev_q['question'].lower().strip())
-            
-            for i, url in enumerate(current_batch_urls, 1):
-                try:
-                    logger.info(f"Processing URL {start_index + i}/{total_urls}: {url}")
-                    
-                    # Scrape content first
-                    page_content = await self._scrape_page_content(url)
-                    
-                    if not page_content or len(page_content) < 200:
-                        print(f"❌ Insufficient content from {url}")
-                        continue
-                    
-                    # Extract actual questions from this URL
-                    url_questions = await self._extract_actual_questions_from_content(page_content, url)
-                    
-                    # SIMPLE FIX: Filter out duplicate questions
-                    unique_url_questions = []
-                    for q_dict in url_questions:
-                        question_text = q_dict['question'].lower().strip()
-                        if question_text not in seen_questions:
-                            seen_questions.add(question_text)
-                            unique_url_questions.append(q_dict)
-                            logger.info(f"✅ Added unique question: {q_dict['question'][:50]}...")
-                        else:
-                            logger.info(f"⚠️ Skipped duplicate question: {q_dict['question'][:50]}...")
-                    
-                    if unique_url_questions:
-                        all_extracted_questions.extend(unique_url_questions)
-                        logger.info(f"✅ Extracted {len(unique_url_questions)} unique questions from {url}")
-                    else:
-                        logger.info(f"⚠️ No unique questions found in {url}")
-                    
-                    # Try screenshot
-                    screenshot = None
-                    if self.browser_tool:
-                        print(f"📸 Attempting screenshot for {url}")
-                        try:
-                            screenshot = await capture_url_screenshot(url, self.browser_tool)
-                            
-                            if screenshot:
-                                # Validate the screenshot
-                                is_valid = await self.validate_screenshot(screenshot, url)
-                                if not is_valid:
-                                    screenshot = None
-                        except Exception as screenshot_error:
-                            logger.warning(f"Screenshot failed for {url}: {screenshot_error}")
-                            screenshot = None
-                    
-                    scraped_sources.append(url)
-                    
-                    # Only add to slideshow if screenshot is valid
-                    if screenshot:
-                        domain = self._extract_domain(url)
-                        valid_screenshots.append({
-                            'url': url,
-                            'screenshot': screenshot,
-                            'title': f"Survey Research - {domain}"
-                        })
-                        logger.info(f"✅ Added screenshot #{len(valid_screenshots)}")
-                    else:
-                        logger.info(f"⚠️ Content only (no valid screenshot) for {url}")
-                    
-                    await asyncio.sleep(0.5)
-                    
-                except Exception as e:
-                    logger.warning(f"Error processing {url}: {e}")
-                    continue
-            
-            # Update session tracking
-            session.browsed_urls.extend(scraped_sources)
+            # Update session
+            if session.browsed_urls is None:
+                session.browsed_urls = []
+            session.browsed_urls.extend(result['processed_urls'])
             session.current_batch_index += 1
             
-            logger.info(f"Batch {session.current_batch_index} results:")
-            logger.info(f"  - URLs in this batch: {len(current_batch_urls)}")
-            logger.info(f"  - Total UNIQUE questions extracted: {len(all_extracted_questions)}")
-            logger.info(f"  - Valid screenshots: {len(valid_screenshots)}")
+            logger.info(f"Batch {session.current_batch_index} processed: {len(result['extracted_questions'])} questions, {len(result['screenshots'])} screenshots")
             
-            # Return extracted questions (not generated ones)
-            return all_extracted_questions, scraped_sources, valid_screenshots
+            return result['extracted_questions'], result['processed_urls'], result['screenshots']
             
         except Exception as e:
-            logger.error(f"Error in batch URL processing: {e}")
+            logger.error(f"Error in optimized internet search: {e}")
             return [], [], []
 
     async def validate_screenshot(self, screenshot_base64: str, url: str) -> bool:
@@ -1669,10 +2080,23 @@ GENERATE {num_needed} SURVEY QUESTIONS:
             return "All research design questions have been completed. Please proceed with the review."
     
     async def _generate_research_design_with_motivation(self, session: ResearchDesign) -> str:
-        """Generate a comprehensive research design using LLM including motivation and related research links"""
+        """Generate comprehensive research design with enhanced research integration"""
         
-        # First, search for related research
+        # Store current session for research URL processing
+        self._current_session = session
+        
+        # Enhanced research search with screenshots - FIXED: Store results for UI access
         related_research = await self._search_related_research(session.research_topic)
+        
+        # IMPORTANT: After research search, check if screenshots were captured and flag for UI
+        if (hasattr(session, 'research_screenshots') and 
+            session.research_screenshots and 
+            len(session.research_screenshots) > 0):
+            
+            # Set a flag to indicate research screenshots are ready for UI
+            session.__dict__['has_research_screenshots'] = True
+            session.__dict__['research_screenshots_count'] = len(session.research_screenshots)
+            logger.info(f"Research design generated with {len(session.research_screenshots)} screenshots ready for UI")
         
         prompt = f"""
         Generate a comprehensive research design based on the following information:
@@ -1747,96 +2171,275 @@ GENERATE {num_needed} SURVEY QUESTIONS:
             logger.error(f"Error summarizing research content: {e}")
             return "Research study with relevant findings for your topic."
 
+    async def _collect_research_urls(self, research_topic: str, target_count: int = 10) -> List[str]:
+        """Collect research URLs using RESEARCH-SPECIFIC search terms (different from internet search)"""
+        try:
+            # RESEARCH-SPECIFIC search variations (different from internet search)
+            search_variations = [
+                f"{research_topic} academic research study",
+                f"{research_topic} peer reviewed research",
+                f"{research_topic} research findings analysis", 
+                f"{research_topic} university research study"
+            ]
+            
+            all_unique_urls = []
+            seen_urls = set()
+            
+            for search_term in search_variations:
+                if len(all_unique_urls) >= target_count:
+                    break
+                    
+                try:
+                    search_result = self.search_service.cse().list(
+                        q=search_term,
+                        cx=self.google_cse_id,
+                        num=10,
+                        safe='active',
+                        fields='items(title,link,snippet)'
+                    ).execute()
+                    
+                    if 'items' in search_result:
+                        for item in search_result['items']:
+                            link = item.get('link', '')
+                            
+                            if link and link not in seen_urls:
+                                if self._is_valid_url(link):
+                                    all_unique_urls.append(link)
+                                    seen_urls.add(link)
+                                    logger.info(f"✅ Collected research URL #{len(all_unique_urls)}: {link}")
+                                    
+                                    if len(all_unique_urls) >= target_count:
+                                        break
+                    
+                    await asyncio.sleep(1)
+                    
+                except Exception as api_error:
+                    logger.error(f"Research search API error for '{search_term}': {api_error}")
+                    continue
+            
+            logger.info(f"Research URL collection: {len(all_unique_urls)} URLs collected (will only mark successful ones)")
+            return all_unique_urls[:target_count]
+            
+        except Exception as e:
+            logger.error(f"Error collecting research URLs: {e}")
+            return []
+
+    def _is_topic_related_url(self, url: str, research_topic: str) -> bool:
+        """Check if URL path contains keywords related to research topic"""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url.lower())
+            url_path = parsed.path.lower()
+            
+            # Extract keywords from research topic
+            topic_keywords = [word.lower() for word in research_topic.split() if len(word) > 3]
+            
+            # Check if any topic keyword appears in URL path
+            for keyword in topic_keywords:
+                if keyword in url_path:
+                    return True
+            
+            # Also check for research-related terms in URL
+            research_indicators = ['research', 'study', 'survey', 'analysis', 'report']
+            for indicator in research_indicators:
+                if indicator in url_path:
+                    return True
+            
+            return False
+            
+        except Exception:
+            return False
+
+    async def _is_content_topic_related(self, content: str, research_topic: str, url: str) -> bool:
+        """Use LLM to determine if content is related to research topic"""
+        
+        # Limit content for processing
+        content_sample = content[:2000]
+        
+        prompt = f"""
+        Determine if this webpage content is related to the research topic "{research_topic}".
+        
+        Content sample from {url}:
+        {content_sample}
+        
+        Respond with ONLY "YES" if the content is clearly related to "{research_topic}" research, studies, or surveys.
+        Respond with ONLY "NO" if the content is not related.
+        
+        Response:
+        """
+        
+        try:
+            response = await self.llm.ask(prompt, temperature=0.1)
+            cleaned_response = remove_chinese_and_punct(str(response)).strip().upper()
+            
+            return "YES" in cleaned_response
+            
+        except Exception as e:
+            logger.error(f"Error checking content relevance for {url}: {e}")
+            return False
+
+    async def _validate_and_select_research_urls(self, urls: List[str], research_topic: str, target_count: int = 3) -> List[str]:
+        """Validate URLs and select those related to research topic"""
+        legitimate_urls = []
+        
+        for url in urls:
+            if len(legitimate_urls) >= target_count:
+                break
+                
+            try:
+                # Check if URL is topic-related by examining the URL path
+                if self._is_topic_related_url(url, research_topic):
+                    logger.info(f"✅ URL path matches topic: {url}")
+                    legitimate_urls.append(url)
+                    continue
+                
+                # If URL path doesn't match, check content relevance
+                content = await self._scrape_page_content(url)
+                if content and len(content) > 300:
+                    is_relevant = await self._is_content_topic_related(content, research_topic, url)
+                    if is_relevant:
+                        logger.info(f"✅ Content matches topic: {url}")
+                        legitimate_urls.append(url)
+                    else:
+                        logger.info(f"❌ Content not relevant: {url}")
+                else:
+                    logger.info(f"❌ Insufficient content: {url}")
+                    
+            except Exception as e:
+                logger.warning(f"Error validating research URL {url}: {e}")
+                continue
+        
+        logger.info(f"Selected {len(legitimate_urls)} legitimate research URLs")
+        return legitimate_urls
+        
+    async def _create_individual_research_summary(self, content: str, url: str, research_topic: str) -> str:
+        """Create individual LLM summary for each research URL"""
+        
+        content_sample = content[:4000]
+        
+        prompt = f"""
+        Create a concise one-sentence summary of this research study related to "{research_topic}".
+        
+        Research URL: {url}
+        Content: {content_sample}
+        
+        Requirements:
+        - EXACTLY one sentence (maximum 20 words)
+        - Focus ONLY on the main finding or conclusion
+        - Do NOT mention methodology, sample size, or participants
+        - Be specific about what was discovered or concluded
+        
+        Examples:
+        - "Shows 73% of parents consider school safety their top concern"
+        - "Finds strong public support for background checks on gun purchases"
+        - "Reports declining confidence in school security measures"
+        
+        Summary:
+        """
+        
+        try:
+            response = await self.llm.ask(prompt, temperature=0.3)
+            summary = remove_chinese_and_punct(str(response)).strip()
+            
+            # Clean up and ensure it's a single sentence
+            summary = summary.split('.')[0]
+            if summary:
+                summary = summary.strip()
+                if not summary.endswith('.'):
+                    summary += '.'
+            
+            # Limit to 20 words maximum
+            words = summary.split()
+            if len(words) > 20:
+                summary = ' '.join(words[:20]) + '.'
+                
+            return summary if summary else "Research study with relevant findings."
+            
+        except Exception as e:
+            logger.error(f"Error creating research summary for {url}: {e}")
+            return "Research study with relevant findings."
+            
+    async def _capture_research_screenshots(self, urls: List[str]) -> List[Dict]:
+        """Capture screenshots for research URLs"""
+        screenshots = []
+        
+        for url in urls:
+            try:
+                if self.browser_tool:
+                    screenshot = await capture_url_screenshot(url, self.browser_tool)
+                    
+                    if screenshot:
+                        is_valid = await self.validate_screenshot(screenshot, url)
+                        if is_valid:
+                            domain = self._extract_domain(url)
+                            screenshots.append({
+                                'url': url,
+                                'screenshot': screenshot,
+                                'title': f"Research Study - {domain}"
+                            })
+                            logger.info(f"✅ Research screenshot captured: {domain}")
+                        else:
+                            logger.warning(f"⚠️ Invalid research screenshot: {url}")
+                    else:
+                        logger.warning(f"⚠️ No research screenshot captured: {url}")
+                        
+            except Exception as e:
+                logger.warning(f"Error capturing research screenshot for {url}: {e}")
+                continue
+        
+        logger.info(f"Captured {len(screenshots)} research screenshots")
+        return screenshots
+
     async def _search_related_research(self, research_topic: str) -> str:
-        """Search for related research studies and provide links with concise summaries"""
+        """FIXED: Research search that only marks the final 3 successful URLs"""
         
         if not self.search_service:
             return ""
         
         try:
-            # Search for academic research on the topic
-            search_query = f"{research_topic} survey research study results"
+            # Get URL processor
+            url_processor = self._get_url_processor()
             
-            search_result = self.search_service.cse().list(
-                q=search_query,
-                cx=self.google_cse_id,
-                num=10,
-                safe='active',
-                fields='items(title,link,snippet)'
-            ).execute()
-            
-            if 'items' not in search_result:
+            # Collect URLs for RESEARCH (different search terms than internet search)
+            collected_urls = await self._collect_research_urls(research_topic, target_count=10)
+            if not collected_urls:
                 return ""
             
-            # Filter for legitimate research sources
-            research_links = []
-            for item in search_result['items']:
-                link = item.get('link', '')
-                title = item.get('title', '')
-                snippet = item.get('snippet', '')
+            # Process URLs with unified approach - scrape once, validate once, screenshot once
+            # Do NOT mark URLs yet - only mark the ones that actually succeed
+            result = await url_processor.process_urls_for_research(
+                collected_urls, research_topic, target_count=3
+            )
+            
+            # CRITICAL: Only mark the URLs that actually made it to the final research design
+            if result['processed_urls']:
+                for successful_url in result['processed_urls']:
+                    url_processor.mark_research_url_processed(successful_url)
+                    logger.info(f"🔬 Marked successful research URL: {successful_url}")
+            
+            # Store results in session
+            if hasattr(self, '_current_session') and self._current_session:
+                session = self._current_session
+                if session.research_screenshots is None:
+                    session.research_screenshots = []
                 
-                # Check if it looks like legitimate research
-                if self._is_legitimate_research_source(link, title, snippet):
-                    research_links.append({
-                        'title': title,
-                        'link': link,
-                        'snippet': snippet
-                    })
-                    
-                    if len(research_links) >= 3:
-                        break
+                if result['screenshots']:
+                    session.research_screenshots.extend(result['screenshots'])
+                    logger.info(f"Stored {len(result['screenshots'])} research screenshots")
             
-            if not research_links:
-                return ""
-            
-            # Scrape and summarize the research links
-            research_summaries = []
-            for research in research_links:
-                try:
-                    # Scrape the content
-                    content = await self._scrape_page_content(research['link'])
-                    if content and len(content) > 300:  # Lower threshold
-                        # Summarize the research (one line only)
-                        summary = await self._summarize_research_content(content, research['title'])
-                        research_summaries.append({
-                            'title': research['title'],
-                            'link': research['link'],
-                            'summary': summary
-                        })
-                    else:
-                        # Use snippet if content scraping fails
-                        research_summaries.append({
-                            'title': research['title'],
-                            'link': research['link'],
-                            'summary': research['snippet'][:100] + "..." if len(research['snippet']) > 100 else research['snippet']
-                        })
-                except Exception as e:
-                    logger.warning(f"Failed to process research link {research['link']}: {e}")
-                    # Use snippet as fallback
-                    research_summaries.append({
-                        'title': research['title'],
-                        'link': research['link'],
-                        'summary': research['snippet'][:100] + "..." if len(research['snippet']) > 100 else research['snippet']
-                    })
-                    continue
-            
-            # Format the research findings - SIMPLIFIED FORMAT
-            if research_summaries:
+            # Format output
+            if result['research_summaries']:
                 formatted_research = []
-                for i, research in enumerate(research_summaries, 1):
-                    # Truncate title if too long
-                    title = research['title']
-                    if len(title) > 60:
-                        title = title[:60] + "..."
-                    
-                    formatted_research.append(f"{i}. **[{title}]({research['link']})** - {research['summary']}")
-                
+                for i, research in enumerate(result['research_summaries'], 1):
+                    formatted_research.append(
+                        f"{i}. **[{research['domain']}]({research['url']})** - {research['summary']}"
+                    )
                 return "\n".join(formatted_research)
             
             return ""
             
         except Exception as e:
-            logger.error(f"Error searching for related research: {e}")
+            logger.error(f"Error in research search: {e}")
             return ""
 
     def _is_legitimate_research_source(self, url: str, title: str, snippet: str) -> bool:
@@ -1893,17 +2496,28 @@ GENERATE {num_needed} SURVEY QUESTIONS:
             return "Unable to generate research design automatically. Please review your inputs manually."
     
     async def _handle_design_review(self, session_id: str, user_input: str) -> str:
-        """Handle user response during design review and save approved content"""
+        """Handle user response during design review with research slideshow support"""
         session = self.active_sessions[session_id]
         response = user_input.upper().strip()
         
         if response == 'Y':
-            # SAVE the approved research design for later use in export
-            if hasattr(session, '__dict__'):
-                # Get the research design that was shown to user
-                research_design = await self._generate_research_design_with_motivation(session)
-                session.__dict__['saved_research_design'] = research_design
-                logger.info("Saved approved research design for export")
+            # # SAVE the approved research design for later use in export
+            # if hasattr(session, '__dict__'):
+            #     research_design = await self._generate_research_design_with_motivation(session)
+            #     session.__dict__['saved_research_design'] = research_design
+            #     logger.info("Saved approved research design for export")
+            
+            # Check if we have research screenshots to merge with main slideshow - FIXED
+            if session.research_screenshots and len(session.research_screenshots) > 0:
+                logger.info(f"Research design includes {len(session.research_screenshots)} research screenshots")
+                
+                # Initialize main screenshots list if it doesn't exist - FIXED
+                if session.screenshots is None:
+                    session.screenshots = []
+                
+                # Add research screenshots to main slideshow - FIXED
+                session.screenshots.extend(session.research_screenshots)
+                logger.info(f"Merged research screenshots. Total screenshots: {len(session.screenshots)}")
             
             session.stage = ResearchStage.DATABASE_SEARCH
             return await self._search_database(session)
@@ -2044,8 +2658,27 @@ GENERATE {num_needed} SURVEY QUESTIONS:
             return False
 
     async def _search_database(self, session: ResearchDesign) -> str:
-        """Search internet and present questions for selection with UI data"""
+        """Search internet and present questions for selection with UI data - FIXED to exclude research URLs"""
         try:
+            # IMPORTANT: Get URL processor and ensure research URLs are properly tracked
+            url_processor = self._get_url_processor()
+            
+            # CRITICAL FIX: If we have research screenshots, mark those URLs as processed for research
+            if hasattr(session, 'research_screenshots') and session.research_screenshots:
+                for screenshot in session.research_screenshots:
+                    research_url = screenshot.get('url')
+                    if research_url:
+                        url_processor.mark_research_url_processed(research_url)
+                        logger.info(f"🔒 Marked research URL as processed: {research_url}")
+            
+            # Additional safety: Check for any cached research content and mark those URLs too
+            if hasattr(url_processor, 'content_cache'):
+                for cached_url in list(url_processor.content_cache.keys()):
+                    if url_processor.is_url_already_processed_for_research(cached_url):
+                        logger.info(f"🔒 Research URL already in cache: {cached_url}")
+                        continue
+            
+            # Now start fresh internet search with completely different URLs
             extracted_questions, sources, screenshots = await self._search_internet_for_questions(
                 session.research_topic, session.target_population, session
             )
@@ -2082,7 +2715,18 @@ GENERATE {num_needed} SURVEY QUESTIONS:
             # Store other session data
             session.internet_questions = [q['question'] for q in session.selected_questions_pool]
             session.internet_sources = sources
-            session.screenshots = screenshots
+            
+            # Handle screenshots properly - DON'T mix with research screenshots
+            if screenshots:
+                # Initialize internet-only screenshots list if None
+                if session.screenshots is None:
+                    session.screenshots = []
+                
+                # IMPORTANT: Only add NEW internet search screenshots (not research screenshots)
+                # Research screenshots are already stored separately in session.research_screenshots
+                session.screenshots.extend(screenshots)
+                logger.info(f"Added {len(screenshots)} INTERNET SEARCH screenshots. Total: {len(session.screenshots)}")
+            
             session.extracted_questions_with_sources = session.selected_questions_pool
             
             # Move to selection stage
@@ -2104,6 +2748,14 @@ GENERATE {num_needed} SURVEY QUESTIONS:
             
             currently_selected_count = len(session.user_selected_questions)
             remaining_selections = session.max_selectable_questions - currently_selected_count
+            
+            # Log URL separation for debugging
+            research_urls = url_processor.processed_research_urls
+            internet_urls = url_processor.processed_internet_urls
+            logger.info(f"📊 URL Tracking Status:")
+            logger.info(f"  - Research URLs tracked: {len(research_urls)}")
+            logger.info(f"  - Internet URLs tracked: {len(internet_urls)}")
+            logger.info(f"  - No overlap should exist between these sets")
             
             # Add a special marker for the frontend to detect
             response_text = f"""🔍 **Questions Found - Please Select (Batch {current_batch}/{(total_collected + 5) // 6})**
@@ -2657,7 +3309,8 @@ Please enter question numbers separated by spaces.
             
             # FIX: Update session screenshots with new screenshots from this batch
             if new_screenshots:
-                if not hasattr(session, 'screenshots') or session.screenshots is None:
+                # Initialize screenshots list if None - FIXED
+                if session.screenshots is None:
                     session.screenshots = []
                 
                 # Add new screenshots to the existing slideshow
@@ -2679,13 +3332,13 @@ Please enter question numbers separated by spaces.
 
     Found {len(new_unique_questions)} NEW unique questions from {len(new_screenshots) if new_screenshots else 0} additional websites:
 
-    📸 **Slideshow Updated**: Added {len(new_screenshots) if new_screenshots else 0} new screenshots (Total: {len(session.screenshots) if hasattr(session, 'screenshots') and session.screenshots else 0})
+    📸 **Slideshow Updated**: Added {len(new_screenshots) if new_screenshots else 0} new screenshots (Total: {len(session.screenshots) if session.screenshots else 0})
 
     **📊 Selection Status:**
     - **Currently selected:** {total_selected}/{session.max_selectable_questions}
     - **Remaining selections:** {remaining_selections}
     - **Total questions in pool:** {len(session.selected_questions_pool)}
-    - **Total websites browsed:** {len(session.screenshots) if hasattr(session, 'screenshots') and session.screenshots else 0}
+    - **Total websites browsed:** {len(session.screenshots) if session.screenshots else 0}
 
     Use the checkboxes in the interface to select from all {len(session.selected_questions_pool)} available questions.
 
@@ -5324,7 +5977,7 @@ class OpenManusUI:
                 )
 
     async def process_message(self, user_message: str, session_id: str = "default", action_type: str = None):
-        """Process a user message via WebSocket with enhanced screenshot validation."""
+        """Process a user message via WebSocket with research screenshot detection"""
         try:
             if not self.agent:
                 await self.broadcast_message("error", {"message": "Agent not initialized"})
@@ -5334,10 +5987,155 @@ class OpenManusUI:
             if session_id in self.research_workflow.active_sessions:
                 session = self.research_workflow.active_sessions[session_id]
                 
-                # ENHANCED: Handle initial search (Y response) with slideshow
-                if session.stage == ResearchStage.DESIGN_REVIEW and user_message.upper().strip() == 'Y':
+                # ENHANCED: Handle design input completion (when research design is generated)
+                if (session.stage == ResearchStage.DESIGN_INPUT and 
+                    hasattr(session, 'user_responses') and
+                    session.user_responses is not None and
+                    'target_population' not in session.user_responses):
+                    
                     try:
-                        # Process the research input which will capture screenshots of found URLs
+                        # This is the final design input step - process it
+                        response = await self.research_workflow.process_research_input(session_id, user_message)
+                        
+                        # AFTER processing, check if research screenshots were generated
+                        if (hasattr(session, '__dict__') and 
+                            session.__dict__.get('has_research_screenshots', False)):
+                            
+                            research_screenshots = getattr(session, 'research_screenshots', None) or []
+                            if research_screenshots:
+                                logger.info(f"Broadcasting research design screenshots: {len(research_screenshots)} screenshots")
+                                
+                                # Send research slideshow data to frontend
+                                await self.broadcast_message("slideshow_data", {
+                                    "screenshots": research_screenshots,
+                                    "total_count": len(research_screenshots),
+                                    "research_topic": getattr(session, 'research_topic', 'Research Topic'),
+                                    "is_research_phase": True,
+                                    "phase_name": "Research Design - Related Studies"
+                                })
+                                
+                                # Send the first research screenshot to browser view
+                                if research_screenshots:
+                                    await self.broadcast_message("browser_state", {
+                                        "base64_image": research_screenshots[0]['screenshot'],
+                                        "url": research_screenshots[0]['url'],
+                                        "title": research_screenshots[0]['title'],
+                                        "source_url": research_screenshots[0]['url']
+                                    })
+                        
+                        # Send the main response
+                        await self.broadcast_message("agent_message", {
+                            "content": response,
+                            "action_type": UserAction.BUILD_QUESTIONNAIRE.value,
+                            "session_id": session_id
+                        })
+                        return
+                        
+                    except Exception as e:
+                        logger.warning(f"Could not process design input with research screenshots: {e}")
+                
+                # ENHANCED: Handle research design approval (Y response) with research slideshow
+                elif (session.stage == ResearchStage.DESIGN_REVIEW and 
+                    user_message.upper().strip() == 'Y'):
+                    try:
+                        # Process the research input which will capture research screenshots
+                        response = await self.research_workflow.process_research_input(session_id, user_message)
+                        
+                        # Check if we have research screenshots to display FIRST
+                        research_screenshots = getattr(session, 'research_screenshots', None)
+                        if research_screenshots:
+                            logger.info(f"Broadcasting research slideshow with {len(research_screenshots)} screenshots")
+                            
+                            # Send research slideshow data to frontend
+                            await self.broadcast_message("slideshow_data", {
+                                "screenshots": research_screenshots,
+                                "total_count": len(research_screenshots),
+                                "research_topic": getattr(session, 'research_topic', 'Research Topic'),
+                                "is_research_phase": True,  # Flag to indicate this is research phase
+                                "phase_name": "Research Design"
+                            })
+                            
+                            # Send the first research screenshot to browser view
+                            if research_screenshots:
+                                await self.broadcast_message("browser_state", {
+                                    "base64_image": research_screenshots[0]['screenshot'],
+                                    "url": research_screenshots[0]['url'],
+                                    "title": research_screenshots[0]['title'],
+                                    "source_url": research_screenshots[0]['url']
+                                })
+                        
+                        # After processing, check if we NOW have internet search screenshots too
+                        screenshots = getattr(session, 'screenshots', None)
+                        if screenshots:
+                            # Count research vs internet screenshots
+                            research_count = len(research_screenshots) if research_screenshots else 0
+                            total_count = len(screenshots)
+                            internet_count = total_count - research_count
+                            
+                            if internet_count > 0:
+                                logger.info(f"Broadcasting combined slideshow: {research_count} research + {internet_count} internet = {total_count} total")
+                                
+                                # Send combined slideshow data to frontend
+                                await self.broadcast_message("slideshow_data", {
+                                    "screenshots": screenshots,
+                                    "total_count": total_count,
+                                    "research_topic": getattr(session, 'research_topic', 'Research Topic'),
+                                    "is_combined_phase": True,  # Flag for combined research + internet
+                                    "research_count": research_count,
+                                    "internet_count": internet_count
+                                })
+                                
+                                # Show the first internet search screenshot (if available)
+                                if internet_count > 0:
+                                    first_internet_index = research_count  # First internet screenshot
+                                    if first_internet_index < len(screenshots):
+                                        await self.broadcast_message("browser_state", {
+                                            "base64_image": screenshots[first_internet_index]['screenshot'],
+                                            "url": screenshots[first_internet_index]['url'],
+                                            "title": screenshots[first_internet_index]['title'],
+                                            "source_url": screenshots[first_internet_index]['url']
+                                        })
+                        
+                        # Check for UI selection data AFTER processing
+                        ui_selection_data = None
+                        if (hasattr(session, '__dict__') and 
+                            'ui_selection_data' in session.__dict__ and
+                            session.__dict__.get('trigger_question_selection_ui', False)):
+                            
+                            ui_selection_data = session.__dict__['ui_selection_data']
+                            session.__dict__['trigger_question_selection_ui'] = False
+                            logger.info(f"Broadcasting UI selection data with {len(ui_selection_data.get('questions', []))} questions")
+                        
+                        # Send the main response with UI selection data if available
+                        message_data = {
+                            "content": response,
+                            "action_type": UserAction.BUILD_QUESTIONNAIRE.value,
+                            "session_id": session_id
+                        }
+                        
+                        # Add UI selection data if available
+                        if ui_selection_data:
+                            message_data["ui_selection_data"] = ui_selection_data
+                            message_data["show_question_selection"] = True
+                            logger.info("Added UI selection data to agent message")
+                        
+                        await self.broadcast_message("agent_message", message_data)
+                        return
+                        
+                    except Exception as e:
+                        logger.warning(f"Could not process research design approval with slideshow: {e}")
+                
+                # ENHANCED: Handle initial search (after research design) with slideshow
+                elif session.stage == ResearchStage.DATABASE_SEARCH and not hasattr(session, '_database_search_started'):
+                    try:
+                        # Mark that database search has started to avoid duplicate processing
+                        session._database_search_started = True
+                        
+                        # Store screenshots count before search
+                        screenshots = getattr(session, 'screenshots', None)
+                        old_screenshot_count = len(screenshots) if screenshots else 0
+                        
+                        # Process the search which will capture screenshots of found URLs
                         response = await self.research_workflow.process_research_input(session_id, user_message)
                         
                         # Check for UI selection data AFTER processing
@@ -5350,25 +6148,35 @@ class OpenManusUI:
                             session.__dict__['trigger_question_selection_ui'] = False
                             logger.info(f"Broadcasting UI selection data with {len(ui_selection_data.get('questions', []))} questions")
                         
-                        # After processing, check if we have screenshots to display
-                        if hasattr(session, 'screenshots') and session.screenshots:
-                            logger.info(f"Broadcasting initial slideshow with {len(session.screenshots)} screenshots")
+                        # After processing, check if we have NEW screenshots to display
+                        screenshots_after = getattr(session, 'screenshots', None)
+                        if screenshots_after:
+                            new_screenshot_count = len(screenshots_after)
+                            new_screenshots_added = new_screenshot_count - old_screenshot_count
                             
-                            # Send slideshow data to frontend
-                            await self.broadcast_message("slideshow_data", {
-                                "screenshots": session.screenshots,
-                                "total_count": len(session.screenshots),
-                                "research_topic": session.research_topic
-                            })
-                            
-                            # Also send the first screenshot to browser view
-                            if session.screenshots:
-                                await self.broadcast_message("browser_state", {
-                                    "base64_image": session.screenshots[0]['screenshot'],
-                                    "url": session.screenshots[0]['url'],
-                                    "title": session.screenshots[0]['title'],
-                                    "source_url": session.screenshots[0]['url']
+                            if new_screenshots_added > 0:
+                                logger.info(f"Broadcasting initial internet search slideshow with {new_screenshots_added} new screenshots")
+                                
+                                # Send slideshow data to frontend
+                                await self.broadcast_message("slideshow_data", {
+                                    "screenshots": screenshots_after,
+                                    "total_count": len(screenshots_after),
+                                    "research_topic": getattr(session, 'research_topic', 'Research Topic'),
+                                    "is_update": old_screenshot_count > 0,  # True if this is an update
+                                    "new_screenshots_added": new_screenshots_added
                                 })
+                                
+                                # Also send the first NEW screenshot to browser view
+                                if screenshots_after and new_screenshots_added > 0:
+                                    # Show the first new screenshot (skip research screenshots if any)
+                                    first_new_index = old_screenshot_count
+                                    if first_new_index < len(screenshots_after):
+                                        await self.broadcast_message("browser_state", {
+                                            "base64_image": screenshots_after[first_new_index]['screenshot'],
+                                            "url": screenshots_after[first_new_index]['url'],
+                                            "title": screenshots_after[first_new_index]['title'],
+                                            "source_url": screenshots_after[first_new_index]['url']
+                                        })
                         
                         # Send the main response with UI selection data if available
                         message_data = {
@@ -5393,7 +6201,8 @@ class OpenManusUI:
                 elif session.stage == ResearchStage.DECISION_POINT and user_message.upper().strip() == 'R':
                     try:
                         # Store screenshots count before rebrowse
-                        old_screenshot_count = len(session.screenshots) if hasattr(session, 'screenshots') and session.screenshots else 0
+                        screenshots = getattr(session, 'screenshots', None)
+                        old_screenshot_count = len(screenshots) if screenshots else 0
                         
                         # Process the rebrowse which will capture additional screenshots
                         response = await self.research_workflow.process_research_input(session_id, user_message)
@@ -5409,28 +6218,32 @@ class OpenManusUI:
                             logger.info(f"Broadcasting updated UI selection data with {len(ui_selection_data.get('questions', []))} questions")
                         
                         # After processing, check if we have updated screenshots to display
-                        if hasattr(session, 'screenshots') and session.screenshots:
-                            new_screenshot_count = len(session.screenshots)
-                            logger.info(f"Broadcasting updated slideshow: {old_screenshot_count} -> {new_screenshot_count} screenshots")
+                        screenshots_after = getattr(session, 'screenshots', None)
+                        if screenshots_after:
+                            new_screenshot_count = len(screenshots_after)
+                            new_screenshots_added = new_screenshot_count - old_screenshot_count
                             
-                            # Send updated slideshow data to frontend
-                            await self.broadcast_message("slideshow_data", {
-                                "screenshots": session.screenshots,
-                                "total_count": len(session.screenshots),
-                                "research_topic": session.research_topic,
-                                "is_update": True,  # Flag to indicate this is an update
-                                "new_screenshots_added": new_screenshot_count - old_screenshot_count
-                            })
-                            
-                            # Send the most recent screenshot to browser view (last added)
-                            if session.screenshots:
-                                latest_screenshot = session.screenshots[-1]  # Get the last (newest) screenshot
-                                await self.broadcast_message("browser_state", {
-                                    "base64_image": latest_screenshot['screenshot'],
-                                    "url": latest_screenshot['url'],
-                                    "title": latest_screenshot['title'],
-                                    "source_url": latest_screenshot['url']
+                            if new_screenshots_added > 0:
+                                logger.info(f"Broadcasting updated slideshow: {old_screenshot_count} -> {new_screenshot_count} screenshots (+{new_screenshots_added})")
+                                
+                                # Send updated slideshow data to frontend
+                                await self.broadcast_message("slideshow_data", {
+                                    "screenshots": screenshots_after,
+                                    "total_count": len(screenshots_after),
+                                    "research_topic": getattr(session, 'research_topic', 'Research Topic'),
+                                    "is_update": True,  # Flag to indicate this is an update
+                                    "new_screenshots_added": new_screenshots_added
                                 })
+                                
+                                # Send the most recent screenshot to browser view (last added)
+                                if screenshots_after and new_screenshots_added > 0:
+                                    latest_screenshot = screenshots_after[-1]  # Get the last (newest) screenshot
+                                    await self.broadcast_message("browser_state", {
+                                        "base64_image": latest_screenshot['screenshot'],
+                                        "url": latest_screenshot['url'],
+                                        "title": latest_screenshot['title'],
+                                        "source_url": latest_screenshot['url']
+                                    })
                         
                         # Send the main response with UI selection data if available
                         message_data = {
@@ -5453,10 +6266,12 @@ class OpenManusUI:
                 
                 # ENHANCED: Handle question selection responses that might trigger more rebrowsing
                 elif (session.stage == ResearchStage.DECISION_POINT and 
-                    hasattr(session, 'awaiting_selection') and session.awaiting_selection):
+                    hasattr(session, 'awaiting_selection') and 
+                    getattr(session, 'awaiting_selection', False)):
                     try:
                         # Store screenshots count before processing selection
-                        old_screenshot_count = len(session.screenshots) if hasattr(session, 'screenshots') and session.screenshots else 0
+                        screenshots = getattr(session, 'screenshots', None)
+                        old_screenshot_count = len(screenshots) if screenshots else 0
                         
                         # Process the selection input
                         response = await self.research_workflow.process_research_input(session_id, user_message)
@@ -5472,24 +6287,26 @@ class OpenManusUI:
                             logger.info(f"Broadcasting selection UI data with {len(ui_selection_data.get('questions', []))} questions")
                         
                         # Check if screenshots were updated during selection processing
-                        if hasattr(session, 'screenshots') and session.screenshots:
-                            new_screenshot_count = len(session.screenshots)
+                        screenshots_after = getattr(session, 'screenshots', None)
+                        if screenshots_after:
+                            new_screenshot_count = len(screenshots_after)
                             
                             # If new screenshots were added, update the slideshow
                             if new_screenshot_count > old_screenshot_count:
-                                logger.info(f"Selection processing added screenshots: {old_screenshot_count} -> {new_screenshot_count}")
+                                new_screenshots_added = new_screenshot_count - old_screenshot_count
+                                logger.info(f"Selection processing added screenshots: {old_screenshot_count} -> {new_screenshot_count} (+{new_screenshots_added})")
                                 
                                 await self.broadcast_message("slideshow_data", {
-                                    "screenshots": session.screenshots,
-                                    "total_count": len(session.screenshots),
-                                    "research_topic": session.research_topic,
+                                    "screenshots": screenshots_after,
+                                    "total_count": len(screenshots_after),
+                                    "research_topic": getattr(session, 'research_topic', 'Research Topic'),
                                     "is_update": True,
-                                    "new_screenshots_added": new_screenshot_count - old_screenshot_count
+                                    "new_screenshots_added": new_screenshots_added
                                 })
                                 
                                 # Update browser view with latest screenshot
-                                if session.screenshots:
-                                    latest_screenshot = session.screenshots[-1]
+                                if screenshots_after:
+                                    latest_screenshot = screenshots_after[-1]
                                     await self.broadcast_message("browser_state", {
                                         "base64_image": latest_screenshot['screenshot'],
                                         "url": latest_screenshot['url'],
@@ -5642,7 +6459,7 @@ class OpenManusUI:
         except asyncio.TimeoutError:
             await self.broadcast_message("agent_message", {
                 "content": "I apologize, but the request timed out. Please try a simpler question.",
-                "action_type": action_type
+                "action_type": action_type if 'action_type' in locals() else None
             })
         except Exception as e:
             logger.error(f"Error processing message: {str(e)}", exc_info=True)

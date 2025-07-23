@@ -152,8 +152,8 @@ class HuggingFaceClient:
 
     def _get_model_path(self) -> str:
         """Get the local path of the model."""
-        # Use the ephemeral directory for model storage
-        cache_dir = "/ephemeral/.cache/huggingface"
+        # Use persistent storage for model caching
+        cache_dir = "/mnt/data/browseragent_llm"
         model_dir = os.path.join(
             cache_dir,
             f"models--{self.model_name.replace('/', '--')}"
@@ -206,7 +206,7 @@ class HuggingFaceClient:
                 "do_sample": temperature > 0.0,
                 "pad_token_id": self.tokenizer.eos_token_id,
                 "eos_token_id": self.tokenizer.eos_token_id,
-                "use_cache": True
+                "use_cache": False
             }
             
             if temperature > 0.0:

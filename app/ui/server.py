@@ -5637,7 +5637,7 @@ class OpenManusUI:
                 config = config_instance._config
                 
                 llm_instance = LLM(
-                    model_name="Qwen/Qwen-7B-Chat",  # switched to chat model
+                    model_name="microsoft/Phi-3.5-mini-instruct",  # switched to chat model
                     api_type="huggingface",
                     use_auth_token=True
                 )

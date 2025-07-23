@@ -79,14 +79,15 @@ playwright install-deps
 # Add the project root to PYTHONPATH
 export PYTHONPATH=$PYTHONPATH:$(pwd)
 
-# Set ownership of /ephemeral to the current user
-echo "Setting ownership of /ephemeral..."
-sudo chown -R $(whoami):$(whoami) /ephemeral
+# Set ownership of /mnt/data/browseragent_llm to current user
+echo "Creating and setting ownership of /mnt/data/browseragent_llm..."
+sudo mkdir -p /mnt/data/browseragent_llm
+sudo chown -R $(whoami):$(whoami) /mnt/data/browseragent_llm
 
 # Set HF_HOME environment variable for model downloads
-export HF_HOME="/ephemeral/.cache/huggingface"
+export HF_HOME="/mnt/data/browseragent_llm"
 
-# Download models
+# Download models   
 echo "Downloading models..."
 python scripts/download_models.py
 

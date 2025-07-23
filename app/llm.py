@@ -48,7 +48,9 @@ MULTIMODAL_MODELS = [
 
 # Add HuggingFace models
 HUGGINGFACE_MODELS = [
-    "Qwen/Qwen-7B-Chat",
+    # "Qwen/Qwen-7B-Chat",
+    "microsoft/Phi-3.5-mini-instruct",
+    "Qwen/Qwen2.5-72B-Instruct",
     "Salesforce/blip2-flan-t5-xl"
 ]
 

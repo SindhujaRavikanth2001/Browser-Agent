@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
+import { Portal } from '@mui/material';
 import {
   Box,
   Typography,
@@ -35,6 +36,10 @@ import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import PauseIcon from '@mui/icons-material/Pause';
 import GetAppIcon from '@mui/icons-material/GetApp';
 import RefreshIcon from '@mui/icons-material/Refresh';
+import VolumeUpIcon from '@mui/icons-material/VolumeUp';
+import VolumeOffIcon from '@mui/icons-material/VolumeOff';
+import MusicNoteIcon from '@mui/icons-material/MusicNote';
+import Slider from '@mui/material/Slider';
 import './App.css';
 
 // TypeScript declarations for Speech Recognition API
@@ -73,11 +78,11 @@ interface SpeechRecognition extends EventTarget {
   maxAlternatives: number;
   serviceURI: string;
   grammars: any;
-  
+
   start(): void;
   stop(): void;
   abort(): void;
-  
+
   onstart: ((this: SpeechRecognition, ev: Event) => any) | null;
   onresult: ((this: SpeechRecognition, ev: SpeechRecognitionEvent) => any) | null;
   onerror: ((this: SpeechRecognition, ev: SpeechRecognitionErrorEvent) => any) | null;
@@ -163,6 +168,35 @@ type UISelectionData = {
   total_count: number;
 };
 
+const MUSIC_TRACKS = {
+  thinking: {
+    url: '/music/thinking-ambient.mp3',
+    name: 'AI Thinking',
+    icon: '🤖',
+    volume: 1.0
+  },
+  research: {
+    url: '/music/research-electronica.mp3',
+    name: 'Research Mode',
+    icon: '🔬',
+    volume: 1.0
+  },
+  processing: {
+    url: '/music/data-processing.mp3',
+    name: 'Processing Data',
+    icon: '⚡',
+    volume: 1.0
+  },
+  browsing: {
+    url: '/music/web-browsing.mp3',
+    name: 'Web Browsing',
+    icon: '🌐',
+    volume: 1.0
+  }
+};
+
+type MusicTrackType = keyof typeof MUSIC_TRACKS;
+
 function App() {
   const theme = useTheme();
   const [socket, setSocket] = useState<WebSocket | null>(null);
@@ -199,9 +233,9 @@ function App() {
   const [availableFiles, setAvailableFiles] = useState<DownloadFile[]>([]);
   const [showDownloadPanel, setShowDownloadPanel] = useState(false);
   const [downloadLoading, setDownloadLoading] = useState(false);
-  const [downloadNotification, setDownloadNotification] = useState({ 
-    open: false, 
-    message: '', 
+  const [downloadNotification, setDownloadNotification] = useState({
+    open: false,
+    message: '',
     severity: 'success' as 'success' | 'error' | 'warning' | 'info'
   });
 
@@ -210,16 +244,68 @@ function App() {
   const [selectedQuestionIds, setSelectedQuestionIds] = useState<Set<string>>(new Set());
   const [showQuestionSelection, setShowQuestionSelection] = useState(false);
   const [selectionMode, setSelectionMode] = useState<'initial' | 'rebrowse'>('initial');
-  
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const actionsEndRef = useRef<HTMLDivElement>(null);
   const browserEndRef = useRef<HTMLDivElement>(null);
+
+  // Music state
+  const [isMusicEnabled, setIsMusicEnabled] = useState(() => {
+    const saved = localStorage.getItem('musicEnabled');
+    return saved !== null ? JSON.parse(saved) : true;
+  });
+  const [currentTrack, setCurrentTrack] = useState<MusicTrackType>('thinking');
+  const [isPlayingMusic, setIsPlayingMusic] = useState(false);
+  const [musicVolume, setMusicVolume] = useState(() => {
+    const saved = localStorage.getItem('musicVolume');
+    return saved !== null ? parseFloat(saved) : 0.3;
+  });
+  const [showMusicSettings, setShowMusicSettings] = useState(false);
+  const musicRefs = useRef<{ [K in MusicTrackType]: HTMLAudioElement | null }>({
+    thinking: null,
+    research: null,
+    processing: null,
+    browsing: null
+  });
+  const [musicButtonRef, setMusicButtonRef] = useState<HTMLElement | null>(null);
 
   // Update voiceInputRef whenever voiceInput changes
   useEffect(() => {
     voiceInputRef.current = voiceInput;
   }, [voiceInput]);
 
+  // Save music preferences to localStorage
+  useEffect(() => {
+    localStorage.setItem('musicEnabled', JSON.stringify(isMusicEnabled));
+  }, [isMusicEnabled]);
+
+  useEffect(() => {
+  const timeoutId = setTimeout(() => {
+    localStorage.setItem('musicVolume', musicVolume.toString());
+  }, 300); // Save to localStorage 300ms after user stops changing volume
+
+  return () => clearTimeout(timeoutId);
+}, [musicVolume]);
+
+  useEffect(() => {
+  if (isLoading && isMusicEnabled) {
+    // Start thinking music when loading begins
+    playBackgroundMusic('thinking');
+  } else if (!isLoading || !isMusicEnabled) {
+    // Stop music when loading ends OR when music is disabled
+    if (isPlayingMusic) {
+      fadeOutMusic(1000);
+    }
+  }
+}, [isLoading, isMusicEnabled, isPlayingMusic]);
+  useEffect(() => {
+    if (isPlayingMusic) {
+      const currentAudio = musicRefs.current[currentTrack];
+      if (currentAudio) {
+        currentAudio.volume = musicVolume * MUSIC_TRACKS[currentTrack].volume;
+      }
+    }
+  }, [musicVolume, isPlayingMusic, currentTrack]);
   // Download functions
   const fetchAvailableFiles = async () => {
     try {
@@ -235,7 +321,7 @@ function App() {
     try {
       setDownloadLoading(true);
       const response = await fetch(`/api/download/${filename}`);
-      
+
       if (response.ok) {
         const blob = await response.blob();
         const url = window.URL.createObjectURL(blob);
@@ -247,7 +333,7 @@ function App() {
         a.click();
         window.URL.revokeObjectURL(url);
         document.body.removeChild(a);
-        
+
         // Show success notification
         showDownloadNotification(`Successfully downloaded: ${filename}`, 'success');
       } else {
@@ -266,12 +352,12 @@ function App() {
     try {
       setDownloadLoading(true);
       const response = await fetch(`/api/download-latest/${fileType}`);
-      
+
       if (response.ok) {
         const blob = await response.blob();
         const filename = response.headers.get('content-disposition')
           ?.split('filename=')[1]?.replace(/"/g, '') || `latest_${fileType}.txt`;
-        
+
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.style.display = 'none';
@@ -281,7 +367,7 @@ function App() {
         a.click();
         window.URL.revokeObjectURL(url);
         document.body.removeChild(a);
-        
+
         // Show success notification
         showDownloadNotification(`Successfully downloaded: ${filename}`, 'success');
       } else {
@@ -315,7 +401,7 @@ function App() {
   // Question selection functions
   const handleQuestionToggle = (questionId: string) => {
     const newSelected = new Set(selectedQuestionIds);
-    
+
     if (newSelected.has(questionId)) {
       newSelected.delete(questionId);
     } else {
@@ -326,44 +412,44 @@ function App() {
       }
       newSelected.add(questionId);
     }
-    
+
     setSelectedQuestionIds(newSelected);
   };
 
   const handleSelectAllFromSource = (sourceId: string) => {
     if (!uiSelectionData) return;
-    
+
     const source = uiSelectionData.sources.find(s => s.id === sourceId);
     if (!source) return;
-    
+
     const newSelected = new Set(selectedQuestionIds);
     let addedCount = 0;
-    
+
     for (const question of source.questions) {
       if (!newSelected.has(question.id) && newSelected.size + addedCount < 30) {
         newSelected.add(question.id);
         addedCount++;
       }
     }
-    
+
     if (addedCount === 0 && newSelected.size >= 30) {
       showDownloadNotification('Maximum 30 questions can be selected', 'warning');
     }
-    
+
     setSelectedQuestionIds(newSelected);
   };
 
   const handleDeselectAllFromSource = (sourceId: string) => {
     if (!uiSelectionData) return;
-    
+
     const source = uiSelectionData.sources.find(s => s.id === sourceId);
     if (!source) return;
-    
+
     const newSelected = new Set(selectedQuestionIds);
     for (const question of source.questions) {
       newSelected.delete(question.id);
     }
-    
+
     setSelectedQuestionIds(newSelected);
   };
 
@@ -379,14 +465,14 @@ function App() {
 
     // Send selection via WebSocket or HTTP
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ 
+      socket.send(JSON.stringify({
         content: JSON.stringify(selectionData)
       }));
     } else {
       fetch('/api/message', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
+        body: JSON.stringify({
           content: JSON.stringify(selectionData)
         })
       });
@@ -428,21 +514,110 @@ function App() {
         body: JSON.stringify({ content: 'Rebrowse' })
       });
     }
-    
+
     setSelectionMode('rebrowse');
     setIsLoading(true);
     // Keep the selection panel open to show new questions when they arrive
   };
 
+  // Music control functions
+  const playBackgroundMusic = (trackType: MusicTrackType = 'thinking') => {
+    if (!isMusicEnabled) return;
+
+    // Stop any currently playing track
+    stopBackgroundMusic();
+
+    const audioRef = musicRefs.current[trackType];
+    if (audioRef) {
+      audioRef.volume = musicVolume * MUSIC_TRACKS[trackType].volume;
+      audioRef.play().catch(console.error);
+      setIsPlayingMusic(true);
+      setCurrentTrack(trackType);
+      console.log(`🎵 Playing ${MUSIC_TRACKS[trackType].name} music`);
+    }
+  };
+  const updateVolumeRealTime = (newVolume: number) => {
+  setMusicVolume(newVolume);
+  
+  // If music is currently playing, update the volume immediately
+  if (isPlayingMusic) {
+    const currentAudio = musicRefs.current[currentTrack];
+    if (currentAudio) {
+      currentAudio.volume = newVolume * MUSIC_TRACKS[currentTrack].volume;
+    }
+  }
+};
+  const stopBackgroundMusic = () => {
+    Object.values(musicRefs.current).forEach(audio => {
+      if (audio) {
+        audio.pause();
+        audio.currentTime = 0;
+      }
+    });
+    setIsPlayingMusic(false);
+    console.log('🎵 Music stopped');
+  };
+
+  const fadeOutMusic = (duration: number = 1000) => {
+    const currentAudio = musicRefs.current[currentTrack];
+    if (!currentAudio || !isPlayingMusic) return;
+
+    const startVolume = currentAudio.volume;
+    const fadeSteps = 20;
+    const stepTime = duration / fadeSteps;
+    const volumeStep = startVolume / fadeSteps;
+
+    let currentStep = 0;
+
+    const fadeInterval = setInterval(() => {
+      currentStep++;
+      currentAudio.volume = Math.max(0, startVolume - (volumeStep * currentStep));
+
+      if (currentStep >= fadeSteps) {
+        clearInterval(fadeInterval);
+        stopBackgroundMusic();
+      }
+    }, stepTime);
+  };
+
+  const getMusicContextFromMessage = (message: string, agentAction?: string): MusicTrackType => {
+    const msgLower = message.toLowerCase();
+    const actionLower = agentAction?.toLowerCase() || '';
+
+    if (msgLower.includes('research') || msgLower.includes('study') || msgLower.includes('questionnaire')) {
+      return 'research';
+    }
+
+    if (actionLower.includes('browser') || msgLower.includes('http') || msgLower.includes('website')) {
+      return 'browsing';
+    }
+
+    if (actionLower.includes('tool') || actionLower.includes('processing')) {
+      return 'processing';
+    }
+
+    return 'thinking';
+  };
+
+  const toggleMusicEnabled = () => {
+  const newMusicEnabled = !isMusicEnabled;
+  setIsMusicEnabled(newMusicEnabled);
+  
+  // If disabling music and it's currently playing, stop it immediately
+  if (!newMusicEnabled && isPlayingMusic) {
+    stopBackgroundMusic();
+  }
+};
+
   // Initialize Speech Recognition
   useEffect(() => {
     // Check if Speech Recognition is supported
     const SpeechRecognitionClass = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    
+
     if (SpeechRecognitionClass) {
       setSpeechSupported(true);
       console.log('Speech Recognition is supported');
-      
+
       // Pre-request microphone permission on component mount
       if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
         navigator.mediaDevices.getUserMedia({ audio: true })
@@ -462,9 +637,9 @@ function App() {
   // Create recognition instance when needed
   const createRecognition = () => {
     const SpeechRecognitionClass = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    
+
     if (!SpeechRecognitionClass) return null;
-    
+
     const recognition = new SpeechRecognitionClass() as SpeechRecognition;
     recognition.continuous = false;
     recognition.interimResults = true;
@@ -480,14 +655,14 @@ function App() {
 
     recognition.onresult = (event: SpeechRecognitionEvent) => {
       let finalTranscript = '';
-      
+
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i];
         if (result.isFinal) {
           finalTranscript += result[0].transcript;
         }
       }
-      
+
       if (finalTranscript) {
         console.log('Final transcript:', finalTranscript);
         const newVoiceInput = voiceInputRef.current + finalTranscript + ' ';
@@ -501,7 +676,7 @@ function App() {
       setIsListening(false);
       setIsInitializing(false);
       isListeningRef.current = false;
-      
+
       switch (event.error) {
         case 'network':
           setVoiceError('Network error. Please check your internet connection.');
@@ -531,12 +706,12 @@ function App() {
       setIsListening(false);
       setIsInitializing(false);
       isListeningRef.current = false;
-      
+
       // Use a small delay to ensure state updates are complete
       setTimeout(() => {
         const currentVoiceInput = voiceInputRef.current;
         console.log('Checking voice input on end:', currentVoiceInput);
-        
+
         if (currentVoiceInput && currentVoiceInput.trim()) {
           console.log('Showing voice review panel');
           setShowVoiceReview(true);
@@ -555,14 +730,14 @@ function App() {
       console.log('Already listening or initializing');
       return;
     }
-    
+
     console.log('Starting voice recognition...');
     setVoiceInput('');
     voiceInputRef.current = '';
     setVoiceError(null);
     setShowVoiceReview(false);
     setIsInitializing(true);
-    
+
     // Clean up any existing recognition
     if (recognitionRef.current) {
       try {
@@ -572,7 +747,7 @@ function App() {
       }
       recognitionRef.current = null;
     }
-    
+
     try {
       const recognition = createRecognition();
       if (!recognition) {
@@ -580,9 +755,9 @@ function App() {
         setIsInitializing(false);
         return;
       }
-      
+
       recognitionRef.current = recognition;
-      
+
       // Check microphone permission
       if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
         try {
@@ -608,9 +783,9 @@ function App() {
   // Stop voice recognition
   const stopListening = () => {
     if (!isListeningRef.current && !isInitializing) return;
-    
+
     setIsInitializing(false);
-    
+
     if (recognitionRef.current) {
       try {
         recognitionRef.current.stop();
@@ -643,10 +818,10 @@ function App() {
   // Slideshow control functions
   const nextSlide = () => {
     if (!slideshowData || slideshowData.screenshots.length === 0) return;
-    
+
     const nextIndex = (currentSlideIndex + 1) % slideshowData.screenshots.length;
     setCurrentSlideIndex(nextIndex);
-    
+
     const nextScreenshot = slideshowData.screenshots[nextIndex];
     setBrowserState(nextScreenshot.screenshot);
     setCurrentImageUrl(nextScreenshot.url);
@@ -655,12 +830,12 @@ function App() {
 
   const previousSlide = () => {
     if (!slideshowData || slideshowData.screenshots.length === 0) return;
-    
-    const prevIndex = currentSlideIndex === 0 
-      ? slideshowData.screenshots.length - 1 
+
+    const prevIndex = currentSlideIndex === 0
+      ? slideshowData.screenshots.length - 1
       : currentSlideIndex - 1;
     setCurrentSlideIndex(prevIndex);
-    
+
     const prevScreenshot = slideshowData.screenshots[prevIndex];
     setBrowserState(prevScreenshot.screenshot);
     setCurrentImageUrl(prevScreenshot.url);
@@ -686,7 +861,7 @@ function App() {
 
   const goToSlide = (index: number) => {
     if (!slideshowData || slideshowData.screenshots.length === 0) return;
-    
+
     setCurrentSlideIndex(index);
     const screenshot = slideshowData.screenshots[index];
     setBrowserState(screenshot.screenshot);
@@ -719,7 +894,7 @@ function App() {
     newSocket.onmessage = (event) => {
       const data = JSON.parse(event.data);
       console.log('Received message:', data);
-    
+
       if (data.type === 'connect') {
         console.log('Connection confirmed by server');
       } else if (data.type === 'agent_message') {
@@ -730,7 +905,7 @@ function App() {
         }]);
         setIsLoading(false);
         setActiveTab(0);
-        
+
         // Handle UI selection data
         if (data.ui_selection_data) {
           console.log('Received UI selection data:', data.ui_selection_data);
@@ -738,13 +913,13 @@ function App() {
           setShowQuestionSelection(true);
           setSelectionMode('initial');
         }
-        
+
         // Alternative: Check for UI selection trigger flag
         if (data.show_question_selection) {
           console.log('Received show_question_selection flag');
           setShowQuestionSelection(true);
         }
-        
+
         // Also check for UI selection trigger in message content
         if (data.content && data.content.includes('[UI_SELECTION_TRIGGER]')) {
           console.log('Detected UI selection trigger in message content');
@@ -755,7 +930,7 @@ function App() {
             setSelectionMode('initial');
           }
         }
-        
+
         // Handle screenshot in agent message response
         if (data.base64_image) {
           console.log('Received screenshot with agent message');
@@ -767,19 +942,19 @@ function App() {
         // NEW: Detect when research package is completed and files are generated
         if (data.content) {
           const content = data.content.toLowerCase();
-          
+
           // Check if this message indicates files were generated
-          if (content.includes('research package complete') || 
-              content.includes('exported to') || 
-              content.includes('package exported') ||
-              content.includes('research_outputs/')) {
-            
+          if (content.includes('research package complete') ||
+            content.includes('exported to') ||
+            content.includes('package exported') ||
+            content.includes('research_outputs/')) {
+
             // Show notification that files are ready for download
             showDownloadNotification(
               'Research files generated! Click the download button in the header to access them.',
               'success'
             );
-            
+
             // Automatically refresh available files
             setTimeout(() => {
               fetchAvailableFiles();
@@ -789,11 +964,11 @@ function App() {
       } else if (data.type === 'slideshow_data') {
         // ENHANCED: Handle slideshow data updates
         console.log('Received slideshow data:', data);
-        
+
         // If this is an update to existing slideshow
         if (data.is_update && slideshowData) {
           console.log(`Slideshow update: Added ${data.new_screenshots_added || 0} new screenshots`);
-          
+
           // Update existing slideshow data safely
           setSlideshowData(prevData => {
             if (!prevData) {
@@ -804,7 +979,7 @@ function App() {
                 research_topic: data.research_topic || ''
               };
             }
-            
+
             return {
               ...prevData,
               screenshots: data.screenshots || prevData.screenshots || [],
@@ -812,19 +987,19 @@ function App() {
               research_topic: data.research_topic || prevData.research_topic || ''
             };
           });
-          
+
           // Show a brief notification about the update
           if (data.new_screenshots_added > 0) {
             // You could add a toast notification here
             console.log(`✅ Added ${data.new_screenshots_added} new screenshots to slideshow`);
           }
-          
+
           // Don't reset slide index for updates - user might be viewing specific slides
           // But ensure index is valid
           if (currentSlideIndex >= (data.screenshots?.length || 0)) {
             setCurrentSlideIndex(Math.max(0, (data.screenshots?.length || 1) - 1));
           }
-          
+
         } else {
           // Initial slideshow setup
           console.log('Setting up initial slideshow with', data.screenshots?.length || 0, 'screenshots');
@@ -835,11 +1010,11 @@ function App() {
           });
           setCurrentSlideIndex(0);
         }
-        
+
         // Set the current screenshot (first for new, or maintain current for updates)
         if (data.screenshots && data.screenshots.length > 0) {
           let targetIndex = 0;
-          
+
           // For updates, stay on current slide if valid, or go to latest
           if (data.is_update && slideshowData) {
             if (currentSlideIndex < data.screenshots.length) {
@@ -848,7 +1023,7 @@ function App() {
               targetIndex = data.screenshots.length - 1; // Go to latest
             }
           }
-          
+
           const targetScreenshot = data.screenshots[targetIndex];
           if (targetScreenshot) {
             setBrowserState(targetScreenshot.screenshot);
@@ -857,7 +1032,7 @@ function App() {
             setCurrentSlideIndex(targetIndex);
           }
         }
-        
+
         // Handle UI selection data in slideshow updates
         if (data.ui_selection_data) {
           console.log('Received updated UI selection data with slideshow');
@@ -865,7 +1040,7 @@ function App() {
           setShowQuestionSelection(true);
           setSelectionMode('rebrowse');
         }
-        
+
       } else if (data.type === 'agent_message_stream_start') {
         setIsStreaming(true);
         setStreamingMessage('');
@@ -899,7 +1074,7 @@ function App() {
       } else if (data.type === 'browser_state') {
         console.log('Received browser state with image data length:',
           data.base64_image ? data.base64_image.length : 0);
-    
+
         if (data.base64_image && data.base64_image.length > 0) {
           setBrowserState(data.base64_image);
           setCurrentImageUrl(data.url || '');
@@ -939,15 +1114,15 @@ function App() {
   // Handle sending messages
   const sendMessage = () => {
     if (!input.trim()) return;
-  
+
     const newMessage: ChatMessage = {
       role: 'user',
       content: input,
       timestamp: Date.now()
     };
-  
+
     setMessages(prev => [...prev, newMessage]);
-  
+
     if (socket && socket.readyState === WebSocket.OPEN) {
       console.log('Sending message via WebSocket:', input);
       socket.send(JSON.stringify({ content: input }));
@@ -971,7 +1146,7 @@ function App() {
               }
             ]);
           }
-          
+
           // Handle UI selection data from HTTP API
           if (data.ui_selection_data) {
             console.log('Received UI selection data from HTTP API');
@@ -979,13 +1154,13 @@ function App() {
             setShowQuestionSelection(true);
             setSelectionMode('initial');
           }
-          
+
           // Also check for show_question_selection flag
           if (data.show_question_selection) {
             console.log('Received show_question_selection flag from HTTP API');
             setShowQuestionSelection(true);
           }
-          
+
           // Check for UI selection trigger in response content
           if (data.response && data.response.includes('[UI_SELECTION_TRIGGER]')) {
             console.log('Detected UI selection trigger in HTTP response');
@@ -995,14 +1170,14 @@ function App() {
               setSelectionMode('initial');
             }
           }
-          
+
           // Handle slideshow data from HTTP API
           if (data.slideshow_data) {
             console.log('Received slideshow data from HTTP API');
             setSlideshowData(data.slideshow_data);
             setCurrentSlideIndex(0);
           }
-          
+
           // Handle screenshot from HTTP API response
           if (data.base64_image) {
             console.log('Received screenshot from HTTP API');
@@ -1017,7 +1192,7 @@ function App() {
           setIsLoading(false);
         });
     }
-  
+
     setInput('');
     setIsLoading(true);
   };
@@ -1125,11 +1300,11 @@ function App() {
                         sx={{
                           fontSize: '0.7rem',
                           height: '18px',
-                          backgroundColor: file.type === 'research_package' 
+                          backgroundColor: file.type === 'research_package'
                             ? alpha(theme.palette.success.main, 0.1)
                             : file.type === 'chat_history'
-                            ? alpha(theme.palette.info.main, 0.1)
-                            : alpha(theme.palette.grey[500], 0.1)
+                              ? alpha(theme.palette.info.main, 0.1)
+                              : alpha(theme.palette.grey[500], 0.1)
                         }}
                       />
                       <Typography variant="caption" color="text.secondary">
@@ -1184,8 +1359,8 @@ function App() {
     >
       <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
         {/* Header */}
-        <Box sx={{ 
-          p: 3, 
+        <Box sx={{
+          p: 3,
           borderBottom: `1px solid ${theme.palette.divider}`,
           backgroundColor: alpha(theme.palette.background.paper, 0.9),
           flexShrink: 0
@@ -1206,7 +1381,7 @@ function App() {
               <CloseIcon />
             </IconButton>
           </Box>
-          
+
           <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
             <Typography variant="body2" color="text.secondary">
               Select up to 30 questions from the found research sources
@@ -1325,8 +1500,8 @@ function App() {
                         '&:hover': {
                           backgroundColor: alpha(theme.palette.primary.main, 0.02)
                         },
-                        borderBottom: questionIndex < source.questions.length - 1 
-                          ? `1px solid ${alpha(theme.palette.divider, 0.5)}` 
+                        borderBottom: questionIndex < source.questions.length - 1
+                          ? `1px solid ${alpha(theme.palette.divider, 0.5)}`
                           : 'none'
                       }}
                     >
@@ -1342,12 +1517,12 @@ function App() {
                         }}
                       />
                       <Box sx={{ flexGrow: 1 }}>
-                        <Typography 
-                          variant="body2" 
-                          sx={{ 
+                        <Typography
+                          variant="body2"
+                          sx={{
                             fontWeight: selectedQuestionIds.has(question.id) ? 600 : 400,
-                            color: selectedQuestionIds.has(question.id) 
-                              ? theme.palette.primary.main 
+                            color: selectedQuestionIds.has(question.id)
+                              ? theme.palette.primary.main
                               : theme.palette.text.primary
                           }}
                         >
@@ -1373,6 +1548,141 @@ function App() {
       </Box>
     </Drawer>
   );
+  // Music Settings Panel Component
+  const MusicSettingsPanel = () => {
+  if (!musicButtonRef || !showMusicSettings) return null;
+
+  const rect = musicButtonRef.getBoundingClientRect();
+  
+  return (
+    <Portal>
+      <Paper
+        elevation={8}
+        onClick={(e) => e.stopPropagation()} // Prevent clicks inside from bubbling
+        sx={{
+          position: 'fixed',
+          top: rect.bottom + 8,
+          right: window.innerWidth - rect.right,
+          minWidth: 280,
+          maxWidth: 320,
+          p: 2,
+          borderRadius: 2,
+          zIndex: 10000,
+          border: `1px solid ${alpha(theme.palette.divider, 0.2)}`,
+          backgroundColor: theme.palette.background.paper,
+          boxShadow: '0 8px 32px rgba(0, 0, 0, 0.12)'
+        }}
+      >
+        {/* Header with Close Button */}
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+          <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
+            Music Settings
+          </Typography>
+          <IconButton
+            size="small"
+            onClick={() => setShowMusicSettings(false)}
+            sx={{
+              padding: '4px',
+              '&:hover': {
+                backgroundColor: alpha(theme.palette.error.main, 0.1)
+              }
+            }}
+          >
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        </Box>
+        
+        {/* Enable/Disable Music */}
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+          <Typography variant="body2">Background Music</Typography>
+          <Button
+            size="small"
+            variant={isMusicEnabled ? "contained" : "outlined"}
+            onClick={toggleMusicEnabled}
+            sx={{ 
+              minWidth: 60, 
+              textTransform: 'none',
+              backgroundColor: isMusicEnabled ? theme.palette.error.main : theme.palette.success.main,
+              color: 'white',
+              '&:hover': {
+                backgroundColor: isMusicEnabled ? theme.palette.error.dark : theme.palette.success.dark,
+              }
+            }}
+          >
+            {isMusicEnabled ? 'Turn OFF' : 'Turn ON'}
+          </Button>
+        </Box>
+
+        {/* Show description when disabled */}
+        {!isMusicEnabled && (
+          <Box sx={{ 
+            p: 1.5, 
+            backgroundColor: alpha(theme.palette.grey[500], 0.1),
+            borderRadius: 1,
+            mb: 2
+          }}>
+            <Typography variant="caption" color="text.secondary">
+              Music plays only during "Thinking..." moments when enabled
+            </Typography>
+          </Box>
+        )}
+
+        {/* Volume Control - only show when enabled */}
+        {isMusicEnabled && (
+          <Box sx={{ mb: 2 }}>
+            <Typography variant="body2" sx={{ mb: 1 }}>
+              Volume: {Math.round(musicVolume * 100)}%
+            </Typography>
+            <Box onClick={(e) => e.stopPropagation()}>
+              <Slider
+              value={musicVolume}
+              onChange={(_, value) => updateVolumeRealTime(value as number)}
+              onChangeCommitted={(_, value) => {
+                // Save to localStorage when user finishes dragging
+                localStorage.setItem('musicVolume', (value as number).toString());
+              }}
+              min={0}
+              max={1}
+              step={0.05} // Smoother volume steps
+              size="small"
+              sx={{
+                '& .MuiSlider-thumb': {
+                  '&:hover, &.Mui-focusVisible': {
+                    boxShadow: '0px 0px 0px 8px rgba(156, 39, 176, 0.16)'
+                  }
+                },
+                '& .MuiSlider-track': {
+                  backgroundColor: theme.palette.secondary.main
+                },
+                '& .MuiSlider-rail': {
+                  opacity: 0.3
+                }
+              }}
+            />
+            </Box>
+          </Box>
+        )}
+
+        {/* Currently Playing - only show when music is playing */}
+        {isMusicEnabled && isPlayingMusic && (
+          <Box sx={{
+            p: 1.5,
+            borderRadius: 1,
+            backgroundColor: alpha(theme.palette.secondary.main, 0.1),
+            border: `1px solid ${alpha(theme.palette.secondary.main, 0.3)}`
+          }}>
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+              Now Playing
+            </Typography>
+            <Typography variant="body2" sx={{ fontWeight: 500 }}>
+              🤖 AI Thinking
+            </Typography>
+          </Box>
+        )}
+      </Paper>
+    </Portal>
+  );
+};
 
   return (
     <Box
@@ -1420,62 +1730,41 @@ function App() {
               {connected ? 'Connected' : 'Disconnected'}
             </Typography>
           </Box>
-          
-          {/* Download Button */}
-          <Box sx={{ ml: 'auto', display: 'flex', gap: 1 }}>
-            {/* Debug button to test question selection UI */}
-            <Tooltip title="Test Question Selection UI (Debug)">
-              <IconButton
-                onClick={() => {
-                  // Create mock UI selection data for testing
-                  const mockUISelectionData = {
-                    questions: [
-                      { id: 'q_1', index: 0, question: 'How satisfied are you with our service?', source: 'https://example.com/survey1', extraction_method: 'regex_pattern' },
-                      { id: 'q_2', index: 1, question: 'What is your age group?', source: 'https://example.com/survey1', extraction_method: 'simple_pattern' },
-                      { id: 'q_3', index: 2, question: 'How often do you use our product?', source: 'https://example.com/survey2', extraction_method: 'llm_extraction' },
-                      { id: 'q_4', index: 3, question: 'Would you recommend us to others?', source: 'https://example.com/survey2', extraction_method: 'regex_pattern' },
-                    ],
-                    sources: [
-                      {
-                        id: 'source_1',
-                        domain: 'example.com',
-                        full_url: 'https://example.com/survey1',
-                        question_count: 2,
-                        questions: [
-                          { id: 'q_1', index: 0, question: 'How satisfied are you with our service?', source: 'https://example.com/survey1', extraction_method: 'regex_pattern' },
-                          { id: 'q_2', index: 1, question: 'What is your age group?', source: 'https://example.com/survey1', extraction_method: 'simple_pattern' }
-                        ]
-                      },
-                      {
-                        id: 'source_2',
-                        domain: 'example.com',
-                        full_url: 'https://example.com/survey2',
-                        question_count: 2,
-                        questions: [
-                          { id: 'q_3', index: 2, question: 'How often do you use our product?', source: 'https://example.com/survey2', extraction_method: 'llm_extraction' },
-                          { id: 'q_4', index: 3, question: 'Would you recommend us to others?', source: 'https://example.com/survey2', extraction_method: 'regex_pattern' }
-                        ]
-                      }
-                    ],
-                    total_count: 4
-                  };
-                  
-                  setUISelectionData(mockUISelectionData);
-                  setShowQuestionSelection(true);
-                  setSelectionMode('initial');
-                  console.log('Triggered test question selection UI');
-                }}
+
+          {/* Download Button and Music Controls */}
+          <Box sx={{ ml: 'auto', display: 'flex', gap: 1, position: 'relative' }}>
+            {/* Enhanced Music Control */}
+            <Box sx={{ position: 'relative' }}>
+              <Tooltip title="Music Settings">
+                <IconButton
+                ref={setMusicButtonRef}
+                onClick={() => setShowMusicSettings(!showMusicSettings)} // Removed stopPropagation
                 sx={{
-                  backgroundColor: alpha(theme.palette.warning.main, 0.1),
+                  backgroundColor: isMusicEnabled 
+                    ? alpha(theme.palette.secondary.main, 0.1)
+                    : alpha(theme.palette.grey[500], 0.1),
                   '&:hover': {
-                    backgroundColor: alpha(theme.palette.warning.main, 0.2)
+                    backgroundColor: isMusicEnabled
+                      ? alpha(theme.palette.secondary.main, 0.2)
+                      : alpha(theme.palette.grey[500], 0.2)
                   }
                 }}
               >
-                <Typography variant="caption" sx={{ fontSize: '10px' }}>TEST</Typography>
+                {isMusicEnabled ? (
+                isPlayingMusic ? (
+                  <VolumeUpIcon color="secondary" sx={{ animation: 'pulse 1.5s infinite' }} />
+                ) : (
+                  <VolumeUpIcon color="secondary" />
+                )
+              ) : (
+                <VolumeOffIcon color="disabled" />
+              )}
               </IconButton>
-            </Tooltip>
-            
+              </Tooltip>
+              {/* Music Settings Panel Portal */}
+              <MusicSettingsPanel />
+            </Box>
+
             <Tooltip title="Download Research Files">
               <IconButton
                 onClick={() => {
@@ -1515,15 +1804,15 @@ function App() {
         onClose={() => setDownloadNotification({ ...downloadNotification, open: false })}
         anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
       >
-        <Alert 
-          onClose={() => setDownloadNotification({ ...downloadNotification, open: false })} 
-          severity={downloadNotification.severity} 
+        <Alert
+          onClose={() => setDownloadNotification({ ...downloadNotification, open: false })}
+          severity={downloadNotification.severity}
           sx={{ width: '100%' }}
           action={
             downloadNotification.severity === 'success' && (
-              <Button 
-                color="inherit" 
-                size="small" 
+              <Button
+                color="inherit"
+                size="small"
                 onClick={() => {
                   fetchAvailableFiles();
                   setShowDownloadPanel(true);
@@ -1644,7 +1933,18 @@ function App() {
                           boxShadow: '0 2px 8px rgba(0, 0, 0, 0.15)',
                         }}
                       >
-                        <Typography variant="body1">Thinking...</Typography>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <Typography variant="body1">Thinking...</Typography>
+                          {isPlayingMusic && (
+                            <MusicNoteIcon 
+                              sx={{ 
+                                fontSize: 16, 
+                                color: theme.palette.secondary.main,
+                                animation: 'pulse 1.5s infinite'
+                              }} 
+                            />
+                          )}
+                        </Box>
                       </Paper>
                     </Box>
                   )}
@@ -1660,9 +1960,9 @@ function App() {
                 }}>
                   {/* Voice status indicator */}
                   {(isListening || isInitializing) && (
-                    <Box sx={{ 
-                      mb: 1, 
-                      p: 1.5, 
+                    <Box sx={{
+                      mb: 1,
+                      p: 1.5,
                       backgroundColor: alpha(theme.palette.primary.main, 0.1),
                       borderRadius: 2,
                       border: `1px solid ${alpha(theme.palette.primary.main, 0.3)}`,
@@ -1674,10 +1974,10 @@ function App() {
                       <Typography variant="body2" color="primary" sx={{ fontWeight: 500 }}>
                         {isInitializing ? 'Initializing...' : 'Listening... Speak now'}
                       </Typography>
-                      <Box sx={{ 
-                        width: 8, 
-                        height: 8, 
-                        borderRadius: '50%', 
+                      <Box sx={{
+                        width: 8,
+                        height: 8,
+                        borderRadius: '50%',
                         backgroundColor: theme.palette.primary.main,
                         animation: 'pulse 1.5s infinite'
                       }} />
@@ -1760,7 +2060,7 @@ function App() {
                         }
                       }}
                     />
-                    
+
                     {/* Voice Input Button */}
                     {speechSupported && (
                       <Tooltip title={isListening ? "Stop listening" : isInitializing ? "Initializing..." : "Start voice input"}>
@@ -1769,7 +2069,7 @@ function App() {
                             onClick={isListening ? stopListening : startListening}
                             disabled={isLoading || showVoiceReview || isInitializing}
                             sx={{
-                              backgroundColor: isListening 
+                              backgroundColor: isListening
                                 ? alpha(theme.palette.error.main, 0.1)
                                 : alpha(theme.palette.primary.main, 0.1),
                               border: isListening
@@ -1950,8 +2250,8 @@ function App() {
                             <Chip
                               label={`${slideshowData.total_count} websites`}
                               size="small"
-                              sx={{ 
-                                ml: 1, 
+                              sx={{
+                                ml: 1,
                                 fontSize: '0.75rem',
                                 animation: slideshowData.is_update ? 'pulse 2s ease-in-out' : 'none'
                               }}
@@ -1964,11 +2264,11 @@ function App() {
                           </Typography>
                         )}
                         {slideshowData?.research_topic && (
-                          <Typography variant="caption" sx={{ 
-                            display: 'block', 
-                            opacity: 0.6, 
+                          <Typography variant="caption" sx={{
+                            display: 'block',
+                            opacity: 0.6,
                             fontStyle: 'italic',
-                            mt: 0.25 
+                            mt: 0.25
                           }}>
                             Research: {slideshowData.research_topic}
                           </Typography>
@@ -2034,7 +2334,7 @@ function App() {
                         >
                           <ArrowBackIosIcon fontSize="small" />
                         </IconButton>
-                        
+
                         <IconButton
                           size="small"
                           onClick={togglePlayPause}
@@ -2047,24 +2347,24 @@ function App() {
                         >
                           {isPlaying ? <PauseIcon fontSize="small" /> : <PlayArrowIcon fontSize="small" />}
                         </IconButton>
-                        
+
                         <Typography variant="caption" sx={{ mx: 1 }}>
                           {currentSlideIndex + 1} / {slideshowData.screenshots.length}
                         </Typography>
-                        
+
                         {slideshowData.is_update && (
                           <Chip
                             label="Updated"
                             size="small"
                             color="success"
-                            sx={{ 
-                              fontSize: '0.7rem', 
+                            sx={{
+                              fontSize: '0.7rem',
                               height: '20px',
                               animation: 'fadeIn 1s ease-in'
                             }}
                           />
                         )}
-                        
+
                         <IconButton
                           size="small"
                           onClick={nextSlide}
@@ -2080,7 +2380,7 @@ function App() {
                       <LinearProgress
                         variant="determinate"
                         value={(currentSlideIndex + 1) / slideshowData.screenshots.length * 100}
-                        sx={{ 
+                        sx={{
                           height: 3,
                           boxShadow: slideshowData.is_update ? '0 0 8px rgba(46, 196, 72, 0.4)' : 'none',
                           transition: 'box-shadow 2s ease-out'
@@ -2133,7 +2433,7 @@ function App() {
                           }
                         }}
                       />
-                      
+
                       {/* URL overlay */}
                       {currentImageUrl && (
                         <Box sx={{
@@ -2146,7 +2446,7 @@ function App() {
                           p: 1,
                           fontSize: '0.75rem'
                         }}>
-                          <Typography variant="caption" sx={{ 
+                          <Typography variant="caption" sx={{
                             wordBreak: 'break-all',
                             opacity: 0.9
                           }}>
@@ -2175,8 +2475,8 @@ function App() {
                               borderRadius: 1,
                               overflow: 'hidden',
                               cursor: 'pointer',
-                              border: currentSlideIndex === index 
-                                ? `2px solid ${theme.palette.primary.main}` 
+                              border: currentSlideIndex === index
+                                ? `2px solid ${theme.palette.primary.main}`
                                 : '2px solid transparent',
                               transition: 'all 0.2s ease',
                               '&:hover': {
@@ -2199,7 +2499,7 @@ function App() {
                         ))}
                       </Box>
                     )}
-                    
+
                     <div ref={browserEndRef} />
                   </Box>
                 </Box>
@@ -2234,6 +2534,21 @@ function App() {
 
       {/* Question Selection Panel */}
       <QuestionSelectionPanel />
+
+      {/* Background music audio elements */}
+      {Object.entries(MUSIC_TRACKS).map(([key, track]) => (
+        <audio
+          key={key}
+          ref={el => { musicRefs.current[key as MusicTrackType] = el; }}
+          loop
+          preload="auto"
+          style={{ display: 'none' }}
+        >
+          <source src={track.url} type="audio/mpeg" />
+          <source src={track.url.replace('.mp3', '.ogg')} type="audio/ogg" />
+          Your browser does not support the audio element.
+        </audio>
+      ))}
     </Box>
   );
 }

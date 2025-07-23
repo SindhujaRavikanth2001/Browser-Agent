@@ -5121,6 +5121,7 @@ async def process_message_with_direct_scraping(agent, message: str, max_timeout:
     """Process message with direct scraping and OCR-based screenshot validation."""
     screenshot_base64 = None
     detected_url = None
+    music_context = "thinking"  # Default music context
     
     try:
         # URL detection
@@ -5142,6 +5143,15 @@ async def process_message_with_direct_scraping(agent, message: str, max_timeout:
                     urls.append(word)
         
         print(f"🔍 Found URLs: {urls}")
+        
+        # Detect music context based on message content
+        message_lower = message.lower()
+        if any(keyword in message_lower for keyword in ['research', 'study', 'questionnaire', 'survey']):
+            music_context = "research"
+        elif urls:
+            music_context = "browsing"
+        else:
+            music_context = "thinking"
         
         if urls:
             url = urls[0]
@@ -5169,6 +5179,7 @@ async def process_message_with_direct_scraping(agent, message: str, max_timeout:
                     
                     if browser_tool:
                         print("🔧 Browser tool found, attempting screenshot with OCR validation")
+                        music_context = "browsing"  # Switch to browsing music
                         
                         # Try up to 2 attempts
                         max_attempts = 2
@@ -5242,7 +5253,8 @@ Note: The website {url} appears to be blocking access. I was unable to retrieve 
                 response = annotate_invalid_links(str(raw))
                 response = remove_chinese_and_punct(response)
         else:
-            # No URL detected
+            # No URL detected - use thinking music
+            music_context = "thinking"
             raw = await asyncio.wait_for(
                 agent.llm.ask(message, temperature=0.7),
                 timeout=max_timeout
@@ -5263,7 +5275,48 @@ Note: The website {url} appears to be blocking access. I was unable to retrieve 
             "response": str(response) if response else "No response generated",
             "base64_image": screenshot_base64,  # Only valid screenshots
             "source_url": detected_url,
-            "screenshot_validated": screenshot_base64 is not None
+            "screenshot_validated": screenshot_base64 is not None,
+            "music_context": music_context  # Add music context to response
+        }
+        
+    except asyncio.TimeoutError:
+        print(f"Agent execution timed out after {max_timeout} seconds")
+        
+        # Extract the best available response from memory
+        best_response = "Request timed out while processing."
+        
+        if hasattr(agent, 'memory') and hasattr(agent.memory, 'messages'):
+            assistant_responses = []
+            for msg in agent.memory.messages:
+                if hasattr(msg, 'role') and msg.role == 'assistant' and hasattr(msg, 'content'):
+                    content = str(msg.content)
+                    if len(content) > 100:
+                        assistant_responses.append(content)
+            
+            if assistant_responses:
+                longest_response = max(assistant_responses, key=len)
+                if len(longest_response) > 300:
+                    best_response = f"Partial response (timed out):\n\n{longest_response}"
+        
+        save_comprehensive_response(message, best_response, is_partial=True)
+        return {
+            "response": best_response,
+            "base64_image": None,
+            "source_url": detected_url,
+            "screenshot_validated": False,
+            "music_context": music_context
+        }
+    
+    except Exception as e:
+        error_msg = f"Error during agent execution: {e}"
+        print(error_msg)
+        save_comprehensive_response(message, error_msg, is_error=True)
+        return {
+            "response": error_msg,
+            "base64_image": None,
+            "source_url": detected_url,
+            "screenshot_validated": False,
+            "music_context": music_context
         }
         
     except asyncio.TimeoutError:

@@ -14,17 +14,24 @@ import urllib.parse
 import pytesseract
 from PIL import Image
 import io
-
+import hashlib
+from difflib import SequenceMatcher
 # Load environment variables
 load_dotenv()
-
+from pydantic import BaseModel, Field
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-
+import concurrent.futures
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import subprocess
+import tempfile
+import os
+import json
 from app.agent.manus import Manus
 from app.llm import LLM
 from app.logger import logger
@@ -40,13 +47,700 @@ from app.tool.terminate import Terminate
 from app.exceptions import TokenLimitExceeded
 import re, requests
 from urllib.parse import urlparse
-
+import time
 # Google API imports
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 # Define a global context variable for the Manus agent
 g = ContextVar('g', default=None)
+
+# Polling site selection
+class PollingSiteConfig:
+    """Configuration for polling websites"""
+    
+    # ENHANCED: Base URLs for polling sites (for screenshots)
+    POLLING_SITE_BASE_URLS = {
+        'marist': 'https://maristpoll.marist.edu/',
+        'siena': 'https://scri.siena.edu/',
+        'quinnipiac': 'https://poll.qu.edu/',
+        'marquette': 'https://www.marquette.edu/law/poll/',
+        'morning_consult': 'https://morningconsult.com/',
+        'gallup': 'https://www.gallup.com/',
+        'pew': 'https://www.pewresearch.org/',
+        'suffolk': 'https://www.suffolk.edu/academics/research-at-suffolk/political-research-center',
+        'monmouth': 'https://www.monmouth.edu/polling-institute/',
+        'cbs': 'https://www.cbsnews.com/news/polls/'
+    }
+    
+    AVAILABLE_POLLS = {
+        'marist': {
+            'name': 'Marist University',
+            'description': 'Marist Poll - National and regional political polling',
+            'scraper_file': 'scrapers/marist_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['marist'],  # ADD: Reference to base URL
+            'active': True
+        },
+        'siena': {
+            'name': 'Siena College',
+            'description': 'Siena Research Institute - New York State polling',
+            'scraper_file': 'scrapers/siena_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['siena'],
+            'active': True
+        },
+        'quinnipiac': {
+            'name': 'Quinnipiac University',
+            'description': 'Quinnipiac Poll - National political polling',
+            'scraper_file': 'scrapers/quinnipiac_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['quinnipiac'],
+            'active': True
+        },
+        'marquette': {
+            'name': 'Marquette Law School',
+            'description': 'Marquette Law School Poll - Wisconsin and national polling',
+            'scraper_file': 'scrapers/marquette_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['marquette'],
+            'active': True
+        },
+        'morning_consult': {
+            'name': 'Morning Consult',
+            'description': 'Morning Consult - Brand intelligence and insights',
+            'scraper_file': 'scrapers/morning_consult_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['morning_consult'],
+            'active': False  # Not implemented yet
+        },
+        'gallup': {
+            'name': 'Gallup',
+            'description': 'Gallup - Public opinion polling and research',
+            'scraper_file': 'scrapers/gallup_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['gallup'],
+            'active': False
+        },
+        'pew': {
+            'name': 'Pew Research Center',
+            'description': 'Pew Research - Social trends and public opinion',
+            'scraper_file': 'scrapers/pew_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['pew'],
+            'active': False
+        },
+        'suffolk': {
+            'name': 'Suffolk University',
+            'description': 'Suffolk University Political Research Center',
+            'scraper_file': 'scrapers/suffolk_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['suffolk'],
+            'active': False
+        },
+        'monmouth': {
+            'name': 'Monmouth University',
+            'description': 'Monmouth University Polling Institute',
+            'scraper_file': 'scrapers/monmouth_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['monmouth'],
+            'active': False
+        },
+        'cbs': {
+            'name': 'CBS News Poll',
+            'description': 'CBS News polling and surveys',
+            'scraper_file': 'scrapers/cbs_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['cbs'],
+            'active': False
+        }
+    }
+    
+    @classmethod
+    def get_base_url(cls, poll_id: str) -> Optional[str]:
+        """Get base URL for a specific polling site"""
+        return cls.POLLING_SITE_BASE_URLS.get(poll_id)
+    
+    @classmethod
+    def get_active_polls(cls):
+        """Get only the polls that are currently implemented"""
+        return {k: v for k, v in cls.AVAILABLE_POLLS.items() if v['active']}
+    
+    @classmethod
+    def get_all_polls(cls):
+        """Get all polls regardless of implementation status"""
+        return cls.AVAILABLE_POLLS
+
+class PollingScraper:
+    """Handles multi-threaded polling site scraping"""
+    
+    def __init__(self, ui_instance=None, browser_tool=None):
+        self.max_workers = 3
+        self.timeout = 600
+        self.ui_instance = ui_instance
+        self.browser_tool = browser_tool  # ADD: Browser tool for screenshots
+        
+        # Question deduplication tracking
+        self.processed_questions = set()
+        self.question_signatures = {}
+        
+        # ADD: Screenshot cache for polling sites
+        self.polling_site_screenshots = {}
+    
+    async def _capture_polling_site_screenshot(self, poll_id: str, poll_config: dict) -> Optional[str]:
+        """Capture screenshot of polling site homepage"""
+        if not self.browser_tool:
+            logger.info(f"No browser tool available for {poll_config['name']} screenshot")
+            return None
+        
+        # Check cache first
+        if poll_id in self.polling_site_screenshots:
+            logger.info(f"Using cached screenshot for {poll_config['name']}")
+            return self.polling_site_screenshots[poll_id]
+        
+        try:
+            # ENHANCED: Get base URL from centralized configuration
+            base_url = PollingSiteConfig.get_base_url(poll_id)
+            if not base_url:
+                logger.warning(f"No base URL configured for {poll_id}")
+                return None
+            
+            logger.info(f"📸 Capturing screenshot for {poll_config['name']} at {base_url}")
+            
+            # Capture screenshot using the existing capture_url_screenshot function
+            screenshot_base64 = await capture_url_screenshot(base_url, self.browser_tool)
+            
+            if screenshot_base64:
+                # Validate the screenshot
+                is_valid = await self.validate_screenshot(screenshot_base64, base_url)
+                if is_valid:
+                    # Cache the screenshot
+                    self.polling_site_screenshots[poll_id] = screenshot_base64
+                    logger.info(f"✅ Screenshot captured and cached for {poll_config['name']}")
+                    return screenshot_base64
+                else:
+                    logger.warning(f"⚠️ Invalid screenshot for {poll_config['name']}")
+            else:
+                logger.warning(f"❌ No screenshot captured for {poll_config['name']}")
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error capturing screenshot for {poll_config['name']}: {e}")
+            return None
+    
+    async def validate_screenshot(self, screenshot_base64: str, url: str) -> bool:
+        """Simple screenshot validation"""
+        try:
+            if len(screenshot_base64) < 10000:
+                return False
+            
+            image_data = base64.b64decode(screenshot_base64)
+            if len(image_data) < 5000:
+                return False
+            
+            data_sample = image_data[:1000]
+            unique_bytes = len(set(data_sample))
+            return unique_bytes >= 20
+            
+        except Exception:
+            return False
+
+    # ADD: Question deduplication methods
+    def _create_question_signature(self, question: str) -> tuple:
+        """Create a normalized signature for question deduplication"""
+        # Normalize the question text
+        normalized = re.sub(r'[^\w\s]', '', question.lower().strip())
+        normalized = ' '.join(normalized.split())  # Remove extra whitespace
+        
+        # Create a hash for exact matches
+        exact_hash = hashlib.md5(normalized.encode()).hexdigest()
+        
+        return exact_hash, normalized
+    
+    def _is_duplicate_question(self, question: str, threshold: float = 0.85) -> bool:
+        """Check if question is a duplicate using both exact and similarity matching"""
+        if not question or len(question.strip()) < 10:
+            return True
+            
+        exact_hash, normalized = self._create_question_signature(question)
+        
+        # Check exact match first
+        if exact_hash in self.processed_questions:
+            return True
+            
+        # Check similarity with existing questions
+        for existing_normalized in self.question_signatures.values():
+            similarity = SequenceMatcher(None, normalized, existing_normalized).ratio()
+            if similarity >= threshold:
+                return True
+        
+        # Not a duplicate - store it
+        self.processed_questions.add(exact_hash)
+        self.question_signatures[exact_hash] = normalized
+        return False
+
+    async def scrape_selected_polls(self, selected_polls: list, research_topic: str, max_results_per_poll: int = 5):
+        """Scrape multiple polling sites concurrently with screenshots"""
+        
+        if not selected_polls:
+            return {
+                'success': False,
+                'message': 'No polling sites selected',
+                'results': [],
+                'polling_screenshots': []
+            }
+        
+        # RESET deduplication tracking for each scraping session
+        self.processed_questions = set()
+        self.question_signatures = {}
+        
+        # Broadcast start status
+        if self.ui_instance:
+            await self.ui_instance.broadcast_scraping_status(
+                "started", 
+                f"Starting to scrape {len(selected_polls)} polling sites for '{research_topic}'"
+            )
+
+        logger.info(f"Starting concurrent scraping of {len(selected_polls)} polling sites for topic: {research_topic}")
+        
+        # STEP 1: Capture screenshots of polling sites (before scraping)
+        polling_screenshots = []
+        if self.browser_tool:
+            logger.info("📸 Capturing polling site screenshots...")
+            if self.ui_instance:
+                await self.ui_instance.broadcast_scraping_status(
+                    "progress", 
+                    "Capturing screenshots of polling sites..."
+                )
+            
+            # Capture screenshots for each selected poll
+            screenshot_tasks = []
+            for poll_id in selected_polls:
+                if poll_id in PollingSiteConfig.get_active_polls():
+                    poll_config = PollingSiteConfig.AVAILABLE_POLLS[poll_id]
+                    screenshot_tasks.append(self._capture_polling_site_screenshot(poll_id, poll_config))
+            
+            # Run screenshot capture concurrently (with small delay between each)
+            for i, screenshot_task in enumerate(screenshot_tasks):
+                if i > 0:
+                    await asyncio.sleep(2)  # Small delay between screenshot captures
+                
+                try:
+                    screenshot_base64 = await screenshot_task
+                    if screenshot_base64:
+                        poll_id = selected_polls[i]
+                        poll_config = PollingSiteConfig.AVAILABLE_POLLS[poll_id]
+                        
+                        # ENHANCED: Get base URL from centralized config
+                        base_url = PollingSiteConfig.get_base_url(poll_id)
+                        if not base_url:
+                            logger.warning(f"No base URL found for {poll_id}")
+                            continue
+                        
+                        polling_screenshots.append({
+                            'poll_id': poll_id,
+                            'poll_name': poll_config['name'],
+                            'url': base_url,
+                            'screenshot': screenshot_base64,
+                            'title': f"Polling Site - {poll_config['name']}"
+                        })
+                        
+                        logger.info(f"✅ Screenshot added for {poll_config['name']}")
+                
+                except Exception as e:
+                    logger.error(f"Error in screenshot task: {e}")
+        
+        # STEP 2: Prepare and run scraping tasks
+        scraping_tasks = []
+        for i, poll_id in enumerate(selected_polls):
+            if poll_id in PollingSiteConfig.get_active_polls():
+                poll_config = PollingSiteConfig.AVAILABLE_POLLS[poll_id]
+                scraping_tasks.append({
+                    'poll_id': poll_id,
+                    'poll_name': poll_config['name'],
+                    'scraper_file': poll_config['scraper_file'],
+                    'research_topic': research_topic,
+                    'max_results': max_results_per_poll,
+                    'delay': i * 3  # Stagger by 3 seconds to avoid server overload
+                })
+        
+        if not scraping_tasks:
+            return {
+                'success': False,
+                'message': 'No active polling sites selected',
+                'results': [],
+                'polling_screenshots': polling_screenshots
+            }
+        
+        # STEP 3: Run scrapers concurrently
+        results = await self._run_scrapers_concurrent_fixed(scraping_tasks)
+        
+        # STEP 4: Broadcast completion status
+        if self.ui_instance:
+            unique_questions = sum(len(r.get('unique_questions', [])) for r in results)
+            total_raw_questions = sum(len(r.get('raw_questions', [])) for r in results)
+            duplicates_removed = total_raw_questions - unique_questions
+            
+            status_msg = f"Scraping completed. Found {unique_questions} unique questions"
+            if duplicates_removed > 0:
+                status_msg += f" ({duplicates_removed} duplicates removed)"
+            status_msg += f" from {len([r for r in results if r['success']])} successful polls"
+            
+            # Add screenshot info
+            if polling_screenshots:
+                status_msg += f". Captured {len(polling_screenshots)} polling site screenshots"
+            
+            await self.ui_instance.broadcast_scraping_status("completed", status_msg)
+
+        # STEP 5: Process and format results
+        formatted_results = self._process_scraping_results(results)
+        
+        # ADD: Include polling screenshots in results
+        formatted_results['polling_screenshots'] = polling_screenshots
+        formatted_results['polling_screenshots_count'] = len(polling_screenshots)
+        
+        logger.info(f"Completed scraping. Total unique questions found: {len(formatted_results.get('all_questions', []))}")
+        logger.info(f"Polling site screenshots captured: {len(polling_screenshots)}")
+        
+        return formatted_results
+    
+    async def _run_scrapers_concurrent_fixed(self, scraping_tasks):
+        """FIXED: Run multiple scrapers concurrently with proper asyncio control"""
+        results = []
+        total_tasks = len(scraping_tasks)
+        completed_tasks = 0
+        
+        # Broadcast initial progress
+        if self.ui_instance:
+            await self.ui_instance.broadcast_scraping_status(
+                "progress", 
+                f"Starting concurrent scraping of {total_tasks} polling sites..."
+            )
+        
+        # FIXED: Use asyncio semaphore for better concurrency control
+        semaphore = asyncio.Semaphore(self.max_workers)
+        
+        async def run_single_scraper_async(task):
+            async with semaphore:
+                # Apply staggered delay
+                if task['delay'] > 0:
+                    await asyncio.sleep(task['delay'])
+                
+                # Run scraper in thread pool to avoid blocking
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(
+                    None, 
+                    self._run_single_scraper, 
+                    task
+                )
+        
+        # Start all scrapers concurrently
+        tasks = [run_single_scraper_async(task) for task in scraping_tasks]
+        
+        # Process results as they complete
+        for coro in asyncio.as_completed(tasks):
+            try:
+                result = await coro
+                results.append(result)
+                completed_tasks += 1
+                
+                # Broadcast progress update
+                if self.ui_instance:
+                    status_detail = f"Completed {result['poll_name']} ({completed_tasks}/{total_tasks})"
+                    if result['success']:
+                        unique_count = len(result.get('unique_questions', []))
+                        raw_count = len(result.get('raw_questions', []))
+                        duplicates = raw_count - unique_count
+                        status_detail += f" - Found {unique_count} unique questions"
+                        if duplicates > 0:
+                            status_detail += f" ({duplicates} duplicates filtered)"
+                    else:
+                        status_detail += f" - Failed: {result['error'][:50]}..."
+                    
+                    await self.ui_instance.broadcast_scraping_status("progress", status_detail)
+
+                # Log progress
+                logger.info(f"✅ Completed scraping {result['poll_name']} ({completed_tasks}/{total_tasks})")
+                
+                if result['success']:
+                    unique_count = len(result.get('unique_questions', []))
+                    logger.info(f"   Found {unique_count} unique questions")
+                else:
+                    logger.warning(f"   Failed: {result['error']}")
+                        
+            except Exception as e:
+                completed_tasks += 1
+                error_result = {
+                    'poll_id': 'unknown',
+                    'poll_name': 'Unknown',
+                    'success': False,
+                    'error': str(e),
+                    'raw_questions': [],
+                    'unique_questions': [],
+                    'source_info': {}
+                }
+                results.append(error_result)
+                
+                # Broadcast error
+                if self.ui_instance:
+                    await self.ui_instance.broadcast_scraping_status(
+                        "progress", 
+                        f"Failed task ({completed_tasks}/{total_tasks}): {str(e)[:50]}..."
+                    )
+
+                logger.error(f"❌ Failed scraping task: {e}")
+        
+        logger.info(f"Completed all scraping tasks. Total questions found: {sum(len(r.get('unique_questions', [])) for r in results)}")
+        return results
+    
+    def _run_single_scraper(self, task):
+        """FIXED: Run a single scraper with better timeout handling"""
+        try:
+            poll_id = task['poll_id']
+            poll_name = task['poll_name']
+            scraper_file = task['scraper_file']
+            research_topic = task['research_topic']
+            max_results = task['max_results']
+            
+            logger.info(f"🔍 Starting scraper for {poll_name}")
+            
+            # Create a temporary file to store results
+            with tempfile.NamedTemporaryFile(mode='w+', suffix='.json', delete=False) as temp_file:
+                temp_filepath = temp_file.name
+            
+            try:
+                # Run the scraper as a subprocess
+                cmd = [
+                    'python', scraper_file,
+                    '--keyword', research_topic,
+                    '--max-results', str(max_results),
+                    '--output', temp_filepath,
+                    '--headless', 'true'
+                ]
+                
+                # FIXED: Use Popen for better timeout control
+                process = subprocess.Popen(
+                    cmd, 
+                    stdout=None,
+                    stderr=None,
+                    text=True, 
+                    cwd=os.path.dirname(os.path.abspath(__file__))
+                )
+                
+                # Wait with timeout
+                try:
+                    stdout, stderr = process.communicate(timeout=self.timeout)
+                    return_code = process.returncode
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"⏰ Killing timed out scraper for {poll_name}")
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    return_code = -1
+                
+                if return_code == 0:
+                    # Read results from temp file
+                    with open(temp_filepath, 'r', encoding='utf-8') as f:
+                        scraper_results = json.load(f)
+                    
+                    # Process the results with deduplication
+                    processed_results = self._process_single_scraper_results_with_dedup(
+                        poll_id, poll_name, scraper_results
+                    )
+                    
+                    return processed_results
+                else:
+                    logger.error(f"Scraper process failed for {poll_name}: {stderr}")
+                    return {
+                        'poll_id': poll_id,
+                        'poll_name': poll_name,
+                        'success': False,
+                        'error': f"Scraper process failed: {stderr[:200]}",
+                        'raw_questions': [],
+                        'unique_questions': [],
+                        'source_info': {}
+                    }
+                    
+            finally:
+                # Clean up temp file
+                try:
+                    os.unlink(temp_filepath)
+                except:
+                    pass
+                    
+        except subprocess.TimeoutExpired:
+            logger.error(f"Scraper timeout for {poll_name}")
+            return {
+                'poll_id': poll_id,
+                'poll_name': poll_name,
+                'success': False,
+                'error': f"Scraper timed out after {self.timeout} seconds",
+                'raw_questions': [],
+                'unique_questions': [],
+                'source_info': {}
+            }
+        except Exception as e:
+            logger.error(f"Error running scraper for {poll_name}: {e}")
+            return {
+                'poll_id': poll_id,
+                'poll_name': poll_name,
+                'success': False,
+                'error': str(e),
+                'raw_questions': [],
+                'unique_questions': [],
+                'source_info': {}
+            }
+    
+    async def _process_single_scraper_results_with_dedup(self, poll_id, poll_name, scraper_results):
+        """ENHANCED: Process results with LLM-enhanced question extraction"""
+        try:
+            raw_questions = []
+            unique_questions = []
+            
+            # Extract questions from scraper results
+            if 'surveys' in scraper_results:
+                for survey in scraper_results['surveys']:
+                    survey_name = survey.get('survey_code', f"{poll_name} Survey")
+                    survey_date = survey.get('survey_date', 'Unknown Date')
+                    survey_question = survey.get('survey_question', '')
+                    survey_url = survey.get('url', '')
+                    
+                    # Get the embedded content
+                    embedded_content = survey.get('embedded_content', '')
+                    
+                    if embedded_content:
+                        # Use enhanced extraction with LLM fallback
+                        try:
+                            from question_extractor import QuestionExtractor
+                            extractor = QuestionExtractor(self.llm) if hasattr(self, 'llm') else QuestionExtractor()
+                            
+                            if hasattr(self, 'llm'):
+                                # ASYNC extraction with LLM fallback
+                                extracted_questions = await extractor.extract_questions_with_metadata(
+                                    embedded_content, survey_url, survey_name
+                                )
+                            else:
+                                # Synchronous extraction (pattern-based only)
+                                from question_extractor import extract_questions_from_content
+                                pattern_questions = extract_questions_from_content(embedded_content)
+                                extracted_questions = []
+                                for i, q in enumerate(pattern_questions):
+                                    extracted_questions.append({
+                                        'question': q,
+                                        'source': survey_url,
+                                        'extraction_method': 'pattern_only',
+                                        'question_number': i + 1
+                                    })
+                            
+                            for q_dict in extracted_questions:
+                                raw_questions.append(q_dict['question'])
+                                
+                                # Apply deduplication
+                                if not self._is_duplicate_question(q_dict['question']):
+                                    unique_questions.append({
+                                        'question': q_dict['question'],
+                                        'source': survey_url,
+                                        'survey_name': survey_name,
+                                        'survey_date': survey_date,
+                                        'survey_question': survey_question,
+                                        'poll_id': poll_id,
+                                        'poll_name': poll_name,
+                                        'extraction_method': q_dict.get('extraction_method', 'unknown')
+                                    })
+                            
+                            logger.info(f"Enhanced extraction: {len(extracted_questions)} questions from {poll_name}")
+                            
+                        except Exception as e:
+                            logger.error(f"Enhanced extraction failed for {poll_name}: {e}")
+                            
+                            # Fallback to pattern-based extraction
+                            try:
+                                from question_extractor import extract_questions_from_content
+                                pattern_questions = extract_questions_from_content(embedded_content)
+                                
+                                for question in pattern_questions:
+                                    raw_questions.append(question)
+                                    
+                                    if not self._is_duplicate_question(question):
+                                        unique_questions.append({
+                                            'question': question,
+                                            'source': survey_url,
+                                            'survey_name': survey_name,
+                                            'survey_date': survey_date,
+                                            'survey_question': survey_question,
+                                            'poll_id': poll_id,
+                                            'poll_name': poll_name,
+                                            'extraction_method': 'pattern_fallback'
+                                        })
+                                
+                                logger.info(f"Pattern fallback: {len(pattern_questions)} questions from {poll_name}")
+                                
+                            except Exception as fallback_error:
+                                logger.error(f"All extraction failed for {poll_name}: {fallback_error}")
+            
+            logger.info(f"Processed {len(unique_questions)} unique questions from {poll_name}")
+            
+            return {
+                'poll_id': poll_id,
+                'poll_name': poll_name,
+                'success': True,
+                'raw_questions': raw_questions,
+                'unique_questions': unique_questions,
+                'source_info': {
+                    'total_surveys': len(scraper_results.get('surveys', [])),
+                    'raw_questions_count': len(raw_questions),
+                    'unique_questions_count': len(unique_questions),
+                    'duplicates_filtered': len(raw_questions) - len(unique_questions),
+                    'scraping_date': scraper_results.get('scraped_at', time.strftime('%Y-%m-%d %H:%M:%S'))
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing results for {poll_name}: {e}")
+            return {
+                'poll_id': poll_id,
+                'poll_name': poll_name,
+                'success': False,
+                'error': f"Error processing results: {str(e)}",
+                'raw_questions': [],
+                'unique_questions': [],
+                'source_info': {}
+            }
+        
+    def _process_scraping_results(self, results):
+        """FIXED: Process and combine results from all scrapers with deduplication info"""
+        all_questions = []
+        successful_polls = []
+        failed_polls = []
+        total_raw_questions = 0
+        total_duplicates_removed = 0
+        
+        for result in results:
+            if result['success']:
+                unique_count = len(result['unique_questions'])
+                raw_count = len(result.get('raw_questions', []))
+                duplicates = raw_count - unique_count
+                
+                successful_polls.append({
+                    'poll_id': result['poll_id'],
+                    'poll_name': result['poll_name'],
+                    'unique_question_count': unique_count,
+                    'raw_question_count': raw_count,
+                    'duplicates_filtered': duplicates,
+                    'source_info': result['source_info']
+                })
+                
+                all_questions.extend(result['unique_questions'])
+                total_raw_questions += raw_count
+                total_duplicates_removed += duplicates
+            else:
+                failed_polls.append({
+                    'poll_id': result['poll_id'],
+                    'poll_name': result['poll_name'],
+                    'error': result['error']
+                })
+        
+        return {
+            'success': len(successful_polls) > 0,
+            'message': f"Scraped {len(successful_polls)} polls successfully, {len(failed_polls)} failed. "
+                      f"Found {len(all_questions)} unique questions ({total_duplicates_removed} duplicates removed)",
+            'all_questions': all_questions,
+            'successful_polls': successful_polls,
+            'failed_polls': failed_polls,
+            'total_unique_questions': len(all_questions),
+            'total_raw_questions': total_raw_questions,
+            'total_duplicates_removed': total_duplicates_removed
+        }
 
 class UserAction(Enum):
     URL_RESEARCH = "url_research"
@@ -71,13 +765,13 @@ class ResearchDesign(BaseModel):
     questions: Optional[List[str]] = None
     internet_questions: Optional[List[str]] = None
     internet_sources: Optional[List[str]] = None
-    screenshots: Optional[List[Dict]] = None
+    screenshots: List[Dict] = None
     use_internet_questions: bool = False
     stage: ResearchStage = ResearchStage.INITIAL
     user_responses: Optional[Dict] = None
     questionnaire_responses: Optional[Dict] = None
     chat_history: Optional[List[Dict]] = None
-    research_screenshots: Optional[List[Dict]] = None
+    research_screenshots: List[Dict] = None
     
     # URL management fields
     all_collected_urls: Optional[List[str]] = None
@@ -92,6 +786,12 @@ class ResearchDesign(BaseModel):
     awaiting_selection: bool = False  # Flag to indicate we're waiting for user selection
     max_selectable_questions: int = 30  # Maximum questions user can select
     additional_questions: Optional[List[str]] = None
+
+    # ADDED: Poll selection fields
+    available_polls: Optional[Dict] = None
+    selected_polls: Optional[List[str]] = None
+    show_poll_selection: bool = False
+    awaiting_poll_selection: bool = False
 
 class UserMessage(BaseModel):
     content: str
@@ -128,7 +828,7 @@ class URLProcessor:
         """Check if URL was already processed in internet search phase"""
         return url in self.processed_internet_urls
     
-    async def process_urls_for_research(self, urls: List[str], research_topic: str, target_count: int = 3) -> Dict:
+    async def process_urls_for_research(self, urls: List[str], research_topic: str, target_count: int = 1) -> Dict:
         """Process URLs for research summaries - mark as research URLs"""
         research_summaries = []
         screenshots = []
@@ -325,27 +1025,43 @@ class URLProcessor:
             return False
     
     async def _extract_questions_from_content(self, content: str, url: str) -> List[Dict]:
-        """Extract questions from already scraped content"""
-        # Use pattern-based extraction first
-        pattern_questions = self.question_extractor.extract_questions_with_sources(content, url)
+        """Extract questions from already scraped content with LLM fallback"""
         
-        if len(pattern_questions) >= 3:
-            return pattern_questions[:6]  # Limit to 6 questions per URL
+        # Initialize enhanced extractor if not exists
+        if not hasattr(self, '_enhanced_extractor'):
+            from question_extractor import QuestionExtractor
+            self._enhanced_extractor = QuestionExtractor(self.llm)
         
-        # Fallback to LLM if pattern matching doesn't find enough
-        llm_questions = await self._llm_extract_questions(content, url)
-        pattern_questions.extend(llm_questions)
-        
-        # Remove duplicates
-        unique_questions = []
-        seen = set()
-        for q_dict in pattern_questions:
-            question_text = q_dict['question'].lower().strip()
-            if question_text not in seen and len(question_text) > 15:
-                seen.add(question_text)
-                unique_questions.append(q_dict)
-        
-        return unique_questions[:6]
+        try:
+            # Use enhanced extraction with LLM fallback
+            questions = await self._enhanced_extractor.extract_questions_with_metadata(content, url)
+            logger.info(f"Enhanced extraction: {len(questions)} questions from {url}")
+            return questions
+            
+        except Exception as e:
+            logger.error(f"Enhanced extraction failed for {url}: {e}")
+            
+            # Fallback to pattern-based extraction
+            try:
+                from question_extractor import extract_questions_from_content
+                pattern_questions = extract_questions_from_content(content)
+                
+                # Convert to expected format
+                question_dicts = []
+                for i, question in enumerate(pattern_questions):
+                    question_dicts.append({
+                        'question': question,
+                        'source': url,
+                        'extraction_method': 'pattern_fallback',
+                        'question_number': i + 1
+                    })
+                
+                logger.info(f"Pattern fallback: {len(question_dicts)} questions from {url}")
+                return question_dicts
+                
+            except Exception as fallback_error:
+                logger.error(f"All extraction methods failed for {url}: {fallback_error}")
+                return []
     
     async def _llm_extract_questions(self, content: str, url: str) -> List[Dict]:
         """Extract questions using LLM from already scraped content"""
@@ -728,10 +1444,11 @@ class ImprovedQuestionExtractor:
 
 # Research Design Workflow Functions
 class ResearchWorkflow:
-    def __init__(self, llm_instance):
+    def __init__(self, llm_instance, ui_instance=None):
         self.llm = llm_instance
         self.active_sessions: Dict[str, ResearchDesign] = {}
         self.browser_tool = None
+        self.ui_instance = ui_instance
         
         # Initialize URL processor for optimized processing
         self._url_processor = None
@@ -835,42 +1552,75 @@ class ResearchWorkflow:
             logger.error(f"Error collecting internet search URLs: {e}")
             return []
 
-    async def _extract_actual_questions_from_content(self, scraped_content: str, url: str) -> List[Dict]:
-        """Extract actual survey questions with improved error handling and source tracking"""
+    async def _show_poll_selection(self, session: ResearchDesign) -> str:
+        active_polls = PollingSiteConfig.get_active_polls()
         
-        # Initialize the improved extractor
+        if not active_polls:
+            return """❌ **No Polling Sites Available**
+    No polling site scrapers are currently implemented. Please check back later."""
+        
+        # Store poll data and flags for frontend/UI
+        session.__dict__['available_polls'] = active_polls
+        session.__dict__['show_poll_selection'] = True
+        session.__dict__['awaiting_poll_selection'] = True
+
+        polls_list = []
+        for poll_id, poll_info in active_polls.items():
+            polls_list.append(f"• **{poll_info['name']}** - {poll_info['description']}")
+        
+        return f"""🗳️ **Select Polling Sites to Search**
+
+    Choose which polling organizations you'd like to search for questions about "{session.research_topic}":
+
+    **Available Polling Sites ({len(active_polls)}):**
+    {chr(10).join(polls_list)}
+
+    Use the poll selection interface to choose your sources, then click **Start Polling Search**.
+
+    **Note:** Multiple polls will be scraped simultaneously to save time."""
+
+    async def _extract_actual_questions_from_content(self, scraped_content: str, url: str) -> List[Dict]:
+        """Extract actual survey questions with improved error handling, source tracking, and LLM fallback"""
+        
+        # Initialize the improved extractor WITH LLM instance
         if not hasattr(self, '_question_extractor'):
-            self._question_extractor = ImprovedQuestionExtractor()
+            from question_extractor import QuestionExtractor  # Import the enhanced class
+            self._question_extractor = QuestionExtractor(self.llm)  # Pass LLM instance
         
         try:
-            # Use improved extraction
-            found_questions = self._question_extractor.extract_questions_with_sources(scraped_content, url)
+            # Use ASYNC extraction with LLM fallback
+            found_questions = await self._question_extractor.extract_questions_with_metadata(
+                scraped_content, url, ""
+            )
             
-            if len(found_questions) >= 3:
-                logger.info(f"Found {len(found_questions)} questions using improved patterns from {url}")
-                return found_questions
-            
-            # Fallback to LLM if pattern matching doesn't find enough
-            logger.info(f"Pattern matching found only {len(found_questions)} questions, using LLM for {url}")
-            
-            llm_questions = await self._llm_extract_actual_questions(scraped_content, url)
-            found_questions.extend(llm_questions)
-            
-            # Remove duplicates
-            unique_questions = []
-            seen = set()
-            
-            for q_dict in found_questions:
-                question_text = q_dict['question'].lower().strip()
-                if question_text not in seen and len(question_text) > 15:
-                    seen.add(question_text)
-                    unique_questions.append(q_dict)
-            
-            return unique_questions[:6]
+            logger.info(f"✅ Enhanced extraction found {len(found_questions)} questions from {url}")
+            return found_questions
             
         except Exception as e:
-            logger.error(f"Error in question extraction from {url}: {e}")
-            return []
+            logger.error(f"❌ Error in enhanced question extraction from {url}: {e}")
+            
+            # Fallback to old pattern-based method
+            try:
+                from question_extractor import extract_questions_from_content
+                pattern_questions = extract_questions_from_content(scraped_content)
+                
+                # Convert to expected format
+                question_dicts = []
+                for i, question in enumerate(pattern_questions):
+                    question_dicts.append({
+                        'question': question,
+                        'source': url,
+                        'extraction_method': 'pattern_fallback',
+                        'question_number': i + 1
+                    })
+                
+                logger.info(f"⚠️ Used pattern fallback: {len(question_dicts)} questions")
+                return question_dicts
+                
+            except Exception as fallback_error:
+                logger.error(f"❌ Pattern fallback also failed: {fallback_error}")
+                return []
+
 
     def _find_questions_with_patterns(self, content: str, url: str) -> List[Dict]:
         """Find actual survey questions using corrected regex patterns"""
@@ -970,49 +1720,199 @@ class ResearchWorkflow:
             return []
 
     async def _search_internet_for_questions(self, research_topic: str, target_population: str, session: ResearchDesign) -> tuple[List[Dict], List[str], List[Dict]]:
-        """Optimized internet search using unified processor - scrape once, validate once, extract once"""
+        """Search selected polling sites for questions WITH SCREENSHOTS"""
+        
+        # Check if poll selection was made
+        selected_polls = session.__dict__.get('selected_polls', [])
+        logger.info(f"🔍 DEBUG: _search_internet_for_questions called with selected_polls: {selected_polls}")
+        
+        if not selected_polls:
+            logger.info("🔍 DEBUG: No polls selected, setting poll selection flags")
+            # Set poll selection flags and return special indicator
+            session.__dict__['awaiting_poll_selection'] = True
+            session.__dict__['show_poll_selection'] = True
+            session.__dict__['available_polls'] = PollingSiteConfig.get_active_polls()
+            logger.info(f"🔍 DEBUG: Set flags - awaiting_poll_selection: {session.__dict__.get('awaiting_poll_selection')}, show_poll_selection: {session.__dict__.get('show_poll_selection')}")
+            # Return a special tuple to indicate poll selection needed
+            return None, None, None
+        
+        # FIX: Initialize session question pools early
+        if session.selected_questions_pool is None:
+            session.selected_questions_pool = []
+            logger.info("Initialized selected_questions_pool to empty list")
+        
+        if session.user_selected_questions is None:
+            session.user_selected_questions = []
+            logger.info("Initialized user_selected_questions to empty list")
+        
+        # Initialize polling scraper WITH UI instance AND browser tool for screenshots
+        polling_scraper = PollingScraper(ui_instance=self.ui_instance, browser_tool=self.browser_tool)
         
         try:
-            # Get URL processor
-            url_processor = self._get_url_processor()
-            
-            # If first time, collect all URLs
-            if session.all_collected_urls is None:
-                session.all_collected_urls = await self._collect_all_urls(research_topic)
-                session.current_batch_index = 0
-                session.browsed_urls = []
-                
-                if not session.all_collected_urls:
-                    return [], [], []
-            
-            # Get current batch
-            total_urls = len(session.all_collected_urls)
-            start_index = session.current_batch_index * 6
-            
-            if start_index >= total_urls:
-                return [], [], []
-            
-            end_index = min(start_index + 6, total_urls)
-            current_batch_urls = session.all_collected_urls[start_index:end_index]
-            
-            # Process URLs with unified approach - validate topic relevance AND extract questions
-            result = await url_processor.process_urls_for_questions(
-                current_batch_urls, research_topic, target_population, target_count=6
+            # Scrape selected polls concurrently WITH SCREENSHOTS
+            scraping_results = await polling_scraper.scrape_selected_polls(
+                selected_polls, research_topic, max_results_per_poll=5
             )
             
-            # Update session
-            if session.browsed_urls is None:
-                session.browsed_urls = []
-            session.browsed_urls.extend(result['processed_urls'])
-            session.current_batch_index += 1
+            if not scraping_results['success']:
+                logger.warning("Polling scraper returned unsuccessful result")
+                return [], [], []
             
-            logger.info(f"Batch {session.current_batch_index} processed: {len(result['extracted_questions'])} questions, {len(result['screenshots'])} screenshots")
+            # Format questions for UI
+            formatted_questions = []
+            for question_data in scraping_results['all_questions']:
+                formatted_questions.append({
+                    'question': question_data['question'],
+                    'source': f"{question_data['source']} - {question_data['survey_name']}",
+                    'poll_id': question_data['poll_id'],
+                    'survey_name': question_data['survey_name'],
+                    'survey_date': question_data['survey_date'],
+                    'extraction_method': question_data['extraction_method']
+                })
             
-            return result['extracted_questions'], result['processed_urls'], result['screenshots']
+            # Create source list
+            sources = list(set([q['source'] for q in formatted_questions]))
+            
+            # GET POLLING SITE SCREENSHOTS from scraping results
+            polling_screenshots = scraping_results.get('polling_screenshots', [])
+            
+            # Convert polling screenshots to the format expected by the UI
+            screenshots = []
+            for poll_screenshot in polling_screenshots:
+                screenshots.append({
+                    'url': poll_screenshot['url'],
+                    'screenshot': poll_screenshot['screenshot'],
+                    'title': poll_screenshot['title']
+                })
+            
+            logger.info(f"✅ Polling search complete: {len(formatted_questions)} questions, {len(screenshots)} polling site screenshots")
+            
+            # FIX: Ensure we always return valid lists (not None)
+            return formatted_questions or [], sources or [], screenshots or []
             
         except Exception as e:
-            logger.error(f"Error in optimized internet search: {e}")
-            return [], [], []
+            logger.error(f"Error in polling search: {e}")
+            # FIX: Always return valid empty lists instead of None
+            return [], [], []   
+
+
+    # Add this method to handle poll selection input
+    async def _handle_poll_selection(self, session_id: str, selected_polls: List[str]) -> str:
+        """Handle poll selection from user - ENHANCED with polling screenshots while preserving research screenshots"""
+        session = self.active_sessions[session_id]
+        
+        if not selected_polls:
+            return """
+    ❌ **No Polls Selected**
+
+    Please select at least one polling site to search.
+    """
+        
+        # Store selected polls
+        session.__dict__['selected_polls'] = selected_polls
+        session.__dict__['awaiting_poll_selection'] = False
+        session.__dict__['show_poll_selection'] = False
+        
+        # Get poll names for display
+        active_polls = PollingSiteConfig.get_active_polls()
+        selected_names = [active_polls[poll_id]['name'] for poll_id in selected_polls if poll_id in active_polls]
+        
+        # Now start the actual search WITH SCREENSHOTS
+        extracted_questions, sources, screenshots = await self._search_internet_for_questions(
+            session.research_topic, session.target_population, session
+        )
+        
+        if not extracted_questions:
+            return f"""
+    ❌ **No Questions Found**
+
+    Unable to find survey questions from the selected polling sites:
+    {chr(10).join(f"• {name}" for name in selected_names)}
+
+    **Would you like to:**
+    - **R** (Retry) - Try different polling sites
+    - **E** (Exit) - Exit workflow
+    """
+        
+        # FIX: Initialize selection pool if None and ensure questions are stored
+        if session.selected_questions_pool is None:
+            session.selected_questions_pool = []
+        if session.user_selected_questions is None:
+            session.user_selected_questions = []
+        
+        # FIX: Store extracted questions in the selection pool
+        session.selected_questions_pool = extracted_questions  # This was missing!
+        
+        # Update session with results
+        session.extracted_questions_with_sources = extracted_questions
+        session.internet_questions = [q['question'] for q in extracted_questions]
+        session.internet_sources = sources
+        
+        # FIXED: PRESERVE research screenshots and ADD polling site screenshots
+        if screenshots:
+            # Initialize screenshots list if None
+            if session.screenshots is None:
+                session.screenshots = []
+            
+            # CRITICAL FIX: Preserve existing research screenshots
+            research_screenshots = getattr(session, 'research_screenshots', None) or []
+            
+            # Create combined screenshots list: research screenshots FIRST, then polling screenshots
+            combined_screenshots = []
+            
+            # Add research screenshots first (if any)
+            if research_screenshots:
+                combined_screenshots.extend(research_screenshots)
+                logger.info(f"Preserved {len(research_screenshots)} research screenshots")
+            
+            # Add new polling screenshots
+            combined_screenshots.extend(screenshots)
+            
+            # Update session with combined screenshots
+            session.screenshots = combined_screenshots
+            
+            # ALSO store them separately as polling screenshots for reference
+            session.__dict__['polling_site_screenshots'] = screenshots
+            session.__dict__['polling_screenshots_count'] = len(screenshots)
+            
+            logger.info(f"Combined screenshots: {len(research_screenshots)} research + {len(screenshots)} polling = {len(combined_screenshots)} total")
+        
+        # Move to selection stage
+        session.stage = ResearchStage.DECISION_POINT
+        session.awaiting_selection = True
+        
+        # Format questions for UI selection and set ALL required flags
+        ui_selection_data = self._format_questions_for_ui_selection(extracted_questions)
+        session.__dict__['ui_selection_data'] = ui_selection_data
+        session.__dict__['trigger_question_selection_ui'] = True
+        session.__dict__['show_question_selection'] = True
+        
+        logger.info(f"POLL SELECTION COMPLETE: Set UI flags for {len(extracted_questions)} questions")
+        logger.info(f"ui_selection_data keys: {list(ui_selection_data.keys())}")
+        logger.info(f"trigger_question_selection_ui: {session.__dict__.get('trigger_question_selection_ui')}")
+        
+        # Enhanced response message including screenshot info
+        screenshot_info = ""
+        if screenshots:
+            screenshot_info = f"\n📸 **Screenshots captured** from {len(screenshots)} polling site homepages."
+        
+        return f"""
+    🎯 **Questions Found from Polling Sites**
+
+    Successfully scraped {len(selected_names)} polling organizations:
+    {chr(10).join(f"• {name}" for name in selected_names)}
+
+    **Found {len(extracted_questions)} total questions** from {len(sources)} different surveys.{screenshot_info}
+
+    Use the question selection interface to choose which questions to include in your research.
+
+    **Options:**
+    - **Continue** - Proceed with selected questions
+    - **Retry** - Try different polling sites
+    - **Exit** - Exit workflow
+
+    [UI_SELECTION_TRIGGER]
+    """
 
     async def validate_screenshot(self, screenshot_base64: str, url: str) -> bool:
         """
@@ -1332,19 +2232,37 @@ GENERATE {num_needed} SURVEY QUESTIONS:
             return None
 
     async def process_research_input(self, session_id: str, user_input: str) -> str:
-        """Process user input during research design phase"""
+        """Process research input with enhanced poll selection handling"""
+        logger.info(f"Processing research input for session {session_id}: '{user_input[:50]}...'")
+        
         if session_id not in self.active_sessions:
             return "Session not found. Please start a new research design session."
         
         session = self.active_sessions[session_id]
+        logger.info(f"Current session stage: {session.stage}")
         
-        # Process the input based on current stage
+        # PRIORITY 1: Handle poll selection input FIRST
+        if session.__dict__.get('awaiting_poll_selection', False):
+            logger.info("Session is awaiting poll selection")
+            try:
+                import json
+                selection_data = json.loads(user_input)
+                if 'selected_polls' in selection_data:
+                    logger.info(f"Processing poll selection: {selection_data['selected_polls']}")
+                    return await self._handle_poll_selection(session_id, selection_data['selected_polls'])
+            except:
+                logger.info("Poll selection input was not JSON format")
+                pass
+
+        # Handle stage-based processing
         if session.stage == ResearchStage.DESIGN_INPUT:
             response = await self._handle_design_input(session_id, user_input)
         elif session.stage == ResearchStage.DESIGN_REVIEW:
             response = await self._handle_design_review(session_id, user_input)
         elif session.stage == ResearchStage.DECISION_POINT:
+            logger.info("Processing decision point input")
             response = await self._handle_decision_point(session_id, user_input)
+            logger.info(f"Decision point response: {response[:50]}...")
         elif session.stage == ResearchStage.QUESTIONNAIRE_BUILDER:
             response = await self._handle_questionnaire_builder(session_id, user_input)
         elif session.stage == ResearchStage.FINAL_OUTPUT:
@@ -1352,7 +2270,12 @@ GENERATE {num_needed} SURVEY QUESTIONS:
         else:
             response = "Invalid session stage."
         
-        # Log this interaction
+        # Check if the response indicates poll selection is needed
+        if response == "POLL_SELECTION_NEEDED":
+            logger.info("Research processing triggered poll selection - not logging as chat")
+            return response
+        
+        # Log normal chat interactions
         self._log_chat_interaction(session_id, user_input, response)
         
         return response
@@ -2408,7 +3331,7 @@ GENERATE {num_needed} SURVEY QUESTIONS:
             # Process URLs with unified approach - scrape once, validate once, screenshot once
             # Do NOT mark URLs yet - only mark the ones that actually succeed
             result = await url_processor.process_urls_for_research(
-                collected_urls, research_topic, target_count=3
+                collected_urls, research_topic, target_count=1
             )
             
             # CRITICAL: Only mark the URLs that actually made it to the final research design
@@ -2496,40 +3419,26 @@ GENERATE {num_needed} SURVEY QUESTIONS:
             return "Unable to generate research design automatically. Please review your inputs manually."
     
     async def _handle_design_review(self, session_id: str, user_input: str) -> str:
-        """Handle user response during design review with research slideshow support"""
         session = self.active_sessions[session_id]
         response = user_input.upper().strip()
+        logger.info(f"🔍 DEBUG: _handle_design_review called with response: '{response}'")
         
         if response == 'Y':
-            # # SAVE the approved research design for later use in export
-            # if hasattr(session, '__dict__'):
-            #     research_design = await self._generate_research_design_with_motivation(session)
-            #     session.__dict__['saved_research_design'] = research_design
-            #     logger.info("Saved approved research design for export")
-            
-            # Check if we have research screenshots to merge with main slideshow - FIXED
-            if session.research_screenshots and len(session.research_screenshots) > 0:
-                logger.info(f"Research design includes {len(session.research_screenshots)} research screenshots")
-                
-                # Initialize main screenshots list if it doesn't exist - FIXED
-                if session.screenshots is None:
-                    session.screenshots = []
-                
-                # Add research screenshots to main slideshow - FIXED
-                session.screenshots.extend(session.research_screenshots)
-                logger.info(f"Merged research screenshots. Total screenshots: {len(session.screenshots)}")
-            
+            logger.info("🔍 DEBUG: User approved design, setting up poll selection")
             session.stage = ResearchStage.DATABASE_SEARCH
-            return await self._search_database(session)
+            # Set poll selection flags BEFORE returning
+            active_polls = PollingSiteConfig.get_active_polls()
+            session.__dict__['available_polls'] = active_polls
+            session.__dict__['show_poll_selection'] = True
+            session.__dict__['awaiting_poll_selection'] = True
+            logger.info(f"🔍 DEBUG: Set poll flags - available_polls: {len(active_polls)}, show_poll_selection: {session.__dict__.get('show_poll_selection')}")
+            logger.info("🔍 DEBUG: Returning POLL_SELECTION_NEEDED to trigger UI")
+            return "POLL_SELECTION_NEEDED"
         elif response == 'N':
             session.stage = ResearchStage.DESIGN_INPUT
             session.user_responses = {}
             return await self.start_research_design(session_id)
         elif response == 'S':
-            # Also save when user chooses to save
-            if hasattr(session, '__dict__'):
-                research_design = await self._generate_research_design_with_motivation(session)
-                session.__dict__['saved_research_design'] = research_design
             return await self._save_and_export(session)
         elif response == 'E':
             del self.active_sessions[session_id]
@@ -2537,7 +3446,7 @@ GENERATE {num_needed} SURVEY QUESTIONS:
         else:
             return """
     Please respond with:
-    - **Y** (Yes) - Proceed to search for relevant questions and data
+    - **Y** (Yes) - Proceed to select polling sources
     - **N** (No) - Revise the research design
     - **S** (Save) - Save and export this design
     - **E** (Exit) - Exit the workflow
@@ -2716,7 +3625,7 @@ GENERATE {num_needed} SURVEY QUESTIONS:
             session.internet_questions = [q['question'] for q in session.selected_questions_pool]
             session.internet_sources = sources
             
-            # Handle screenshots properly - DON'T mix with research screenshots
+            # Handle screenshots properly - DON'T mix with research screenshots - FIXED NULL CHECKS
             if screenshots:
                 # Initialize internet-only screenshots list if None
                 if session.screenshots is None:
@@ -2817,18 +3726,34 @@ GENERATE {num_needed} SURVEY QUESTIONS:
         return "\n".join(formatted_output)
 
     def _format_questions_for_ui_selection(self, questions_pool: List[Dict]) -> Dict:
-        """Format questions for UI selection with structured data"""
+        """FIXED: Format questions for UI selection with FULL deep URLs displayed correctly"""
         if not questions_pool:
             return {"questions": [], "sources": []}
         
-        # Group by source for better organization
+        # Group by actual source URL for better organization
         source_groups = {}
         formatted_questions = []
         
         for i, q_dict in enumerate(questions_pool):
-            source_url = q_dict['source']
+            # CRITICAL FIX: Use the actual FULL source URL from the question data
+            source_url = q_dict.get('source', '')
+            poll_name = q_dict.get('poll_name', 'Unknown Poll')
+            survey_name = q_dict.get('survey_name', 'Unknown Survey')
+            
+            # Debug logging for source URL extraction
+            logger.debug(f"Processing question {i+1}: source_url='{source_url}', poll_name='{poll_name}'")
+            
+            # Validate that we have a proper URL
+            if not source_url or not source_url.startswith(('http://', 'https://')):
+                # Fallback: construct URL if missing
+                if poll_name and poll_name != 'Unknown Poll':
+                    source_url = f"https://{poll_name.lower().replace(' ', '').replace('university', '').replace('college', '').replace('school', '')}.edu"
+                else:
+                    source_url = "https://unknown-source.com"
+            
             question_id = f"q_{i+1}"
             
+            # Use the FULL URL as the grouping key
             if source_url not in source_groups:
                 source_groups[source_url] = []
             
@@ -2836,26 +3761,38 @@ GENERATE {num_needed} SURVEY QUESTIONS:
                 "id": question_id,
                 "index": i,
                 "question": q_dict['question'],
-                "source": source_url,
+                "source": source_url,  # KEEP FULL DEEP URL
+                "display_source": source_url,  # ALSO use full URL for display
+                "poll_name": poll_name,
+                "survey_name": survey_name,
                 "extraction_method": q_dict.get('extraction_method', 'unknown')
             }
             
             source_groups[source_url].append(question_data)
             formatted_questions.append(question_data)
         
-        # Format sources for display
+        # Format sources for display with FULL URLs
         formatted_sources = []
         for source_num, (source_url, questions) in enumerate(source_groups.items(), 1):
+            first_question = questions[0]
+            poll_name = first_question.get('poll_name', 'Unknown Poll')
+            
+            # Extract domain for display purposes but show FULL URL as primary
             try:
                 from urllib.parse import urlparse
-                domain = urlparse(source_url).netloc
+                parsed = urlparse(source_url)
+                domain = parsed.netloc if source_url else 'Unknown'
             except:
-                domain = source_url
+                domain = 'Unknown'
             
+            # CRITICAL FIX: Make sure the full_url field contains the complete deep URL
             formatted_sources.append({
                 "id": f"source_{source_num}",
-                "domain": domain,
-                "full_url": source_url,
+                "domain": domain,  # Domain for backwards compatibility
+                "full_url": source_url,  # CRITICAL: This must be the FULL deep URL
+                "display_url": source_url,  # ADDED: Also ensure display URL is full
+                "poll_name": poll_name,
+                "display_name": poll_name,  # Clean poll name only
                 "question_count": len(questions),
                 "questions": questions
             })
@@ -2867,12 +3804,15 @@ GENERATE {num_needed} SURVEY QUESTIONS:
         }
 
     async def _handle_decision_point(self, session_id: str, user_input: str) -> str:
-        """Handle decision point with question selection logic"""
+        """Handle decision point with question selection logic - FIXED rebrowse poll selection"""
         session = self.active_sessions[session_id]
         response = user_input.strip()
         
-        # FIXED: Handle "C" or "Continue" command universally - always go to questionnaire builder
+        logger.info(f"Decision point handling: '{response}' for session {session_id}")
+        
+        # Handle "C" or "Continue" command - go to questionnaire builder
         if response.upper() in ['C', 'CONTINUE']:
+            logger.info("User chose to continue to questionnaire builder")
             # Set up questions for questionnaire builder
             if session.user_selected_questions:
                 session.use_internet_questions = True
@@ -2888,15 +3828,32 @@ GENERATE {num_needed} SURVEY QUESTIONS:
         
         # If we're awaiting selection, handle the selection input
         if session.awaiting_selection:
+            logger.info("Processing question selection input")
             return await self._handle_question_selection(session_id, response)
         
-        # Handle other responses
+        # Handle rebrowse command
         if response.upper() in ['R', 'REBROWSE']:
+            logger.info(f"User requested rebrowse (current count: {session.rebrowse_count})")
+            
             # Check if rebrowse is still allowed
             if session.rebrowse_count >= 4:
+                logger.info("Maximum rebrowse attempts reached")
                 return await self._show_final_selection_summary(session)
-            return await self._rebrowse_internet(session)
+            
+            # Call rebrowse which will return POLL_SELECTION_NEEDED
+            rebrowse_result = await self._rebrowse_internet(session)
+            
+            logger.info(f"Rebrowse result: {rebrowse_result}")
+            
+            # If rebrowse requests poll selection, return the special code
+            if rebrowse_result == "POLL_SELECTION_NEEDED":
+                logger.info("Rebrowse triggered poll selection - returning special code")
+                return "POLL_SELECTION_NEEDED"
+            else:
+                return rebrowse_result
+                
         elif response.upper() in ['E', 'EXIT']:
+            logger.info("User chose to exit workflow")
             del self.active_sessions[session_id]
             return "Research design workflow ended. Thank you!"
         else:
@@ -2912,29 +3869,34 @@ GENERATE {num_needed} SURVEY QUESTIONS:
     async def _handle_question_selection(self, session_id: str, user_input: str) -> str:
         """Handle user's question selection input from UI or text"""
         session = self.active_sessions[session_id]
-        
+        print("---------------3718-------------------")
         # Check if input is from UI (JSON format with selected question IDs)
         if user_input.strip().startswith('{') and 'selected_questions' in user_input:
+            print("---------------3721-------------------")
             try:
                 import json
                 selection_data = json.loads(user_input)
+                print("----------------3725---------------",selection_data)
                 selected_question_ids = selection_data.get('selected_questions', [])
-                
+                print("----------------3727---------------",selected_question_ids)
                 # Convert question IDs to question dictionaries
                 newly_selected = []
                 for question_id in selected_question_ids:
                     # Extract index from question ID (e.g., "q_5" -> index 4)
                     try:
                         index = int(question_id.split('_')[1]) - 1
+                        print("--------------3734-----------",index)
+                        print("--------------3735-----------",session.selected_questions_pool)
                         if 0 <= index < len(session.selected_questions_pool):
+                            print("---------------3736-------------------")
                             question_dict = session.selected_questions_pool[index]
-                            
+                            print("---------------3738-------------------")
                             # Check if already selected
                             already_selected = any(
                                 q['question'].lower().strip() == question_dict['question'].lower().strip() 
                                 for q in session.user_selected_questions
                             )
-                            
+                            print("---------------3744-------------------")
                             if not already_selected:
                                 newly_selected.append(question_dict)
                     except (ValueError, IndexError):
@@ -2943,7 +3905,7 @@ GENERATE {num_needed} SURVEY QUESTIONS:
                 # Check selection limits
                 currently_selected_count = len(session.user_selected_questions)
                 remaining_selections = session.max_selectable_questions - currently_selected_count
-                
+                print("---------------3753-------------------")
                 if len(newly_selected) > remaining_selections:
                     # Don't change awaiting_selection state, stay in selection mode
                     return f"""
@@ -2954,11 +3916,11 @@ GENERATE {num_needed} SURVEY QUESTIONS:
 
     Please select {remaining_selections} or fewer questions using the interface.
     """
-                
+                print("---------------3764-------------------")
                 # Add selected questions to user's selection
                 session.user_selected_questions.extend(newly_selected)
                 session.awaiting_selection = False  # Selection complete
-                
+                print("---------------3768-------------------")
                 # Show selection summary
                 total_selected = len(session.user_selected_questions)
                 remaining_selections = session.max_selectable_questions - total_selected
@@ -2967,7 +3929,7 @@ GENERATE {num_needed} SURVEY QUESTIONS:
                     f"{i+1}. {q['question']}" 
                     for i, q in enumerate(session.user_selected_questions)
                 )
-                
+                print("---------------3777-------------------")
                 # Check if user has reached the maximum
                 if total_selected >= session.max_selectable_questions:
                     return f"""
@@ -3275,7 +4237,7 @@ Please enter question numbers separated by spaces.
 """
 
     async def _rebrowse_internet(self, session: ResearchDesign) -> str:
-        """Rebrowse next batch and present new questions for selection with UI support"""
+        """Rebrowse shows poll selection UI instead of using previous polls - FIXED"""
         try:
             # Check rebrowse limit
             if session.rebrowse_count >= 4:
@@ -3284,70 +4246,26 @@ Please enter question numbers separated by spaces.
             # Increment rebrowse count
             session.rebrowse_count += 1
             
-            # Get new questions from next batch
-            new_extracted_questions, new_sources, new_screenshots = await self._search_internet_for_questions(
-                session.research_topic, session.target_population, session
-            )
+            logger.info(f"Starting rebrowse attempt {session.rebrowse_count}/4")
             
-            if not new_extracted_questions:
-                return await self._show_final_selection_summary(session)
+            # CRITICAL: Clear previous poll selection and reset flags
+            session.__dict__['selected_polls'] = []  # Clear previous selection
+            session.__dict__['poll_selection_completed'] = False  # Reset completion flag
+            session.__dict__['awaiting_poll_selection'] = True
+            session.__dict__['show_poll_selection'] = True
             
-            # Add new unique questions to pool
-            existing_questions = {q['question'].lower().strip() for q in session.selected_questions_pool}
-            new_unique_questions = []
+            # Get available polls for selection
+            active_polls = PollingSiteConfig.get_active_polls()
+            session.__dict__['available_polls'] = active_polls
             
-            for q_dict in new_extracted_questions:
-                question_text = q_dict['question'].lower().strip()
-                if question_text not in existing_questions:
-                    new_unique_questions.append(q_dict)
-                    existing_questions.add(question_text)
+            if not active_polls:
+                return """❌ **No Polling Sites Available**
+    No polling site scrapers are currently implemented. Please check back later."""
             
-            if not new_unique_questions:
-                return await self._show_final_selection_summary(session)
+            logger.info(f"Rebrowse: Set poll selection flags for {len(active_polls)} available polls")
             
-            session.selected_questions_pool.extend(new_unique_questions)
-            
-            # FIX: Update session screenshots with new screenshots from this batch
-            if new_screenshots:
-                # Initialize screenshots list if None - FIXED
-                if session.screenshots is None:
-                    session.screenshots = []
-                
-                # Add new screenshots to the existing slideshow
-                session.screenshots.extend(new_screenshots)
-                logger.info(f"Added {len(new_screenshots)} new screenshots to slideshow. Total: {len(session.screenshots)}")
-            
-            # IMPORTANT: Update UI selection data for rebrowse
-            ui_selection_data = self._format_questions_for_ui_selection(session.selected_questions_pool)
-            session.__dict__['ui_selection_data'] = ui_selection_data
-            session.__dict__['trigger_question_selection_ui'] = True  # Set trigger for UI
-            
-            session.awaiting_selection = True
-            
-            total_selected = len(session.user_selected_questions)
-            remaining_selections = session.max_selectable_questions - total_selected
-            
-            return f"""
-    🔍 **New Questions Found - Please Select (Rebrowse {session.rebrowse_count})**
-
-    Found {len(new_unique_questions)} NEW unique questions from {len(new_screenshots) if new_screenshots else 0} additional websites:
-
-    📸 **Slideshow Updated**: Added {len(new_screenshots) if new_screenshots else 0} new screenshots (Total: {len(session.screenshots) if session.screenshots else 0})
-
-    **📊 Selection Status:**
-    - **Currently selected:** {total_selected}/{session.max_selectable_questions}
-    - **Remaining selections:** {remaining_selections}
-    - **Total questions in pool:** {len(session.selected_questions_pool)}
-    - **Total websites browsed:** {len(session.screenshots) if session.screenshots else 0}
-
-    Use the checkboxes in the interface to select from all {len(session.selected_questions_pool)} available questions.
-
-    **Options after selection:**
-    - **Continue** - Proceed to questionnaire builder with selected questions
-    - **Rebrowse** - Search more URLs ({4 - session.rebrowse_count} rebrowses left)
-    - **Exit** - Exit workflow
-
-    [UI_SELECTION_TRIGGER]"""
+            # CRITICAL: Return special code that triggers poll selection UI
+            return "POLL_SELECTION_NEEDED"
             
         except Exception as e:
             logger.error(f"Error in rebrowse: {e}")
@@ -5618,7 +6536,7 @@ class OpenManusUI:
         self.active_websockets: List[WebSocket] = []
         self.frontend_dir = static_dir or os.path.join(os.path.dirname(__file__), "../../frontend/openmanus-ui/dist")
         self.research_workflow: Optional[ResearchWorkflow] = None
-
+        self._enhanced_extractor = None
         # Configure CORS
         self.app.add_middleware(
             CORSMiddleware,
@@ -5627,6 +6545,13 @@ class OpenManusUI:
             allow_methods=["*"],
             allow_headers=["*"],
         )
+
+        def _get_enhanced_extractor(self):
+            """Get or create enhanced question extractor with LLM access"""
+            if self._enhanced_extractor is None:
+                llm_instance = getattr(self.agent, 'llm', None) if self.agent else None
+                self._enhanced_extractor = QuestionExtractor(llm_instance)
+            return self._enhanced_extractor
 
         # Initialize Manus agent on startup
         @self.app.on_event("startup")
@@ -5637,7 +6562,7 @@ class OpenManusUI:
                 config = config_instance._config
                 
                 llm_instance = LLM(
-                    model_name="Qwen/Qwen-7B-Chat",  # switched to chat model
+                    model_name="Qwen/Qwen-7B-Chat",
                     api_type="huggingface",
                     use_auth_token=True
                 )
@@ -5659,10 +6584,15 @@ class OpenManusUI:
                 )
                 
                 self.agent = Manus(config=config, tools=manus_tools, llm=llm_instance)
-                self.research_workflow = ResearchWorkflow(llm_instance)
+                
+                # ENHANCED: Initialize research workflow with browser tool for screenshots
+                self.research_workflow = ResearchWorkflow(llm_instance, ui_instance=self)
+                
+                # CRITICAL: Share the browser tool with research workflow for polling screenshots
                 self.research_workflow.browser_tool = browser_use_tool
+                
                 self.patch_agent_methods()
-                logger.info("Manus agent and Research Workflow initialized successfully on startup.")
+                logger.info("Manus agent and Research Workflow initialized successfully with browser tool sharing.")
             except Exception as e:
                 logger.error(f"Error initializing Manus agent on startup: {str(e)}")
                 raise
@@ -5714,6 +6644,26 @@ class OpenManusUI:
                 "research_workflow_enabled": self.research_workflow is not None
             })
 
+        @self.app.get("/api/available-polls")
+        async def get_available_polls():
+            """Get list of available polling sources"""
+            try:
+                active_polls = PollingSiteConfig.get_active_polls()
+                all_polls = PollingSiteConfig.get_all_polls()
+                
+                return JSONResponse({
+                    "active_polls": active_polls,
+                    "all_polls": all_polls,
+                    "total_active": len(active_polls),
+                    "total_available": len(all_polls)
+                })
+            except Exception as e:
+                logger.error(f"Error getting available polls: {e}")
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"Error getting polls: {str(e)}"}
+                )
+
         @self.app.post("/api/message")
         async def handle_message(request: UserMessage):
             try:
@@ -5724,6 +6674,7 @@ class OpenManusUI:
                     )
 
                 session_id = request.research_session_id or "default_research_session"
+                logger.info(f"HTTP processing message for session {session_id}: '{request.content[:50]}...'")
                 
                 # Check if we have an active research session first
                 if session_id in self.research_workflow.active_sessions:
@@ -5731,28 +6682,115 @@ class OpenManusUI:
                     slideshow_data = None
                     ui_selection_data = None
                     
+                    # Handle poll selection JSON input
+                    if session.__dict__.get('awaiting_poll_selection', False):
+                        logger.info("HTTP: Session is awaiting poll selection")
+                        try:
+                            # Parse JSON input for poll selection
+                            if request.content.strip().startswith('{'):
+                                import json
+                                selection_data = json.loads(request.content)
+                                if 'selected_polls' in selection_data:
+                                    logger.info(f"HTTP: Processing poll selection: {selection_data['selected_polls']}")
+                                    
+                                    # Process poll selection
+                                    response_content = await self.research_workflow._handle_poll_selection(
+                                        session_id, selection_data['selected_polls']
+                                    )
+                                    
+                                    # Clear poll selection flags to prevent re-popup
+                                    session.__dict__['awaiting_poll_selection'] = False
+                                    session.__dict__['show_poll_selection'] = False
+                                    session.__dict__['poll_selection_completed'] = True
+                                    
+                                    # Check for UI selection data AFTER processing
+                                    if (hasattr(session, '__dict__') and 
+                                        'ui_selection_data' in session.__dict__ and
+                                        session.__dict__.get('trigger_question_selection_ui', False)):
+                                        
+                                        ui_selection_data = session.__dict__['ui_selection_data']
+                                        session.__dict__['trigger_question_selection_ui'] = False
+                                        logger.info(f"HTTP: Found UI selection data with {len(ui_selection_data.get('questions', []))} questions")
+                                    
+                                    # Check for slideshow data
+                                    if hasattr(session, 'screenshots') and session.screenshots is not None:
+                                        slideshow_data = {
+                                            "screenshots": session.screenshots,
+                                            "total_count": len(session.screenshots),
+                                            "research_topic": session.research_topic
+                                        }
+                                    
+                                    result = {
+                                        "response": response_content,
+                                        "status": "success",
+                                        "action_type": UserAction.BUILD_QUESTIONNAIRE.value,
+                                        "session_id": session_id
+                                    }
+                                    
+                                    # Add UI selection data to HTTP response
+                                    if ui_selection_data:
+                                        result["ui_selection_data"] = ui_selection_data
+                                        result["show_question_selection"] = True
+                                        logger.info("HTTP: Added UI selection data to response")
+                                    
+                                    # Add slideshow data
+                                    if slideshow_data and slideshow_data["screenshots"]:
+                                        result["slideshow_data"] = slideshow_data
+                                        result["base64_image"] = slideshow_data["screenshots"][0]["screenshot"]
+                                        result["image_url"] = slideshow_data["screenshots"][0]["url"]
+                                        result["image_title"] = slideshow_data["screenshots"][0]["title"]
+                                    
+                                    return JSONResponse(result)
+                        except Exception as e:
+                            logger.error(f"HTTP: Error processing poll selection: {e}")
+                    
                     # Process the research input
+                    logger.info("HTTP: Processing regular research input")
                     response_content = await self.research_workflow.process_research_input(
                         session_id, request.content
                     )
                     
+                    # CRITICAL: Check if response indicates poll selection is needed
+                    if response_content == "POLL_SELECTION_NEEDED":
+                        logger.info("HTTP: Poll selection needed - returning poll selection response")
+                        available_polls = session.__dict__.get('available_polls', {})
+                        if available_polls:
+                            # Check if this is a rebrowse situation
+                            is_rebrowse = session.rebrowse_count > 0
+                            rebrowse_info = f" (Rebrowse Attempt {session.rebrowse_count}/4)" if is_rebrowse else ""
+                            
+                            logger.info(f"HTTP: Returning poll selection UI - is_rebrowse: {is_rebrowse}")
+                            
+                            return JSONResponse({
+                                "response": (
+                                    f"🔄 **Select Polling Sites to Search{rebrowse_info}**\n\n"
+                                    "Please select which polling organizations you'd like to search for questions.\n"
+                                    "Use the poll selection panel below. Click **Start Polling Search** when ready."
+                                ),
+                                "status": "success",
+                                "action_type": UserAction.BUILD_QUESTIONNAIRE.value,
+                                "session_id": session_id,
+                                "available_polls": available_polls,
+                                "show_poll_selection": True,
+                                "is_rebrowse": is_rebrowse
+                            })
+                    
                     # Check if we have screenshots to include
-                    if hasattr(session, 'screenshots') and session.screenshots:
+                    if hasattr(session, 'screenshots') and session.screenshots is not None:
                         slideshow_data = {
                             "screenshots": session.screenshots,
                             "total_count": len(session.screenshots),
                             "research_topic": session.research_topic
                         }
                     
-                    # ALWAYS check for UI selection data after processing
+                    # Check for UI selection data after processing
                     if (hasattr(session, '__dict__') and 
                         'ui_selection_data' in session.__dict__ and
                         session.__dict__.get('trigger_question_selection_ui', False)):
                         
                         ui_selection_data = session.__dict__['ui_selection_data']
-                        # Clear the trigger flag
                         session.__dict__['trigger_question_selection_ui'] = False
-                        logger.info(f"Sending UI selection data with {len(ui_selection_data.get('questions', []))} questions")
+                        logger.info(f"HTTP: Sending UI selection data with {len(ui_selection_data.get('questions', []))} questions")
                     
                     # Prepare the result
                     result = {
@@ -5762,23 +6800,32 @@ class OpenManusUI:
                         "session_id": session_id
                     }
                     
+                    # Only show poll selection if NOT already completed and actually needed
+                    if (hasattr(session, '__dict__') and 
+                        session.__dict__.get('show_poll_selection', False) and
+                        not session.__dict__.get('poll_selection_completed', False)):
+                        
+                        available_polls = session.__dict__.get('available_polls', {})
+                        if available_polls:
+                            result["available_polls"] = available_polls
+                            result["show_poll_selection"] = True
+
                     # Add UI selection data if available
                     if ui_selection_data:
                         result["ui_selection_data"] = ui_selection_data
-                        result["show_question_selection"] = True  # Explicit flag for frontend
-                        logger.info("Added UI selection data to response")
+                        result["show_question_selection"] = True
+                        logger.info("HTTP: Added UI selection data to response")
                     
                     # Add slideshow data if we have screenshots
-                    if slideshow_data:
+                    if slideshow_data and slideshow_data["screenshots"]:
                         result["slideshow_data"] = slideshow_data
-                        if slideshow_data["screenshots"]:
-                            result["base64_image"] = slideshow_data["screenshots"][0]["screenshot"]
-                            result["image_url"] = slideshow_data["screenshots"][0]["url"]
-                            result["image_title"] = slideshow_data["screenshots"][0]["title"]
+                        result["base64_image"] = slideshow_data["screenshots"][0]["screenshot"]
+                        result["image_url"] = slideshow_data["screenshots"][0]["url"]
+                        result["image_title"] = slideshow_data["screenshots"][0]["title"]
                     
                     return JSONResponse(result)
 
-                # Determine action type if not provided
+                # Handle non-research sessions
                 action_type = request.action_type
                 if not action_type:
                     intent = detect_user_intent(request.content)
@@ -5788,7 +6835,7 @@ class OpenManusUI:
                 if action_type == UserAction.BUILD_QUESTIONNAIRE.value:
                     # Start new research session
                     session_id = f"research_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-                    logger.info(f"Starting new research session: {session_id}")
+                    logger.info(f"HTTP: Starting new research session: {session_id}")
                     response_content = await self.research_workflow.start_research_design(session_id)
                     
                     return JSONResponse({
@@ -5799,7 +6846,7 @@ class OpenManusUI:
                     })
                 
                 else:
-                    # Handle URL research or general research with enhanced screenshot validation
+                    # Handle URL research or general research
                     response_data = await process_message_with_direct_scraping(
                         self.agent,
                         request.content,
@@ -5827,12 +6874,10 @@ class OpenManusUI:
                         result["base64_image"] = screenshot
                         result["screenshot_validated"] = screenshot_validated
                         
-                        # Add source URL info for the Visit Site button
                         if source_url:
                             result["source_url"] = source_url
                             result["image_url"] = source_url
                             
-                            # Extract domain for title
                             try:
                                 from urllib.parse import urlparse
                                 parsed = urlparse(source_url)
@@ -5846,9 +6891,8 @@ class OpenManusUI:
                     return JSONResponse(result)
                 
             except Exception as e:
-                logger.error(f"Error in handle_message: {str(e)}", exc_info=True)
+                logger.error(f"HTTP: Error in handle_message: {str(e)}", exc_info=True)
                 error_response = f"Server error: {str(e)}"
-                save_comprehensive_response(request.content, error_response, is_error=True)
                 return JSONResponse(
                     status_code=500,
                     content={"response": error_response, "status": "error"}
@@ -6030,15 +7074,135 @@ class OpenManusUI:
                 )
 
     async def process_message(self, user_message: str, session_id: str = "default", action_type: str = None):
-        """Process a user message via WebSocket with research screenshot detection"""
+        """Process a user message via WebSocket with COMPLETE poll selection and rebrowse handling"""
         try:
             if not self.agent:
                 await self.broadcast_message("error", {"message": "Agent not initialized"})
                 return
 
+            logger.info(f"WebSocket processing message for session {session_id}: '{user_message[:50]}...'")
+
             # Check if we have an active research session first
             if session_id in self.research_workflow.active_sessions:
                 session = self.research_workflow.active_sessions[session_id]
+                
+                # PRIORITY 1: Handle poll selection with polling site screenshots
+                if session.__dict__.get('awaiting_poll_selection', False):
+                    logger.info("WebSocket: Session is awaiting poll selection")
+                    try:
+                        # Parse JSON input for poll selection
+                        if user_message.strip().startswith('{'):
+                            import json
+                            selection_data = json.loads(user_message)
+                            if 'selected_polls' in selection_data:
+                                logger.info(f"WebSocket: Processing poll selection: {selection_data['selected_polls']}")
+                                
+                                # Process poll selection WITH screenshots
+                                response_content = await self.research_workflow._handle_poll_selection(
+                                    session_id, selection_data['selected_polls']
+                                )
+                                
+                                # Clear poll selection flags immediately
+                                session.__dict__['awaiting_poll_selection'] = False
+                                session.__dict__['show_poll_selection'] = False
+                                session.__dict__['poll_selection_completed'] = True
+                                
+                                # Handle UI selection data and screenshots
+                                ui_selection_data = None
+                                slideshow_data = None
+                                
+                                if (hasattr(session, '__dict__') and 
+                                    'ui_selection_data' in session.__dict__ and
+                                    session.__dict__.get('trigger_question_selection_ui', False)):
+                                    
+                                    ui_selection_data = session.__dict__['ui_selection_data']
+                                    session.__dict__['trigger_question_selection_ui'] = False
+                                    logger.info(f"WebSocket: Broadcasting UI selection data with {len(ui_selection_data.get('questions', []))} questions")
+                                
+                                # Check for slideshow data
+                                screenshots = getattr(session, 'screenshots', None)
+                                if screenshots is not None and len(screenshots) > 0:
+                                    slideshow_data = {
+                                        "screenshots": screenshots,
+                                        "total_count": len(screenshots),
+                                        "research_topic": session.research_topic,
+                                        "is_polling_phase": True,
+                                        "phase_name": "Selected Polling Organizations"
+                                    }
+                                    
+                                    # Add polling metadata if available
+                                    if session.__dict__.get('polling_screenshots_count', 0) > 0:
+                                        slideshow_data["polling_screenshots_count"] = session.__dict__['polling_screenshots_count']
+                                        slideshow_data["description"] = f"Overview of {session.__dict__['polling_screenshots_count']} polling organizations"
+                                    
+                                    logger.info(f"WebSocket: Broadcasting slideshow with {len(screenshots)} screenshots")
+                                
+                                # Prepare response message
+                                message_data = {
+                                    "content": response_content,
+                                    "action_type": UserAction.BUILD_QUESTIONNAIRE.value,
+                                    "session_id": session_id
+                                }
+                                
+                                # Add UI selection data if available
+                                if ui_selection_data:
+                                    message_data["ui_selection_data"] = ui_selection_data
+                                    message_data["show_question_selection"] = True
+                                    logger.info("WebSocket: Added UI selection data to message")
+                                
+                                # Add slideshow data if available
+                                if slideshow_data:
+                                    message_data["slideshow_data"] = slideshow_data
+                                    if slideshow_data["screenshots"]:
+                                        message_data["base64_image"] = slideshow_data["screenshots"][0]["screenshot"]
+                                        message_data["image_url"] = slideshow_data["screenshots"][0]["url"]
+                                        message_data["image_title"] = slideshow_data["screenshots"][0]["title"]
+                                
+                                await self.broadcast_message("agent_message", message_data)
+                                
+                                # Send separate slideshow update
+                                if slideshow_data:
+                                    await self.broadcast_message("slideshow_data", slideshow_data)
+                                    
+                                    # Send browser state update
+                                    await self.broadcast_message("browser_state", {
+                                        "base64_image": slideshow_data["screenshots"][0]["screenshot"],
+                                        "url": slideshow_data["screenshots"][0]["url"],
+                                        "title": slideshow_data["screenshots"][0]["title"],
+                                        "source_url": slideshow_data["screenshots"][0]["url"],
+                                        "is_polling_site": True
+                                    })
+                                
+                                return
+                    except Exception as e:
+                        logger.error(f"WebSocket: Error processing poll selection: {e}")
+                
+                # Only show poll selection popup if NOT already handled
+                if (session.__dict__.get('show_poll_selection', False) and 
+                    not session.__dict__.get('awaiting_poll_selection', False) and
+                    not session.__dict__.get('poll_selection_completed', False)):
+                    
+                    available_polls = session.__dict__.get('available_polls', {})
+                    if available_polls:
+                        # Check if this is a rebrowse situation
+                        is_rebrowse = session.rebrowse_count > 0
+                        rebrowse_info = f" (Rebrowse Attempt {session.rebrowse_count}/4)" if is_rebrowse else ""
+                        
+                        await self.broadcast_message("agent_message", {
+                            "content": (
+                                f"🔄 **Select Polling Sites to Search{rebrowse_info}**\n\n"
+                                "Please select which polling organizations you'd like to search for questions.\n"
+                                "Use the poll selection panel below. Click **Start Polling Search** when ready."
+                            ),
+                            "available_polls": available_polls,
+                            "show_poll_selection": True,
+                            "session_id": session_id,
+                            "action_type": "poll_selection",
+                            "is_rebrowse": is_rebrowse
+                        })
+                        # Set awaiting flag but DON'T clear show flag yet
+                        session.__dict__['awaiting_poll_selection'] = True
+                        return
                 
                 # ENHANCED: Handle design input completion (when research design is generated)
                 if (session.stage == ResearchStage.DESIGN_INPUT and 
@@ -6076,6 +7240,29 @@ class OpenManusUI:
                                         "source_url": research_screenshots[0]['url']
                                     })
                         
+                        # Check if poll selection is needed
+                        if response == "POLL_SELECTION_NEEDED":
+                            # Trigger poll selection UI
+                            available_polls = session.__dict__.get('available_polls', {})
+                            if available_polls:
+                                # Check if this is a rebrowse situation
+                                is_rebrowse = session.rebrowse_count > 0
+                                rebrowse_info = f" (Rebrowse Attempt {session.rebrowse_count}/4)" if is_rebrowse else ""
+                                
+                                await self.broadcast_message("agent_message", {
+                                    "content": (
+                                        f"🔄 **Select Polling Sites to Search{rebrowse_info}**\n\n"
+                                        "Please select which polling organizations you'd like to search for questions.\n"
+                                        "Use the poll selection panel below. Click **Start Polling Search** when ready."
+                                    ),
+                                    "available_polls": available_polls,
+                                    "show_poll_selection": True,
+                                    "session_id": session_id,
+                                    "action_type": "poll_selection",
+                                    "is_rebrowse": is_rebrowse
+                                })
+                                return
+                        
                         # Send the main response
                         await self.broadcast_message("agent_message", {
                             "content": response,
@@ -6093,6 +7280,29 @@ class OpenManusUI:
                     try:
                         # Process the research input which will capture research screenshots
                         response = await self.research_workflow.process_research_input(session_id, user_message)
+                        
+                        # Check if poll selection is needed
+                        if response == "POLL_SELECTION_NEEDED":
+                            # Trigger poll selection UI
+                            available_polls = session.__dict__.get('available_polls', {})
+                            if available_polls:
+                                # Check if this is a rebrowse situation
+                                is_rebrowse = session.rebrowse_count > 0
+                                rebrowse_info = f" (Rebrowse Attempt {session.rebrowse_count}/4)" if is_rebrowse else ""
+                                
+                                await self.broadcast_message("agent_message", {
+                                    "content": (
+                                        f"🔄 **Select Polling Sites to Search{rebrowse_info}**\n\n"
+                                        "Please select which polling organizations you'd like to search for questions.\n"
+                                        "Use the poll selection panel below. Click **Start Polling Search** when ready."
+                                    ),
+                                    "available_polls": available_polls,
+                                    "show_poll_selection": True,
+                                    "session_id": session_id,
+                                    "action_type": "poll_selection",
+                                    "is_rebrowse": is_rebrowse
+                                })
+                                return
                         
                         # Check if we have research screenshots to display FIRST
                         research_screenshots = getattr(session, 'research_screenshots', None)
@@ -6119,7 +7329,7 @@ class OpenManusUI:
                         
                         # After processing, check if we NOW have internet search screenshots too
                         screenshots = getattr(session, 'screenshots', None)
-                        if screenshots:
+                        if screenshots is not None:
                             # Count research vs internet screenshots
                             research_count = len(research_screenshots) if research_screenshots else 0
                             total_count = len(screenshots)
@@ -6184,12 +7394,35 @@ class OpenManusUI:
                         # Mark that database search has started to avoid duplicate processing
                         session._database_search_started = True
                         
-                        # Store screenshots count before search
+                        # Store screenshots count before search - FIXED null check
                         screenshots = getattr(session, 'screenshots', None)
-                        old_screenshot_count = len(screenshots) if screenshots else 0
+                        old_screenshot_count = len(screenshots) if screenshots is not None else 0
                         
                         # Process the search which will capture screenshots of found URLs
                         response = await self.research_workflow.process_research_input(session_id, user_message)
+                        
+                        # Check if poll selection is needed
+                        if response == "POLL_SELECTION_NEEDED":
+                            # Trigger poll selection UI
+                            available_polls = session.__dict__.get('available_polls', {})
+                            if available_polls:
+                                # Check if this is a rebrowse situation
+                                is_rebrowse = session.rebrowse_count > 0
+                                rebrowse_info = f" (Rebrowse Attempt {session.rebrowse_count}/4)" if is_rebrowse else ""
+                                
+                                await self.broadcast_message("agent_message", {
+                                    "content": (
+                                        f"🔄 **Select Polling Sites to Search{rebrowse_info}**\n\n"
+                                        "Please select which polling organizations you'd like to search for questions.\n"
+                                        "Use the poll selection panel below. Click **Start Polling Search** when ready."
+                                    ),
+                                    "available_polls": available_polls,
+                                    "show_poll_selection": True,
+                                    "session_id": session_id,
+                                    "action_type": "poll_selection",
+                                    "is_rebrowse": is_rebrowse
+                                })
+                                return
                         
                         # Check for UI selection data AFTER processing
                         ui_selection_data = None
@@ -6201,9 +7434,9 @@ class OpenManusUI:
                             session.__dict__['trigger_question_selection_ui'] = False
                             logger.info(f"Broadcasting UI selection data with {len(ui_selection_data.get('questions', []))} questions")
                         
-                        # After processing, check if we have NEW screenshots to display
+                        # After processing, check if we have NEW screenshots to display - FIXED null checks
                         screenshots_after = getattr(session, 'screenshots', None)
-                        if screenshots_after:
+                        if screenshots_after is not None:
                             new_screenshot_count = len(screenshots_after)
                             new_screenshots_added = new_screenshot_count - old_screenshot_count
                             
@@ -6220,7 +7453,7 @@ class OpenManusUI:
                                 })
                                 
                                 # Also send the first NEW screenshot to browser view
-                                if screenshots_after and new_screenshots_added > 0:
+                                if new_screenshots_added > 0 and len(screenshots_after) > old_screenshot_count:
                                     # Show the first new screenshot (skip research screenshots if any)
                                     first_new_index = old_screenshot_count
                                     if first_new_index < len(screenshots_after):
@@ -6253,12 +7486,35 @@ class OpenManusUI:
                 # ENHANCED: Handle rebrowse (R response) with updated slideshow
                 elif session.stage == ResearchStage.DECISION_POINT and user_message.upper().strip() == 'R':
                     try:
-                        # Store screenshots count before rebrowse
+                        # Store screenshots count before rebrowse - FIXED null check
                         screenshots = getattr(session, 'screenshots', None)
-                        old_screenshot_count = len(screenshots) if screenshots else 0
+                        old_screenshot_count = len(screenshots) if screenshots is not None else 0
                         
                         # Process the rebrowse which will capture additional screenshots
                         response = await self.research_workflow.process_research_input(session_id, user_message)
+                        
+                        # CRITICAL: Check if response indicates poll selection is needed
+                        if response == "POLL_SELECTION_NEEDED":
+                            logger.info("WebSocket: Rebrowse triggered poll selection - showing poll selection UI")
+                            available_polls = session.__dict__.get('available_polls', {})
+                            if available_polls:
+                                # This IS a rebrowse situation
+                                is_rebrowse = True
+                                rebrowse_info = f" (Rebrowse Attempt {session.rebrowse_count}/4)"
+                                
+                                await self.broadcast_message("agent_message", {
+                                    "content": (
+                                        f"🔄 **Select Polling Sites to Search{rebrowse_info}**\n\n"
+                                        "Please select which polling organizations you'd like to search for questions.\n"
+                                        "Use the poll selection panel below. Click **Start Polling Search** when ready."
+                                    ),
+                                    "available_polls": available_polls,
+                                    "show_poll_selection": True,
+                                    "session_id": session_id,
+                                    "action_type": "poll_selection",
+                                    "is_rebrowse": is_rebrowse
+                                })
+                                return
                         
                         # Check for UI selection data AFTER processing
                         ui_selection_data = None
@@ -6270,9 +7526,9 @@ class OpenManusUI:
                             session.__dict__['trigger_question_selection_ui'] = False
                             logger.info(f"Broadcasting updated UI selection data with {len(ui_selection_data.get('questions', []))} questions")
                         
-                        # After processing, check if we have updated screenshots to display
+                        # After processing, check if we have updated screenshots to display - FIXED null checks
                         screenshots_after = getattr(session, 'screenshots', None)
-                        if screenshots_after:
+                        if screenshots_after is not None:
                             new_screenshot_count = len(screenshots_after)
                             new_screenshots_added = new_screenshot_count - old_screenshot_count
                             
@@ -6289,7 +7545,7 @@ class OpenManusUI:
                                 })
                                 
                                 # Send the most recent screenshot to browser view (last added)
-                                if screenshots_after and new_screenshots_added > 0:
+                                if new_screenshots_added > 0 and len(screenshots_after) > 0:
                                     latest_screenshot = screenshots_after[-1]  # Get the last (newest) screenshot
                                     await self.broadcast_message("browser_state", {
                                         "base64_image": latest_screenshot['screenshot'],
@@ -6317,17 +7573,40 @@ class OpenManusUI:
                     except Exception as e:
                         logger.warning(f"Could not process rebrowse with screenshots: {e}")
                 
-                # ENHANCED: Handle question selection responses that might trigger more rebrowsing
+                # ENHANCED: Handle question selection responses that might trigger more rebrowsing - FIXED NULL CHECKS
                 elif (session.stage == ResearchStage.DECISION_POINT and 
                     hasattr(session, 'awaiting_selection') and 
                     getattr(session, 'awaiting_selection', False)):
                     try:
-                        # Store screenshots count before processing selection
+                        # Store screenshots count before processing selection - FIXED null check
                         screenshots = getattr(session, 'screenshots', None)
-                        old_screenshot_count = len(screenshots) if screenshots else 0
+                        old_screenshot_count = len(screenshots) if screenshots is not None else 0
                         
                         # Process the selection input
                         response = await self.research_workflow.process_research_input(session_id, user_message)
+                        
+                        # Check if poll selection is needed
+                        if response == "POLL_SELECTION_NEEDED":
+                            # Trigger poll selection UI
+                            available_polls = session.__dict__.get('available_polls', {})
+                            if available_polls:
+                                # Check if this is a rebrowse situation
+                                is_rebrowse = session.rebrowse_count > 0
+                                rebrowse_info = f" (Rebrowse Attempt {session.rebrowse_count}/4)" if is_rebrowse else ""
+                                
+                                await self.broadcast_message("agent_message", {
+                                    "content": (
+                                        f"🔄 **Select Polling Sites to Search{rebrowse_info}**\n\n"
+                                        "Please select which polling organizations you'd like to search for questions.\n"
+                                        "Use the poll selection panel below. Click **Start Polling Search** when ready."
+                                    ),
+                                    "available_polls": available_polls,
+                                    "show_poll_selection": True,
+                                    "session_id": session_id,
+                                    "action_type": "poll_selection",
+                                    "is_rebrowse": is_rebrowse
+                                })
+                                return
                         
                         # Check for UI selection data AFTER processing
                         ui_selection_data = None
@@ -6339,9 +7618,9 @@ class OpenManusUI:
                             session.__dict__['trigger_question_selection_ui'] = False
                             logger.info(f"Broadcasting selection UI data with {len(ui_selection_data.get('questions', []))} questions")
                         
-                        # Check if screenshots were updated during selection processing
+                        # Check if screenshots were updated during selection processing - FIXED null checks
                         screenshots_after = getattr(session, 'screenshots', None)
-                        if screenshots_after:
+                        if screenshots_after is not None:
                             new_screenshot_count = len(screenshots_after)
                             
                             # If new screenshots were added, update the slideshow
@@ -6358,7 +7637,7 @@ class OpenManusUI:
                                 })
                                 
                                 # Update browser view with latest screenshot
-                                if screenshots_after:
+                                if len(screenshots_after) > 0:
                                     latest_screenshot = screenshots_after[-1]
                                     await self.broadcast_message("browser_state", {
                                         "base64_image": latest_screenshot['screenshot'],
@@ -6387,7 +7666,31 @@ class OpenManusUI:
                         logger.warning(f"Could not process selection with potential screenshots: {e}")
                 
                 # Regular research workflow processing for all other cases
+                logger.info("WebSocket: Processing regular research input")
                 response = await self.research_workflow.process_research_input(session_id, user_message)
+                
+                # CRITICAL: Check if response indicates poll selection is needed
+                if response == "POLL_SELECTION_NEEDED":
+                    logger.info("WebSocket: Regular processing triggered poll selection - showing poll selection UI")
+                    available_polls = session.__dict__.get('available_polls', {})
+                    if available_polls:
+                        # Check if this is a rebrowse situation
+                        is_rebrowse = session.rebrowse_count > 0
+                        rebrowse_info = f" (Rebrowse Attempt {session.rebrowse_count}/4)" if is_rebrowse else ""
+                        
+                        await self.broadcast_message("agent_message", {
+                            "content": (
+                                f"🔄 **Select Polling Sites to Search{rebrowse_info}**\n\n"
+                                "Please select which polling organizations you'd like to search for questions.\n"
+                                "Use the poll selection panel below. Click **Start Polling Search** when ready."
+                            ),
+                            "available_polls": available_polls,
+                            "show_poll_selection": True,
+                            "session_id": session_id,
+                            "action_type": "poll_selection",
+                            "is_rebrowse": is_rebrowse
+                        })
+                        return
                 
                 # ALWAYS check for UI selection data after ANY processing
                 ui_selection_data = None
@@ -6515,7 +7818,7 @@ class OpenManusUI:
                 "action_type": action_type if 'action_type' in locals() else None
             })
         except Exception as e:
-            logger.error(f"Error processing message: {str(e)}", exc_info=True)
+            logger.error(f"WebSocket: Error processing message: {str(e)}", exc_info=True)
             await self.broadcast_message("error", {
                 "message": f"Error processing message: {str(e)}"
             })
@@ -6531,6 +7834,14 @@ class OpenManusUI:
                 logger.error(f"Error sending message to client: {str(e)}")
                 if websocket in self.active_websockets:
                     self.active_websockets.remove(websocket)
+
+    async def broadcast_scraping_status(self, status: str, details: str = ""):
+        """Broadcast scraping status to connected clients"""
+        await self.broadcast_message("scraping_status", {
+            "status": status,
+            "details": details,
+            "timestamp": time.time()
+        })
 
     def patch_agent_methods(self):
         """Patch the agent methods to capture responses immediately."""

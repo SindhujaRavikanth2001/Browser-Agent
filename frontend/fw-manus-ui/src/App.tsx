@@ -168,6 +168,18 @@ type UISelectionData = {
   total_count: number;
 };
 
+// Poll selection types
+type PollSource = {
+  id: string;
+  name: string;
+  description: string;
+  active: boolean;
+};
+
+type PollSelectionData = {
+  [key: string]: PollSource;
+};
+
 const MUSIC_TRACKS = {
   thinking: {
     url: '/music/thinking-ambient.mp3',
@@ -268,6 +280,13 @@ function App() {
     browsing: null
   });
   const [musicButtonRef, setMusicButtonRef] = useState<HTMLElement | null>(null);
+
+  // Poll selection state
+  const [showPollSelection, setShowPollSelection] = useState(false);
+  const [availablePolls, setAvailablePolls] = useState<PollSelectionData>({});
+  const [selectedPollIds, setSelectedPollIds] = useState<Set<string>>(new Set());
+  const [pollSelectionLoading, setPollSelectionLoading] = useState(false);
+  const [pollSelectionCompleted, setPollSelectionCompleted] = useState(false);
 
   // Update voiceInputRef whenever voiceInput changes
   useEffect(() => {
@@ -520,6 +539,51 @@ function App() {
     // Keep the selection panel open to show new questions when they arrive
   };
 
+  // Poll selection functions
+  const handlePollToggle = (pollId: string) => {
+    const newSelected = new Set(selectedPollIds);
+    
+    if (newSelected.has(pollId)) {
+      newSelected.delete(pollId);
+    } else {
+      newSelected.add(pollId);
+    }
+    
+    setSelectedPollIds(newSelected);
+  };
+
+  const submitPollSelection = () => {
+    if (selectedPollIds.size === 0) {
+      showDownloadNotification('Please select at least one polling site', 'warning');
+      return;
+    }
+
+    const selectionData = Array.from(selectedPollIds);
+
+    // Send selection via WebSocket or HTTP
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({
+        content: JSON.stringify({ selected_polls: selectionData })
+      }));
+    } else {
+      fetch('/api/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: JSON.stringify({ selected_polls: selectionData })
+        })
+      });
+    }
+
+    // Close selection panel and show loading
+    setShowPollSelection(false);
+    setSelectedPollIds(new Set());
+    setAvailablePolls({});
+    setPollSelectionLoading(true);
+    setIsLoading(true);
+    setPollSelectionCompleted(true); // Mark poll selection as completed
+  };
+  
   // Music control functions
   const playBackgroundMusic = (trackType: MusicTrackType = 'thinking') => {
     if (!isMusicEnabled) return;
@@ -906,12 +970,38 @@ function App() {
         setIsLoading(false);
         setActiveTab(0);
 
+        // ENHANCED: Handle poll selection data
+        console.log('🔍 DEBUG: Checking for poll selection data:', {
+          hasAvailablePolls: !!data.available_polls,
+          pollCount: data.available_polls ? Object.keys(data.available_polls).length : 0,
+          showPollSelection: data.show_poll_selection,
+          content: data.content
+        });
+        
+        // Only show poll selection if we haven't already handled it
+        if (data.available_polls && Object.keys(data.available_polls).length > 0 && !showPollSelection && !pollSelectionCompleted) {
+          console.log('🔍 DEBUG: Poll selection data received, setting UI state');
+          setAvailablePolls(data.available_polls);
+          setShowPollSelection(true);
+          setPollSelectionLoading(false);
+          console.log('🔍 DEBUG: showPollSelection set to true');
+        }
+
+        // Handle show_poll_selection flag
+        if (data.show_poll_selection && !showPollSelection && !pollSelectionCompleted) {
+          console.log('🔍 DEBUG: Received show_poll_selection flag');
+          setShowPollSelection(true);
+          setPollSelectionLoading(false);
+          console.log('🔍 DEBUG: showPollSelection set to true from flag');
+        }
+
         // Handle UI selection data
         if (data.ui_selection_data) {
           console.log('Received UI selection data:', data.ui_selection_data);
           setUISelectionData(data.ui_selection_data);
           setShowQuestionSelection(true);
           setSelectionMode('initial');
+          setPollSelectionLoading(false);
         }
 
         // Alternative: Check for UI selection trigger flag
@@ -937,6 +1027,19 @@ function App() {
           setBrowserState(data.base64_image);
           setCurrentImageUrl(data.image_url || '');
           setCurrentImageTitle(data.image_title || '');
+        }
+
+        // Enhanced question selection with poll source info
+        if (data.content && data.content.includes('Questions Found from Polling Sites')) {
+          console.log('Questions found from polling sites');
+          setPollSelectionLoading(false);
+          
+          // Auto-trigger question selection if UI data is available
+          if (data.ui_selection_data) {
+            setUISelectionData(data.ui_selection_data);
+            setShowQuestionSelection(true);
+            setSelectionMode('initial');
+          }
         }
 
         // NEW: Detect when research package is completed and files are generated
@@ -1083,6 +1186,19 @@ function App() {
         } else {
           console.warn('Received empty browser screenshot');
         }
+      } else if (data.type === 'scraping_status') {
+        // Handle scraping progress updates
+        console.log('Scraping status update:', data.status, data.details);
+        
+        // You could show a progress indicator or toast notification
+        if (data.status === 'started') {
+          setPollSelectionLoading(true);
+        } else if (data.status === 'completed') {
+          setPollSelectionLoading(false);
+        } else if (data.status === 'progress') {
+          // Show progress details if needed
+          console.log('Scraping progress:', data.details);
+        }
       }
     };
 
@@ -1147,6 +1263,20 @@ function App() {
             ]);
           }
 
+          // Handle poll selection data from HTTP API
+          if (data.available_polls) {
+            console.log('Received available polls data from HTTP API');
+            setAvailablePolls(data.available_polls);
+            setShowPollSelection(true);
+            setPollSelectionLoading(false);
+          }
+
+          // Handle poll selection trigger
+          if (data.show_poll_selection) {
+            console.log('Received show_poll_selection flag from HTTP API');
+            setShowPollSelection(true);
+            setPollSelectionLoading(false);
+          }
           // Handle UI selection data from HTTP API
           if (data.ui_selection_data) {
             console.log('Received UI selection data from HTTP API');
@@ -1199,6 +1329,154 @@ function App() {
 
   const handleTabChange = (_: React.SyntheticEvent, newValue: number) => {
     setActiveTab(newValue);
+  };
+
+    // Poll Selection Panel Component
+  const PollSelectionPanel = () => {
+    console.log('🔍 DEBUG: PollSelectionPanel render - showPollSelection:', showPollSelection);
+    return (
+  <Drawer
+    anchor="bottom"
+    open={showPollSelection}
+    onClose={() => setShowPollSelection(false)}
+    sx={{
+      '& .MuiDrawer-paper': {
+        height: '70vh',
+        maxHeight: '600px',
+        p: 0
+      }
+    }}
+  >
+    <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+      {/* Header */}
+      <Box sx={{
+        p: 3,
+        borderBottom: `1px solid ${theme.palette.divider}`,
+        backgroundColor: alpha(theme.palette.background.paper, 0.9),
+        flexShrink: 0
+      }}>
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+          <Typography variant="h6" fontWeight="600">
+            Select Polling Sources
+          </Typography>
+          <IconButton onClick={() => setShowPollSelection(false)}>
+            <CloseIcon />
+          </IconButton>
+        </Box>
+
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+          <Typography variant="body2" color="text.secondary">
+            Choose which polling organizations to search for survey questions
+          </Typography>
+          <Chip
+            label={`${selectedPollIds.size} selected`}
+            size="small"
+            color={selectedPollIds.size > 0 ? 'primary' : 'default'}
+          />
+        </Box>
+
+        {/* Action buttons */}
+        <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+          <Button
+            variant="contained"
+            onClick={submitPollSelection}
+            disabled={selectedPollIds.size === 0 || pollSelectionLoading}
+            sx={{ textTransform: 'none' }}
+          >
+            Start Polling Search ({selectedPollIds.size} sites)
+          </Button>
+          <Button
+            variant="outlined"
+            onClick={() => setShowPollSelection(false)}
+            disabled={pollSelectionLoading}
+            sx={{ textTransform: 'none' }}
+          >
+            Cancel
+          </Button>
+        </Box>
+      </Box>
+
+      {/* Polls content - FIXED data handling */}
+      <Box sx={{ flexGrow: 1, overflow: 'auto', p: 2 }}>
+        {Object.keys(availablePolls).length > 0 ? (
+          <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 2 }}>
+            {Object.entries(availablePolls).map(([pollId, pollInfo]) => (
+              <Paper
+                key={pollId}
+                elevation={0}
+                sx={{
+                  p: 2,
+                  border: `1px solid ${theme.palette.divider}`,
+                  borderRadius: 2,
+                  cursor: pollInfo.active ? 'pointer' : 'default',
+                  opacity: pollInfo.active ? 1 : 0.6,
+                  backgroundColor: selectedPollIds.has(pollId) 
+                    ? alpha(theme.palette.primary.main, 0.1)
+                    : 'transparent',
+                  borderColor: selectedPollIds.has(pollId) 
+                    ? theme.palette.primary.main 
+                    : theme.palette.divider,
+                  '&:hover': pollInfo.active ? {
+                    backgroundColor: alpha(theme.palette.primary.main, 0.05),
+                    borderColor: theme.palette.primary.main
+                  } : {}
+                }}
+                onClick={() => pollInfo.active && handlePollToggle(pollId)}
+              >
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', mb: 1 }}>
+                  <Box sx={{ flexGrow: 1 }}>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                      <Checkbox
+                        checked={selectedPollIds.has(pollId)}
+                        onChange={() => handlePollToggle(pollId)}
+                        disabled={!pollInfo.active}
+                        sx={{
+                          padding: 0,
+                          '&.Mui-disabled': {
+                            color: theme.palette.action.disabled
+                          }
+                        }}
+                      />
+                      <Typography variant="subtitle1" fontWeight="600" sx={{
+                        color: selectedPollIds.has(pollId) 
+                          ? theme.palette.primary.main 
+                          : theme.palette.text.primary
+                      }}>
+                        {pollInfo.name}
+                      </Typography>
+                      {!pollInfo.active && (
+                        <Chip
+                          label="Coming Soon"
+                          size="small"
+                          sx={{
+                            fontSize: '0.7rem',
+                            height: '18px',
+                            backgroundColor: alpha(theme.palette.warning.main, 0.1),
+                            color: theme.palette.warning.main
+                          }}
+                        />
+                      )}
+                    </Box>
+                    <Typography variant="body2" color="text.secondary" sx={{ fontSize: '0.85rem' }}>
+                      {pollInfo.description}
+                    </Typography>
+                  </Box>
+                </Box>
+              </Paper>
+            ))}
+          </Box>
+        ) : (
+          <Box sx={{ textAlign: 'center', py: 4 }}>
+            <CircularProgress size={24} />
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 2 }}>
+              Loading polling sources...
+            </Typography>
+          </Box>
+        )}
+      </Box>
+    </Box>
+  </Drawer>
+  );
   };
 
   // Download Panel Component
@@ -2534,6 +2812,9 @@ function App() {
 
       {/* Question Selection Panel */}
       <QuestionSelectionPanel />
+
+      {/* Poll Selection Panel */}
+      <PollSelectionPanel />
 
       {/* Background music audio elements */}
       {Object.entries(MUSIC_TRACKS).map(([key, track]) => (

@@ -1,9 +1,5 @@
 """
-Simple Marquette Law School Poll Scraper
-Step 1: Navigate to search URL
-Step 2: Collect URLs of 8 search results  
-Step 3: Visit each URL and scrape content
-Step 4: Store everything in JSON file
+Simple Marquette Law School Poll Scraper - UPDATED with Simple Question Extraction
 """
 
 from selenium import webdriver
@@ -15,11 +11,6 @@ import time
 import argparse
 import json
 import re
-from question_extractor import extract_questions_from_content, question_extractor
-
-class ScraperTimeout(Exception):
-    """Custom exception for scraper timeouts"""
-    pass
 
 class SimpleMarquetteScraper:
     def __init__(self, headless=True):
@@ -39,35 +30,52 @@ class SimpleMarquetteScraper:
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
         
-        # Try multiple approaches for ChromeDriver
         try:
-            # Method 1: Use webdriver-manager (if working)
             service = Service(ChromeDriverManager().install())
             self.driver = webdriver.Chrome(service=service, options=chrome_options)
             print("✅ ChromeDriver loaded via webdriver-manager")
         except Exception as e:
             print(f"❌ webdriver-manager failed: {e}")
             try:
-                # Method 2: Use manually installed ChromeDriver
                 service = Service('/usr/local/bin/chromedriver')
                 self.driver = webdriver.Chrome(service=service, options=chrome_options)
                 print("✅ ChromeDriver loaded from /usr/local/bin/chromedriver")
             except Exception as e2:
-                print(f"❌ Manual ChromeDriver failed: {e2}")
                 try:
-                    # Method 3: Let Selenium find ChromeDriver automatically
                     self.driver = webdriver.Chrome(options=chrome_options)
                     print("✅ ChromeDriver loaded automatically by Selenium")
                 except Exception as e3:
                     print(f"❌ All ChromeDriver methods failed: {e3}")
                     raise e3
         
-        # Set implicit wait and other configurations
         self.driver.implicitly_wait(10)
         self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     
+    def extract_questions_marquette_simple(self, content):
+        """Simple regex extraction for Marquette - looks for 'Question:' tags"""
+        questions = []
+        
+        # Look for "Question:" followed by text
+        question_pattern = r'Question:\s*(.+?)(?=\n|Question:|$)'
+        matches = re.findall(question_pattern, content, re.IGNORECASE | re.DOTALL)
+        
+        for match in matches:
+            question = match.strip()
+            # Clean up the question
+            question = re.sub(r'\s+', ' ', question)  # Remove extra whitespace
+            question = question.replace('\n', ' ').strip()
+            
+            # Make sure it ends with a question mark
+            if question and not question.endswith('?'):
+                question += '?'
+            
+            if len(question) > 10 and len(question) < 500:  # Reasonable length
+                questions.append(question)
+        
+        return questions
+    
     def search_and_scrape(self, search_term, max_results=5):
-        """Main scraping function - FIXED method name"""
+        """Main scraping function"""
         self.results = []
         
         # Step 1: Navigate to search URL
@@ -79,7 +87,7 @@ class SimpleMarquetteScraper:
         # Step 2: Collect URLs of search results
         print("Step 2: Collecting URLs of search results...")
         urls = self.collect_urls(max_results)
-        print(f"Found {len(urls)} URLs: {urls}")
+        print(f"Found {len(urls)} URLs")
         
         # Step 3: Visit each URL and scrape content
         print("Step 3: Visiting each URL and scraping content...")
@@ -90,27 +98,20 @@ class SimpleMarquetteScraper:
                 self.driver.get(url)
                 time.sleep(3)
                 
-                # Get page title
                 title = self.driver.title
-                
-                # Get main content
                 content = self.get_page_content()
                 
-                # Extract questions with enhanced extraction
-                extracted_questions = question_extractor.extract_questions_with_metadata(
-                    content, url, title
-                )
+                # SIMPLE question extraction for Marquette
+                extracted_questions = self.extract_questions_marquette_simple(content)
+                
+                print(f"  Extracted {len(extracted_questions)} questions using simple regex")
                 
                 self.results.append({
-                    'number': i,
-                    'url': url,
-                    'title': title,
-                    'content': content,
                     'survey_code': f"MARQUETTE_{i}",
                     'survey_date': time.strftime('%Y-%m-%d'),
                     'survey_question': title,
+                    'url': url,
                     'embedded_content': content,
-                    'main_content': content,
                     'extracted_questions': extracted_questions
                 })
                 
@@ -119,17 +120,15 @@ class SimpleMarquetteScraper:
                 print(f"  ❌ Error scraping {url}: {e}")
                 continue
         
-        print(f"Step 4: Completed scraping {len(self.results)} results")
+        print(f"Completed scraping {len(self.results)} results")
         return self.results
     
     def collect_urls(self, max_results=5):
         """Collect URLs from search results"""
         urls = []
-        
-        # Find all article links
         articles = self.driver.find_elements(By.CSS_SELECTOR, "article")
         
-        for article in articles[:max_results]:  # Get first max_results
+        for article in articles[:max_results]:
             try:
                 link = article.find_element(By.CSS_SELECTOR, "h2 a")
                 url = link.get_attribute('href')
@@ -138,45 +137,34 @@ class SimpleMarquetteScraper:
             except:
                 continue
         
-        return urls[:max_results]  # Ensure we only get max_results
+        return urls[:max_results]
     
     def get_page_content(self):
         """Get main content from current page"""
         try:
-            # Try to get main content
             content_element = self.driver.find_element(By.CSS_SELECTOR, ".entry-content")
             return content_element.text.strip()
         except:
             try:
-                # Fallback to body
                 body = self.driver.find_element(By.TAG_NAME, "body")
                 return body.text.strip()
             except:
                 return "Could not extract content"
-    
-    def extract_questions_from_result(self, result):
-        """Extract questions from a single result"""
-        content = result.get('embedded_content', result.get('main_content', ''))
-        return extract_questions_from_content(content)
     
     def cleanup(self):
         """Close browser"""
         if self.driver:
             self.driver.quit()
 
-# Use the enhanced question extraction from the shared module
-# The extract_questions_from_content function is now imported from question_extractor
-
 def main():
     """Run the scraper with command line arguments"""
-    parser = argparse.ArgumentParser(description='Poll scraper')
+    parser = argparse.ArgumentParser(description='Marquette Poll scraper')
     parser.add_argument('--keyword', required=True, help='Search keyword')
     parser.add_argument('--max-results', type=int, default=5, help='Maximum results to scrape')
     parser.add_argument('--output', required=True, help='Output JSON file path')
     parser.add_argument('--headless', default='true', help='Run in headless mode')
     
     args = parser.parse_args()
-    
     headless = args.headless.lower() == 'true'
     
     scraper = SimpleMarquetteScraper(headless=headless)
@@ -192,30 +180,14 @@ def main():
             'surveys': []
         }
         
-        # Process results with ENHANCED question extraction
         for result in results:
-            # Get the embedded content
-            embedded_content = result.get('embedded_content', result.get('main_content', ''))
-            
-            # Try enhanced extraction first (with LLM fallback)
-            try:
-                # Note: In individual scrapers, you won't have LLM access
-                # So use the synchronous pattern-based extraction
-                extracted_questions = extract_questions_from_content(embedded_content, max_questions=15)
-                
-                print(f"Extracted {len(extracted_questions)} questions from survey")
-                
-            except Exception as e:
-                print(f"Question extraction failed: {e}")
-                extracted_questions = []
-            
             survey_data = {
                 'survey_code': result.get('survey_code', 'Unknown'),
                 'survey_date': result.get('survey_date', 'Unknown'),
                 'survey_question': result.get('survey_question', ''),
                 'url': result.get('url', ''),
-                'embedded_content': embedded_content,
-                'extracted_questions': extracted_questions
+                'embedded_content': result.get('embedded_content', ''),
+                'extracted_questions': result.get('extracted_questions', [])
             }
             output_data['surveys'].append(survey_data)
         

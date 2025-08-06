@@ -14,7 +14,6 @@ import time
 import argparse
 import json
 import re
-from question_extractor import extract_questions_from_content, question_extractor
 
 class ScraperTimeout(Exception):
     """Custom exception for scraper timeouts"""
@@ -183,35 +182,6 @@ class IframeMaristScraper:
                     # Scrape the embedded HTML content
                     content = self.scrape_embedded_content(survey_code, survey_date, survey_question)
                     
-                    # Add URL information - try to get actual URL from iframe
-                    try:
-                        # Try to find a link in the row that might contain the actual URL
-                        row = button.find_element(By.XPATH, "./ancestor::tr")
-                        links = row.find_elements(By.TAG_NAME, "a")
-                        actual_url = ""
-                        for link in links:
-                            href = link.get_attribute('href')
-                            if href and 'maristpoll.marist.edu' in href:
-                                actual_url = href
-                                break
-                        
-                        if actual_url:
-                            content['url'] = actual_url
-                        else:
-                            # Fallback: construct URL from survey code
-                            content['url'] = f"https://maristpoll.marist.edu/surveys/{survey_code.lower().replace(' ', '-')}"
-                    except:
-                        # Fallback: construct URL from survey code
-                        content['url'] = f"https://maristpoll.marist.edu/surveys/{survey_code.lower().replace(' ', '-')}"
-                    
-                    # Extract questions with enhanced extraction
-                    embedded_content = content.get('embedded_content', '')
-                    if embedded_content:
-                        extracted_questions = question_extractor.extract_questions_with_metadata(
-                            embedded_content, content.get('url', ''), survey_code
-                        )
-                        content['extracted_questions'] = extracted_questions
-                    
                     self.results.append(content)
                     
                     # IMPORTANT: Click the HTML Preview button again to toggle it off
@@ -378,34 +348,6 @@ class IframeMaristScraper:
                 'scraped_at': time.strftime('%Y-%m-%d %H:%M:%S')
             }
     
-    def save_results_json(self, keyword, output_file):
-        """Save results in JSON format for integration"""
-        output_data = {
-            'keyword': keyword,
-            'scraped_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'total_results': len(self.results),
-            'surveys': []
-        }
-        
-        for result in self.results:
-            survey_data = {
-                'survey_code': result.get('survey_code', result.get('original_title', 'Unknown')),
-                'survey_date': result.get('survey_date', result.get('original_date', 'Unknown')),
-                'survey_question': result.get('survey_question', result.get('main_content', '')[:500]),
-                'embedded_content': result.get('embedded_content', result.get('main_content', '')),
-                'url': result.get('url', ''),  # CRITICAL: Include the actual URL
-                'extracted_questions': self.extract_questions_from_result(result)
-            }
-            output_data['surveys'].append(survey_data)
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(output_data, f, indent=2, ensure_ascii=False)
-
-    def extract_questions_from_result(self, result):
-        """Extract questions from a single result"""
-        content = result.get('embedded_content', result.get('main_content', ''))
-        return extract_questions_from_content(content)
-    
     def cleanup(self):
         """Close browser"""
         if self.driver:
@@ -414,20 +356,19 @@ class IframeMaristScraper:
 
 def main():
     """Run the scraper with command line arguments"""
-    parser = argparse.ArgumentParser(description='Poll scraper')
+    parser = argparse.ArgumentParser(description='Marist Poll scraper')
     parser.add_argument('--keyword', required=True, help='Search keyword')
     parser.add_argument('--max-results', type=int, default=5, help='Maximum results to scrape')
     parser.add_argument('--output', required=True, help='Output JSON file path')
     parser.add_argument('--headless', default='true', help='Run in headless mode')
     
     args = parser.parse_args()
-    
     headless = args.headless.lower() == 'true'
     
     scraper = IframeMaristScraper(headless=headless)
     
     try:
-        results = scraper.search_and_scrape(args.keyword, args.max_results)
+        scraper.search_and_scrape(args.keyword, args.max_results)
         
         # Convert results to the expected format and save as JSON
         output_data = {
@@ -437,34 +378,18 @@ def main():
             'surveys': []
         }
         
-        # Process results with ENHANCED question extraction
-        for result in results:
-            # Get the embedded content
-            embedded_content = result.get('embedded_content', result.get('main_content', ''))
-            
-            # Try enhanced extraction first (with LLM fallback)
-            try:
-                # Note: In individual scrapers, you won't have LLM access
-                # So use the synchronous pattern-based extraction
-                extracted_questions = extract_questions_from_content(embedded_content, max_questions=15)
-                
-                print(f"Extracted {len(extracted_questions)} questions from survey")
-                
-            except Exception as e:
-                print(f"Question extraction failed: {e}")
-                extracted_questions = []
-            
+        # Process results WITHOUT question extraction
+        for result in scraper.results:
             survey_data = {
                 'survey_code': result.get('survey_code', 'Unknown'),
                 'survey_date': result.get('survey_date', 'Unknown'),
                 'survey_question': result.get('survey_question', ''),
                 'url': result.get('url', ''),
-                'embedded_content': embedded_content,
-                'extracted_questions': extracted_questions
+                'embedded_content': result.get('embedded_content', ''),
+                # NO extracted_questions - LLM will handle this
             }
             output_data['surveys'].append(survey_data)
         
-        # Save to JSON file
         with open(args.output, 'w', encoding='utf-8') as f:
             json.dump(output_data, f, indent=2, ensure_ascii=False)
         

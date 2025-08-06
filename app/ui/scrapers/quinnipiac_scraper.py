@@ -15,7 +15,6 @@ import time
 import argparse
 import json
 import re
-from question_extractor import extract_questions_from_content, question_extractor
 class ScraperTimeout(Exception):
     """Custom exception for scraper timeouts"""
     pass
@@ -135,15 +134,11 @@ class QuinnipiacPollScraper:
             for i, poll_info in enumerate(poll_info_list, 1):
                 try:
                     print(f"\n--- Processing poll {i}/{len(poll_info_list)} ---")
-                    print(f"Title: {poll_info['title']}")
-                    print(f"Date: {poll_info['date']}")
-                    print(f"URL: {poll_info['url']}")
                     
-                    # Navigate directly to the poll page
+                    # Navigate and scrape content
                     self.driver.get(poll_info['url'])
                     time.sleep(4)
                     
-                    # Scrape the content from the poll page
                     content = self.scrape_poll_content(poll_info)
                     
                     # Add survey metadata
@@ -151,18 +146,11 @@ class QuinnipiacPollScraper:
                     content['survey_date'] = content.get('original_date', time.strftime('%Y-%m-%d'))
                     content['survey_question'] = content.get('original_title', 'Unknown')
                     
-                    # Extract questions with enhanced extraction
-                    main_content = content.get('main_content', '')
-                    if main_content:
-                        extracted_questions = question_extractor.extract_questions_with_metadata(
-                            main_content, content.get('url', ''), content.get('original_title', '')
-                        )
-                        content['extracted_questions'] = extracted_questions
+                    # REMOVED: Question extraction here - will be done by LLM in main app
                     
                     self.results.append(content)
-                    
                     print(f"✓ Poll {i} scraped successfully")
-                    time.sleep(3)  # Be respectful between requests
+                    time.sleep(3)
                     
                 except Exception as e:
                     print(f"✗ Error processing poll {i}: {e}")
@@ -523,34 +511,6 @@ class QuinnipiacPollScraper:
         except Exception as e:
             print(f"Could not save debug info: {e}")
     
-    def save_results_json(self, keyword, output_file):
-        """Save results in JSON format for integration"""
-        output_data = {
-            'keyword': keyword,
-            'scraped_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'total_results': len(self.results),
-            'surveys': []
-        }
-        
-        for result in self.results:
-            survey_data = {
-                'survey_code': result.get('survey_code', result.get('original_title', 'Unknown')),
-                'survey_date': result.get('survey_date', result.get('original_date', 'Unknown')),
-                'survey_question': result.get('survey_question', result.get('main_content', '')[:500]),
-                'embedded_content': result.get('embedded_content', result.get('main_content', '')),
-                'url': result.get('url', ''),
-                'extracted_questions': self.extract_questions_from_result(result)
-            }
-            output_data['surveys'].append(survey_data)
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(output_data, f, indent=2, ensure_ascii=False)
-
-    def extract_questions_from_result(self, result):
-        """Extract questions from a single result"""
-        content = result.get('embedded_content', result.get('main_content', ''))
-        return extract_questions_from_content(content)
-    
     def cleanup(self):
         """Close browser"""
         if self.driver:
@@ -559,20 +519,19 @@ class QuinnipiacPollScraper:
 
 def main():
     """Run the scraper with command line arguments"""
-    parser = argparse.ArgumentParser(description='Poll scraper')
+    parser = argparse.ArgumentParser(description='Quinnipiac Poll scraper')
     parser.add_argument('--keyword', required=True, help='Search keyword')
     parser.add_argument('--max-results', type=int, default=5, help='Maximum results to scrape')
     parser.add_argument('--output', required=True, help='Output JSON file path')
     parser.add_argument('--headless', default='true', help='Run in headless mode')
     
     args = parser.parse_args()
-    
     headless = args.headless.lower() == 'true'
     
     scraper = QuinnipiacPollScraper(headless=headless)
     
     try:
-        results = scraper.search_and_scrape(args.keyword, args.max_results)
+        scraper.search_and_scrape(args.keyword, args.max_results)
         
         # Convert results to the expected format and save as JSON
         output_data = {
@@ -582,34 +541,18 @@ def main():
             'surveys': []
         }
         
-        # Process results with ENHANCED question extraction
-        for result in results:
-            # Get the embedded content
-            embedded_content = result.get('embedded_content', result.get('main_content', ''))
-            
-            # Try enhanced extraction first (with LLM fallback)
-            try:
-                # Note: In individual scrapers, you won't have LLM access
-                # So use the synchronous pattern-based extraction
-                extracted_questions = extract_questions_from_content(embedded_content, max_questions=15)
-                
-                print(f"Extracted {len(extracted_questions)} questions from survey")
-                
-            except Exception as e:
-                print(f"Question extraction failed: {e}")
-                extracted_questions = []
-            
+        # Process results WITHOUT question extraction
+        for result in scraper.results:
             survey_data = {
                 'survey_code': result.get('survey_code', 'Unknown'),
                 'survey_date': result.get('survey_date', 'Unknown'),
                 'survey_question': result.get('survey_question', ''),
                 'url': result.get('url', ''),
-                'embedded_content': embedded_content,
-                'extracted_questions': extracted_questions
+                'embedded_content': result.get('main_content', ''),
+                # NO extracted_questions - LLM will handle this
             }
             output_data['surveys'].append(survey_data)
         
-        # Save to JSON file
         with open(args.output, 'w', encoding='utf-8') as f:
             json.dump(output_data, f, indent=2, ensure_ascii=False)
         

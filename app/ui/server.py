@@ -177,6 +177,74 @@ class PollingScraper:
         # ADD: Screenshot cache for polling sites
         self.polling_site_screenshots = {}
     
+    async def _extract_questions_with_llm(self, content: str, url: str, survey_name: str, poll_name: str) -> List[str]:
+        """Extract questions using LLM - fast and accurate"""
+        
+        # Get LLM instance from the main app
+        llm_instance = None
+        if hasattr(self, 'ui_instance') and self.ui_instance:
+            if hasattr(self.ui_instance, 'research_workflow'):
+                llm_instance = self.ui_instance.research_workflow.llm
+        
+        if not llm_instance:
+            print(f"⚠️ No LLM instance available for {poll_name}")
+            return []
+        
+        # Limit content for faster processing
+        content_sample = content[:4000] if len(content) > 4000 else content
+        
+        prompt = f"""Extract EXISTING survey questions from this {poll_name} poll content.
+
+    POLL: {poll_name}
+    SURVEY: {survey_name}
+    CONTENT: {content_sample}
+
+    RULES:
+    1. Find questions that already exist in the content
+    2. Return actual survey questions only (not instructions or explanations)
+    3. Each question must end with "?"
+    4. Maximum 10 questions
+    5. If no questions found, return "NO_QUESTIONS"
+
+    FORMAT: One question per line, no numbering
+
+    QUESTIONS:"""
+        
+        try:
+            response = await llm_instance.ask(prompt, temperature=0.2)
+            response_text = str(response).strip()
+            
+            if "NO_QUESTIONS" in response_text.upper():
+                return []
+            
+            # Parse questions from response
+            lines = response_text.split('\n')
+            questions = []
+            
+            for line in lines:
+                line = line.strip()
+                if not line or len(line) < 15:
+                    continue
+                    
+                # Remove numbering/bullets
+                line = re.sub(r'^\d+[\.\)]\s*', '', line)
+                line = re.sub(r'^[-•*]\s*', '', line)
+                line = line.strip()
+                
+                # Must be a proper question
+                if line.endswith('?') and len(line) > 15 and len(line) < 300:
+                    questions.append(line)
+                    
+                    if len(questions) >= 10:  # Limit to 10
+                        break
+            
+            print(f"✅ LLM extracted {len(questions)} questions from {poll_name}")
+            return questions
+            
+        except Exception as e:
+            print(f"❌ LLM extraction failed for {poll_name}: {e}")
+            return []
+
     async def _capture_polling_site_screenshot(self, poll_id: str, poll_config: dict) -> Optional[str]:
         """Capture screenshot of polling site homepage"""
         if not self.browser_tool:
@@ -533,8 +601,8 @@ class PollingScraper:
                     with open(temp_filepath, 'r', encoding='utf-8') as f:
                         scraper_results = json.load(f)
                     
-                    # Process the results with deduplication
-                    processed_results = self._process_single_scraper_results_with_dedup(
+                    # FIXED: Process the results with deduplication - MAKE IT SYNC
+                    processed_results = self._process_single_scraper_results_with_dedup_sync(
                         poll_id, poll_name, scraper_results
                     )
                     
@@ -580,95 +648,76 @@ class PollingScraper:
                 'unique_questions': [],
                 'source_info': {}
             }
-    
-    async def _process_single_scraper_results_with_dedup(self, poll_id, poll_name, scraper_results):
-        """ENHANCED: Process results with LLM-enhanced question extraction"""
+
+    def _process_single_scraper_results_with_dedup_sync(self, poll_id, poll_name, scraper_results):
+        """Process results and extract questions using LLM (except Marquette)"""
         try:
             raw_questions = []
             unique_questions = []
             
-            # Extract questions from scraper results
-            if 'surveys' in scraper_results:
-                for survey in scraper_results['surveys']:
-                    survey_name = survey.get('survey_code', f"{poll_name} Survey")
-                    survey_date = survey.get('survey_date', 'Unknown Date')
-                    survey_question = survey.get('survey_question', '')
-                    survey_url = survey.get('url', '')
-                    
-                    # Get the embedded content
-                    embedded_content = survey.get('embedded_content', '')
-                    
-                    if embedded_content:
-                        # Use enhanced extraction with LLM fallback
-                        try:
-                            from question_extractor import QuestionExtractor
-                            extractor = QuestionExtractor(self.llm) if hasattr(self, 'llm') else QuestionExtractor()
-                            
-                            if hasattr(self, 'llm'):
-                                # ASYNC extraction with LLM fallback
-                                extracted_questions = await extractor.extract_questions_with_metadata(
-                                    embedded_content, survey_url, survey_name
-                                )
-                            else:
-                                # Synchronous extraction (pattern-based only)
-                                from question_extractor import extract_questions_from_content
-                                pattern_questions = extract_questions_from_content(embedded_content)
-                                extracted_questions = []
-                                for i, q in enumerate(pattern_questions):
-                                    extracted_questions.append({
-                                        'question': q,
-                                        'source': survey_url,
-                                        'extraction_method': 'pattern_only',
-                                        'question_number': i + 1
-                                    })
-                            
-                            for q_dict in extracted_questions:
-                                raw_questions.append(q_dict['question'])
-                                
-                                # Apply deduplication
-                                if not self._is_duplicate_question(q_dict['question']):
-                                    unique_questions.append({
-                                        'question': q_dict['question'],
-                                        'source': survey_url,
-                                        'survey_name': survey_name,
-                                        'survey_date': survey_date,
-                                        'survey_question': survey_question,
-                                        'poll_id': poll_id,
-                                        'poll_name': poll_name,
-                                        'extraction_method': q_dict.get('extraction_method', 'unknown')
-                                    })
-                            
-                            logger.info(f"Enhanced extraction: {len(extracted_questions)} questions from {poll_name}")
-                            
-                        except Exception as e:
-                            logger.error(f"Enhanced extraction failed for {poll_name}: {e}")
-                            
-                            # Fallback to pattern-based extraction
-                            try:
-                                from question_extractor import extract_questions_from_content
-                                pattern_questions = extract_questions_from_content(embedded_content)
-                                
-                                for question in pattern_questions:
-                                    raw_questions.append(question)
-                                    
-                                    if not self._is_duplicate_question(question):
-                                        unique_questions.append({
-                                            'question': question,
-                                            'source': survey_url,
-                                            'survey_name': survey_name,
-                                            'survey_date': survey_date,
-                                            'survey_question': survey_question,
-                                            'poll_id': poll_id,
-                                            'poll_name': poll_name,
-                                            'extraction_method': 'pattern_fallback'
-                                        })
-                                
-                                logger.info(f"Pattern fallback: {len(pattern_questions)} questions from {poll_name}")
-                                
-                            except Exception as fallback_error:
-                                logger.error(f"All extraction failed for {poll_name}: {fallback_error}")
+            if 'surveys' not in scraper_results:
+                return self._create_error_result(poll_id, poll_name, "No surveys in results")
             
-            logger.info(f"Processed {len(unique_questions)} unique questions from {poll_name}")
+            for survey in scraper_results['surveys']:
+                survey_name = survey.get('survey_code', f"{poll_name} Survey")
+                survey_date = survey.get('survey_date', 'Unknown Date')
+                survey_question = survey.get('survey_question', '')
+                survey_url = survey.get('url', '')
+                embedded_content = survey.get('embedded_content', '')
+                
+                if not embedded_content:
+                    continue
+                
+                extracted_questions = []
+                
+                # STEP 1: Check if questions are pre-extracted (Marquette case)
+                if 'extracted_questions' in survey and survey['extracted_questions']:
+                    print(f"✅ Using pre-extracted questions from {poll_name}")
+                    extracted_questions = survey['extracted_questions']
+                
+                # STEP 2: Use LLM extraction for all other polls
+                else:
+                    print(f"🤖 Using LLM extraction for {poll_name}")
+                    # Run LLM extraction synchronously
+                    import asyncio
+                    
+                    try:
+                        # Create new event loop if needed
+                        try:
+                            loop = asyncio.get_event_loop()
+                        except RuntimeError:
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                        
+                        # Run LLM extraction
+                        extracted_questions = loop.run_until_complete(
+                            self._extract_questions_with_llm(
+                                embedded_content, survey_url, survey_name, poll_name
+                            )
+                        )
+                        
+                    except Exception as e:
+                        print(f"❌ LLM extraction failed for {poll_name}: {e}")
+                        extracted_questions = []
+                
+                # STEP 3: Process extracted questions with deduplication
+                for question in extracted_questions:
+                    raw_questions.append(question)
+                    
+                    # Apply deduplication
+                    if not self._is_duplicate_question(question):
+                        unique_questions.append({
+                            'question': question,
+                            'source': survey_url,
+                            'survey_name': survey_name,
+                            'survey_date': survey_date,
+                            'survey_question': survey_question,
+                            'poll_id': poll_id,
+                            'poll_name': poll_name,
+                            'extraction_method': 'llm_extraction' if poll_id != 'marquette' else 'regex_extraction'
+                        })
+            
+            print(f"✅ Processed {len(unique_questions)} unique questions from {poll_name}")
             
             return {
                 'poll_id': poll_id,
@@ -686,16 +735,20 @@ class PollingScraper:
             }
             
         except Exception as e:
-            logger.error(f"Error processing results for {poll_name}: {e}")
-            return {
-                'poll_id': poll_id,
-                'poll_name': poll_name,
-                'success': False,
-                'error': f"Error processing results: {str(e)}",
-                'raw_questions': [],
-                'unique_questions': [],
-                'source_info': {}
-            }
+            print(f"❌ Error processing results for {poll_name}: {e}")
+            return self._create_error_result(poll_id, poll_name, str(e))
+
+    def _create_error_result(self, poll_id, poll_name, error_message):
+        """Create error result structure"""
+        return {
+            'poll_id': poll_id,
+            'poll_name': poll_name,
+            'success': False,
+            'error': error_message,
+            'raw_questions': [],
+            'unique_questions': [],
+            'source_info': {}
+        }
         
     def _process_scraping_results(self, results):
         """FIXED: Process and combine results from all scrapers with deduplication info"""
@@ -1798,15 +1851,12 @@ class ResearchWorkflow:
 
     # Add this method to handle poll selection input
     async def _handle_poll_selection(self, session_id: str, selected_polls: List[str]) -> str:
-        """Handle poll selection from user - ENHANCED with polling screenshots while preserving research screenshots"""
+        """Handle poll selection from user - FIXED to properly store selected questions"""
         session = self.active_sessions[session_id]
         
         if not selected_polls:
-            return """
-    ❌ **No Polls Selected**
-
-    Please select at least one polling site to search.
-    """
+            return """❌ **No Polls Selected**
+    Please select at least one polling site to search."""
         
         # Store selected polls
         session.__dict__['selected_polls'] = selected_polls
@@ -1823,96 +1873,55 @@ class ResearchWorkflow:
         )
         
         if not extracted_questions:
-            return f"""
-    ❌ **No Questions Found**
-
-    Unable to find survey questions from the selected polling sites:
-    {chr(10).join(f"• {name}" for name in selected_names)}
-
-    **Would you like to:**
-    - **R** (Retry) - Try different polling sites
-    - **E** (Exit) - Exit workflow
-    """
+            return f"""❌ **No Questions Found**
+    Unable to find survey questions from the selected polling sites."""
         
-        # FIX: Initialize selection pool if None and ensure questions are stored
+        # CRITICAL FIX: Initialize all question tracking properly
         if session.selected_questions_pool is None:
             session.selected_questions_pool = []
         if session.user_selected_questions is None:
             session.user_selected_questions = []
         
-        # FIX: Store extracted questions in the selection pool
-        session.selected_questions_pool = extracted_questions  # This was missing!
-        
-        # Update session with results
-        session.extracted_questions_with_sources = extracted_questions
+        # FIXED: Store extracted questions in ALL the right places
+        session.selected_questions_pool = extracted_questions
         session.internet_questions = [q['question'] for q in extracted_questions]
         session.internet_sources = sources
+        session.extracted_questions_with_sources = extracted_questions
         
-        # FIXED: PRESERVE research screenshots and ADD polling site screenshots
+        # IMPORTANT: Set flags to use these questions
+        session.use_internet_questions = True
+        
+        # Handle screenshots properly
         if screenshots:
-            # Initialize screenshots list if None
             if session.screenshots is None:
                 session.screenshots = []
             
-            # CRITICAL FIX: Preserve existing research screenshots
+            # Preserve existing research screenshots and add polling screenshots
             research_screenshots = getattr(session, 'research_screenshots', None) or []
-            
-            # Create combined screenshots list: research screenshots FIRST, then polling screenshots
             combined_screenshots = []
             
-            # Add research screenshots first (if any)
             if research_screenshots:
                 combined_screenshots.extend(research_screenshots)
-                logger.info(f"Preserved {len(research_screenshots)} research screenshots")
-            
-            # Add new polling screenshots
             combined_screenshots.extend(screenshots)
             
-            # Update session with combined screenshots
             session.screenshots = combined_screenshots
-            
-            # ALSO store them separately as polling screenshots for reference
             session.__dict__['polling_site_screenshots'] = screenshots
             session.__dict__['polling_screenshots_count'] = len(screenshots)
-            
-            logger.info(f"Combined screenshots: {len(research_screenshots)} research + {len(screenshots)} polling = {len(combined_screenshots)} total")
         
         # Move to selection stage
         session.stage = ResearchStage.DECISION_POINT
         session.awaiting_selection = True
         
-        # Format questions for UI selection and set ALL required flags
+        # Format questions for UI selection
         ui_selection_data = self._format_questions_for_ui_selection(extracted_questions)
         session.__dict__['ui_selection_data'] = ui_selection_data
         session.__dict__['trigger_question_selection_ui'] = True
         session.__dict__['show_question_selection'] = True
         
-        logger.info(f"POLL SELECTION COMPLETE: Set UI flags for {len(extracted_questions)} questions")
-        logger.info(f"ui_selection_data keys: {list(ui_selection_data.keys())}")
-        logger.info(f"trigger_question_selection_ui: {session.__dict__.get('trigger_question_selection_ui')}")
-        
-        # Enhanced response message including screenshot info
-        screenshot_info = ""
-        if screenshots:
-            screenshot_info = f"\n📸 **Screenshots captured** from {len(screenshots)} polling site homepages."
-        
-        return f"""
-    🎯 **Questions Found from Polling Sites**
-
-    Successfully scraped {len(selected_names)} polling organizations:
-    {chr(10).join(f"• {name}" for name in selected_names)}
-
-    **Found {len(extracted_questions)} total questions** from {len(sources)} different surveys.{screenshot_info}
-
-    Use the question selection interface to choose which questions to include in your research.
-
-    **Options:**
-    - **Continue** - Proceed with selected questions
-    - **Retry** - Try different polling sites
-    - **Exit** - Exit workflow
-
-    [UI_SELECTION_TRIGGER]
-    """
+        return f"""🎯 **Questions Found from Polling Sites**
+    Successfully scraped {len(selected_names)} polling organizations.
+    **Found {len(extracted_questions)} total questions** from {len(sources)} different surveys.
+    Use the question selection interface to choose which questions to include in your research."""
 
     async def validate_screenshot(self, screenshot_base64: str, url: str) -> bool:
         """
@@ -2595,11 +2604,11 @@ GENERATE {num_needed} SURVEY QUESTIONS:
             return f"Error creating research package: {str(e)}. Please check logs and try again."
     
     def _create_saved_question_breakdown(self, session: ResearchDesign, final_questions: List[str]) -> str:
-        """Create question breakdown from saved session data without LLM calls"""
+        """SIMPLE FIX: Just use the selected questions directly - no pattern matching needed"""
         
         # Get different question types from session data
         custom_questions = session.__dict__.get('custom_questions', [])
-        selected_questions = []
+        polling_questions = []
         generated_questions = []
         
         # Fixed demographics
@@ -2611,56 +2620,104 @@ GENERATE {num_needed} SURVEY QUESTIONS:
             "In which city/region do you currently live?"
         ]
         
-        # Identify selected internet questions from session
+        # SIMPLE FIX: Just use user_selected_questions directly
+        polling_sources = []
+        
         if (hasattr(session, 'user_selected_questions') and 
             session.user_selected_questions):
-            selected_questions = [q['question'] for q in session.user_selected_questions]
-            selected_sources = list(set(q['source'] for q in session.user_selected_questions))
-        elif (session.questionnaire_responses and 
-            'selected_questions' in session.questionnaire_responses):
-            selected_questions = session.questionnaire_responses['selected_questions']
-            selected_sources = session.internet_sources or []
-        else:
-            selected_sources = []
+            
+            # Get the selected polling questions directly
+            polling_questions = [q['question'] for q in session.user_selected_questions]
+            
+            # Get sources
+            unique_sources = set()
+            for q in session.user_selected_questions:
+                poll_name = q.get('poll_name', '')
+                source = q.get('source', '')
+                
+                if poll_name and poll_name != 'Unknown Poll':
+                    unique_sources.add(poll_name)
+                elif source and 'http' in source:
+                    try:
+                        from urllib.parse import urlparse
+                        domain = urlparse(source).netloc
+                        unique_sources.add(domain)
+                    except:
+                        unique_sources.add(source[:50])
+                elif source:
+                    unique_sources.add(source)
+                else:
+                    unique_sources.add("Polling Organization")
+            
+            polling_sources = list(unique_sources)
+            logger.info(f"SIMPLE EXPORT: Using {len(polling_questions)} questions directly from user_selected_questions")
         
-        # Count demographics
+        # Count demographics in final_questions
         demographic_count = sum(1 for q in final_questions if q in fixed_demographics)
         
-        # Identify generated questions (everything else that's not custom, selected, or demographic)
+        # Identify generated questions - everything in final_questions that's NOT custom or demographic
+        # (We don't need to remove polling questions from final_questions since we're showing them separately)
         for q in final_questions:
-            if q not in custom_questions and q not in selected_questions and q not in fixed_demographics:
+            if (q not in custom_questions and 
+                q not in fixed_demographics):
                 generated_questions.append(q)
         
-        # Build comprehensive breakdown
+        logger.info(f"=== SIMPLE EXPORT DEBUG ===")
+        logger.info(f"Polling questions (direct): {len(polling_questions)}")
+        logger.info(f"Generated questions: {len(generated_questions)}")
+        logger.info(f"Custom questions: {len(custom_questions)}")
+        logger.info(f"Demographics: {demographic_count}")
+        
+        # Build breakdown
         breakdown_lines = []
+        
+        # Show polling questions FIRST
+        if polling_questions:
+            breakdown_lines.append(f"Selected Polling Questions: {len(polling_questions)}")
+            breakdown_lines.append(f"  • Questions selected from polling organizations during research")
+            if polling_sources:
+                breakdown_lines.append(f"  • Sources: {', '.join(polling_sources[:5])}")
+            breakdown_lines.append("")
+            
+            breakdown_lines.append("SELECTED POLLING QUESTIONS:")
+            for i, q in enumerate(polling_questions, 1):
+                breakdown_lines.append(f"  {i}. {q}")
+            breakdown_lines.append("")
         
         if generated_questions:
             breakdown_lines.append(f"AI Generated Questions: {len(generated_questions)}")
             breakdown_lines.append(f"  • Created based on research topic and methodology")
             breakdown_lines.append("")
-        
-        if selected_questions:
-            breakdown_lines.append(f"Internet Research Questions: {len(selected_questions)}")
-            breakdown_lines.append(f"  • Selected from {len(selected_sources)} websites")
-            if selected_sources:
-                breakdown_lines.append(f"  • Sources included:")
-                for source in selected_sources[:5]:  # Show up to 5 sources
-                    breakdown_lines.append(f"    - {source}")
-                if len(selected_sources) > 5:
-                    breakdown_lines.append(f"    - ... and {len(selected_sources) - 5} more sources")
+            
+            breakdown_lines.append("AI GENERATED QUESTIONS:")
+            for i, q in enumerate(generated_questions, 1):
+                breakdown_lines.append(f"  {i}. {q}")
             breakdown_lines.append("")
         
         if custom_questions:
             breakdown_lines.append(f"Custom Questions (User-Provided): {len(custom_questions)}")
-            breakdown_lines.append(f"  • Questions you added during the questionnaire building process")
+            breakdown_lines.append(f"  • Questions you added during questionnaire building")
+            breakdown_lines.append("")
+            
+            breakdown_lines.append("CUSTOM QUESTIONS:")
+            for i, q in enumerate(custom_questions, 1):
+                breakdown_lines.append(f"  {i}. {q}")
             breakdown_lines.append("")
         
         if demographic_count > 0:
+            demographic_questions = [q for q in final_questions if q in fixed_demographics]
             breakdown_lines.append(f"Fixed Demographics: {demographic_count}")
             breakdown_lines.append(f"  • Standard demographic questions automatically included")
             breakdown_lines.append("")
+            
+            breakdown_lines.append("DEMOGRAPHIC QUESTIONS:")
+            for i, q in enumerate(demographic_questions, 1):
+                breakdown_lines.append(f"  {i}. {q}")
+            breakdown_lines.append("")
         
-        breakdown_lines.append(f"Total Approved Questions: {len(final_questions)}")
+        # Calculate total (polling + generated + custom + demographics)
+        total_questions = len(polling_questions) + len(generated_questions) + len(custom_questions) + demographic_count
+        breakdown_lines.append(f"Total Questions: {total_questions}")
         
         return "\n".join(breakdown_lines)
 
@@ -3869,34 +3926,30 @@ GENERATE {num_needed} SURVEY QUESTIONS:
     async def _handle_question_selection(self, session_id: str, user_input: str) -> str:
         """Handle user's question selection input from UI or text"""
         session = self.active_sessions[session_id]
-        print("---------------3718-------------------")
         # Check if input is from UI (JSON format with selected question IDs)
         if user_input.strip().startswith('{') and 'selected_questions' in user_input:
-            print("---------------3721-------------------")
             try:
                 import json
                 selection_data = json.loads(user_input)
-                print("----------------3725---------------",selection_data)
                 selected_question_ids = selection_data.get('selected_questions', [])
-                print("----------------3727---------------",selected_question_ids)
                 # Convert question IDs to question dictionaries
                 newly_selected = []
                 for question_id in selected_question_ids:
                     # Extract index from question ID (e.g., "q_5" -> index 4)
                     try:
                         index = int(question_id.split('_')[1]) - 1
-                        print("--------------3734-----------",index)
-                        print("--------------3735-----------",session.selected_questions_pool)
+
+
                         if 0 <= index < len(session.selected_questions_pool):
-                            print("---------------3736-------------------")
+
                             question_dict = session.selected_questions_pool[index]
-                            print("---------------3738-------------------")
+
                             # Check if already selected
                             already_selected = any(
                                 q['question'].lower().strip() == question_dict['question'].lower().strip() 
                                 for q in session.user_selected_questions
                             )
-                            print("---------------3744-------------------")
+
                             if not already_selected:
                                 newly_selected.append(question_dict)
                     except (ValueError, IndexError):
@@ -3905,7 +3958,7 @@ GENERATE {num_needed} SURVEY QUESTIONS:
                 # Check selection limits
                 currently_selected_count = len(session.user_selected_questions)
                 remaining_selections = session.max_selectable_questions - currently_selected_count
-                print("---------------3753-------------------")
+
                 if len(newly_selected) > remaining_selections:
                     # Don't change awaiting_selection state, stay in selection mode
                     return f"""
@@ -3916,11 +3969,11 @@ GENERATE {num_needed} SURVEY QUESTIONS:
 
     Please select {remaining_selections} or fewer questions using the interface.
     """
-                print("---------------3764-------------------")
+
                 # Add selected questions to user's selection
                 session.user_selected_questions.extend(newly_selected)
                 session.awaiting_selection = False  # Selection complete
-                print("---------------3768-------------------")
+
                 # Show selection summary
                 total_selected = len(session.user_selected_questions)
                 remaining_selections = session.max_selectable_questions - total_selected
@@ -3929,7 +3982,7 @@ GENERATE {num_needed} SURVEY QUESTIONS:
                     f"{i+1}. {q['question']}" 
                     for i, q in enumerate(session.user_selected_questions)
                 )
-                print("---------------3777-------------------")
+
                 # Check if user has reached the maximum
                 if total_selected >= session.max_selectable_questions:
                     return f"""
@@ -4203,7 +4256,7 @@ Please enter question numbers separated by spaces.
 """
 
     async def _show_current_questions(self, session: ResearchDesign) -> str:
-        """Show current questions with options"""
+        """FIXED: Show current questions with proper categorization including polling questions"""
         if not session.questions:
             return "No questions generated yet."
         
@@ -4215,17 +4268,64 @@ Please enter question numbers separated by spaces.
             "In which city/region do you currently live?"
         ]
         
-        main_questions = [q for q in session.questions if q not in fixed_demographics]
-        demographic_questions = [q for q in session.questions if q in fixed_demographics]
+        # Categorize questions properly
+        custom_questions = session.__dict__.get('custom_questions', [])
+        polling_questions = []
+        generated_questions = []
+        demographic_questions = []
         
-        return f"""
-📋 **Current Questionnaire ({len(session.questions)} questions)**
+        # Get polling questions from user selection
+        if (hasattr(session, 'user_selected_questions') and 
+            session.user_selected_questions):
+            polling_questions = [q['question'] for q in session.user_selected_questions]
+        
+        # Categorize all questions
+        for q in session.questions:
+            if q in fixed_demographics:
+                demographic_questions.append(q)
+            elif q in custom_questions:
+                continue  # Custom questions will be shown separately
+            elif q in polling_questions:
+                continue  # Polling questions will be shown separately  
+            else:
+                generated_questions.append(q)
+        
+        # Build display
+        sections = []
+        question_counter = 1
+        
+        if generated_questions:
+            sections.append(f"**AI Generated Questions ({len(generated_questions)}):**")
+            for q in generated_questions:
+                sections.append(f"{question_counter}. {q}")
+                question_counter += 1
+            sections.append("")
+        
+        if polling_questions:
+            sections.append(f"**Selected Polling Questions ({len(polling_questions)}):**")
+            for q in polling_questions:
+                sections.append(f"{question_counter}. {q}")
+                question_counter += 1
+            sections.append("")
+        
+        if custom_questions:
+            sections.append(f"**Your Custom Questions ({len(custom_questions)}):**")
+            for q in custom_questions:
+                sections.append(f"{question_counter}. {q}")
+                question_counter += 1
+            sections.append("")
+        
+        if demographic_questions:
+            sections.append(f"**Demographics ({len(demographic_questions)}):**")
+            for q in demographic_questions:
+                sections.append(f"{question_counter}. {q}")
+                question_counter += 1
+        
+        display_content = "\n".join(sections)
+        
+        return f"""📋 **Current Questionnaire ({len(session.questions)} questions)**
 
-**Main Questions ({len(main_questions)}):**
-{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(main_questions))}
-
-**Demographics ({len(demographic_questions)}):**
-{chr(10).join(f"{i+len(main_questions)+1}. {q}" for i, q in enumerate(demographic_questions))}
+{display_content}
 
 ---
 
@@ -4233,8 +4333,7 @@ Please enter question numbers separated by spaces.
 - **A** (Accept) - Use these questions and proceed to testing
 - **R** (Revise) - Rephrase questions in different words
 - **M** (More) - Generate additional questions
-- **B** (Back) - Return to questionnaire builder menu
-"""
+- **B** (Back) - Return to questionnaire builder menu"""
 
     async def _rebrowse_internet(self, session: ResearchDesign) -> str:
         """Rebrowse shows poll selection UI instead of using previous polls - FIXED"""
@@ -5119,92 +5218,62 @@ Enter your specifications:
 """
 
     async def _store_accepted_questions(self, session: ResearchDesign) -> str:
-        """Store the accepted questions and offer user input option"""
+        """FIXED: Store accepted questions ensuring polling questions are included"""
         
-        # Only generate new questions if we don't already have good ones
-        if not session.questions or len(session.questions) < 3:
-            logger.info("No sufficient questions found, generating fallback questions")
-            # Generate a comprehensive question set for the research topic
-            prompt = f"""
-    Create a final validated questionnaire for this research:
-
-    Topic: {session.research_topic}
-    Objectives: {', '.join(session.objectives or [])}
-    Target Population: {session.target_population}
-
-    Generate 8-12 specific, actionable survey questions covering:
-    1. Overall satisfaction measures
-    2. Specific topic-related questions
-    3. Behavioral questions
-    4. Demographic questions
-
-    Format each as a clear, complete survey question. Respond in English only.
-    """
-            
-            try:
-                response = await self.llm.ask(prompt, temperature=0.7)
-                cleaned_response = remove_chinese_and_punct(str(response))
-                
-                # Extract individual questions from the response
-                lines = cleaned_response.split('\n')
-                questions = []
-                for line in lines:
-                    line = line.strip()
-                    if line and (line[0].isdigit() or line.startswith('-') or line.startswith('•')):
-                        # Clean up question formatting
-                        clean_question = re.sub(r'^[\d\.\-\•\s]+', '', line).strip()
-                        if clean_question and len(clean_question) > 10:
-                            questions.append(clean_question)
-                
-                if questions:
-                    session.questions = questions
-                    logger.info(f"Generated and stored {len(questions)} fallback questions")
-                else:
-                    # Ultimate fallback questions
-                    session.questions = [
-                        "How satisfied are you with your overall experience?",
-                        "How would you rate the quality of service?",
-                        "How likely are you to recommend this to others?",
-                        "What factors are most important to you?",
-                        "How often do you use this service?",
-                        "What improvements would you suggest?",
-                        "How satisfied are you with the value for money?",
-                        "What is your age group?"
-                    ]
-                    logger.info("Used ultimate fallback questions")
-                    
-            except Exception as e:
-                logger.error(f"Error generating final questions: {e}")
-                # Use basic fallback questions
-                session.questions = [
-                    "How satisfied are you with your overall experience?",
-                    "How would you rate the quality of service?",
-                    "How likely are you to recommend this to others?",
-                    "What factors are most important to you?",
-                    "How often do you use this service?",
-                    "What improvements would you suggest?",
-                    "How satisfied are you with the value for money?",
-                    "What is your age group?"
-                ]
-                logger.info("Used basic fallback questions due to error")
-        else:
-            logger.info(f"Using existing {len(session.questions)} questions from session")
-        
-        # Count existing questions
+        # Check if we have questions from different sources
         existing_count = len(session.questions) if session.questions else 0
         
-        return f"""
-    ✅ **Questions Accepted ({existing_count} questions)**
+        # If we have user-selected polling questions, make sure they're in the final questions
+        if (hasattr(session, 'user_selected_questions') and 
+            session.user_selected_questions and 
+            existing_count == 0):
+            
+            # Convert polling questions to simple list
+            polling_questions = [q['question'] for q in session.user_selected_questions]
+            
+            # Add demographics
+            fixed_demographics = [
+                "What is your age?",
+                "What is your gender?",
+                "What is your highest level of education?",
+                "What is your annual household income range?",
+                "In which city/region do you currently live?"
+            ]
+            
+            # Combine polling questions with demographics
+            session.questions = polling_questions + fixed_demographics
+            existing_count = len(session.questions)
+            
+            logger.info(f"Added {len(polling_questions)} polling questions + {len(fixed_demographics)} demographics = {existing_count} total")
+        
+        # If still no questions, generate fallback
+        if existing_count < 3:
+            logger.info("Generating fallback questions as backup")
+            fallback_questions = [
+                "How satisfied are you with your overall experience?",
+                "How would you rate the quality of service?",
+                "How likely are you to recommend this to others?",
+                "What factors are most important to you?",
+                "How often do you use this service?",
+                "What improvements would you suggest?",
+                "How satisfied are you with the value for money?",
+                "What is your age group?"
+            ]
+            
+            if not session.questions:
+                session.questions = fallback_questions
+            else:
+                # Add fallback questions to existing ones
+                session.questions.extend(fallback_questions[:max(0, 8 - existing_count)])
+        
+        return f"""✅ **Questions Accepted ({len(session.questions)} questions)**
 
-    Would you like to add your own custom questions before proceeding to testing?
+Would you like to add your own custom questions before proceeding to testing?
 
-    **Options:**
-    - **A** (Add Custom) - Enter your own additional questions
-    - **T** (Test Now) - Proceed directly to synthetic testing with current questions
-    - **R** (Review) - Review the current question list again
-
-    Please choose your option:
-    """
+**Options:**
+- **A** (Add Custom) - Enter your own additional questions
+- **T** (Test Now) - Proceed directly to synthetic testing with current questions
+- **R** (Review) - Review the current question list again"""
     
     async def _test_questions(self, session: ResearchDesign) -> str:
         """Test questions with synthetic respondents using ALL session questions"""

@@ -1,5 +1,5 @@
 """
-Siena Research Institute Scraper
+Siena Research Institute Scraper - FIXED
 Scrapes search results from sri.siena.edu
 """
 
@@ -14,28 +14,6 @@ import time
 import argparse
 import json
 import re
-from question_extractor import extract_questions_from_content, question_extractor
-class ScraperTimeout(Exception):
-    """Custom exception for scraper timeouts"""
-    pass
-
-def run_with_timeout(self, timeout_seconds=300):
-    """Run scraper with timeout protection"""
-    import signal
-    
-    def timeout_handler(signum, frame):
-        raise ScraperTimeout(f"Scraper timed out after {timeout_seconds} seconds")
-    
-    # Set timeout
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(timeout_seconds)
-    
-    try:
-        # Run your scraping logic here
-        self.search_and_scrape(self.keyword, self.max_results)
-    finally:
-        # Disable timeout
-        signal.alarm(0)
 
 class SienaResearchScraper:
     def __init__(self, headless=True):
@@ -55,9 +33,7 @@ class SienaResearchScraper:
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
         
-        # Try multiple approaches for ChromeDriver
         try:
-            # Method 1: Use webdriver-manager (if working)
             from webdriver_manager.chrome import ChromeDriverManager
             service = Service(ChromeDriverManager().install())
             self.driver = webdriver.Chrome(service=service, options=chrome_options)
@@ -65,42 +41,29 @@ class SienaResearchScraper:
         except Exception as e:
             print(f"❌ webdriver-manager failed: {e}")
             try:
-                # Method 2: Use manually installed ChromeDriver
                 service = Service('/usr/local/bin/chromedriver')
                 self.driver = webdriver.Chrome(service=service, options=chrome_options)
                 print("✅ ChromeDriver loaded from /usr/local/bin/chromedriver")
             except Exception as e2:
-                print(f"❌ Manual ChromeDriver failed: {e2}")
                 try:
-                    # Method 3: Let Selenium find ChromeDriver automatically
                     self.driver = webdriver.Chrome(options=chrome_options)
                     print("✅ ChromeDriver loaded automatically by Selenium")
                 except Exception as e3:
                     print(f"❌ All ChromeDriver methods failed: {e3}")
-                    # Method 4: Try system chromedriver
-                    try:
-                        service = Service('chromedriver')  # Assumes chromedriver is in PATH
-                        self.driver = webdriver.Chrome(service=service, options=chrome_options)
-                        print("✅ ChromeDriver loaded from system PATH")
-                    except Exception as e4:
-                        print(f"❌ System ChromeDriver failed: {e4}")
-                        raise e3
+                    raise e3
         
-        # Set implicit wait and other configurations
         self.driver.implicitly_wait(10)
         self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
     def search_and_scrape(self, keyword, max_results=5):
         """Main scraping function"""
         try:
-            # Step 1: Navigate to search results
-            search_url = f"https://sri.siena.edu/?s={keyword}"
+            search_url = f"https://sri.siena.edu/?s={keyword.replace(' ', '+')}"
             print(f"Navigating to: {search_url}")
             
             self.driver.get(search_url)
-            time.sleep(5)  # Wait for page to load
+            time.sleep(5)
             
-            # Step 2: Wait for search results to load
             print("Waiting for search results to load...")
             try:
                 WebDriverWait(self.driver, 15).until(
@@ -111,7 +74,6 @@ class SienaResearchScraper:
             except:
                 print("Warning: Could not detect search results elements")
             
-            # Step 3: Find search result links
             result_links = self.find_result_links()
             
             if not result_links:
@@ -120,7 +82,6 @@ class SienaResearchScraper:
             
             print(f"Found {len(result_links)} search result links")
             
-            # Step 4: Process each result link
             links_to_process = result_links[:max_results]
             
             for i, link_info in enumerate(links_to_process, 1):
@@ -129,11 +90,9 @@ class SienaResearchScraper:
                     print(f"Title: {link_info['title']}")
                     print(f"URL: {link_info['url']}")
                     
-                    # Navigate to the result page
                     self.driver.get(link_info['url'])
                     time.sleep(3)
                     
-                    # Scrape the content from the page
                     content = self.scrape_page_content(link_info)
                     
                     # Add survey metadata
@@ -141,24 +100,17 @@ class SienaResearchScraper:
                     content['survey_date'] = time.strftime('%Y-%m-%d')
                     content['survey_question'] = content.get('original_title', 'Unknown')
                     
-                    # Extract questions with enhanced extraction
-                    main_content = content.get('main_content', '')
-                    if main_content:
-                        extracted_questions = question_extractor.extract_questions_with_metadata(
-                            main_content, content.get('url', ''), content.get('original_title', '')
-                        )
-                        content['extracted_questions'] = extracted_questions
+                    # NO question extraction here - will be done by LLM in main app
                     
                     self.results.append(content)
                     
                     print(f"✓ Result {i} scraped successfully")
-                    time.sleep(2)  # Be respectful between requests
+                    time.sleep(2)
                     
                 except Exception as e:
                     print(f"✗ Error processing result {i}: {e}")
                     continue
             
-            # Step 5: Save results
             print(f"\nScraping completed! Successfully processed {len(self.results)} results.")
             
         except Exception as e:
@@ -169,9 +121,7 @@ class SienaResearchScraper:
         try:
             result_links = []
             
-            # Try different selectors for search results
             link_selectors = [
-                # Common WordPress search result selectors
                 ".search-results article h2 a",
                 ".search-results .entry-title a", 
                 ".post .entry-title a",
@@ -182,7 +132,6 @@ class SienaResearchScraper:
                 "article h3 a",
                 ".entry-header h2 a",
                 ".entry-header .entry-title a",
-                # Generic selectors
                 "h2 a[href*='sri.siena.edu']",
                 "h3 a[href*='sri.siena.edu']",
                 ".post-title a",
@@ -197,7 +146,6 @@ class SienaResearchScraper:
                         href = link.get_attribute('href')
                         title = link.text.strip()
                         
-                        # Filter valid results
                         if (href and href not in [r['url'] for r in result_links] 
                             and 'sri.siena.edu' in href
                             and len(title) > 5
@@ -216,19 +164,17 @@ class SienaResearchScraper:
                 except Exception as e:
                     continue
             
-            # If no specific search results found, try finding any relevant links
             if not result_links:
                 print("No specific search results found, trying general links...")
                 try:
                     all_links = self.driver.find_elements(By.XPATH, "//a[contains(@href, 'sri.siena.edu')]")
                     
-                    for link in all_links[:15]:  # Limit to avoid too many
+                    for link in all_links[:15]:
                         href = link.get_attribute('href')
                         title = link.text.strip()
                         
                         if (href and title and len(title) > 5
-                            and not href.endswith(('.pdf', '.jpg', '.png'))
-                            and 'trump' in title.lower()):
+                            and not href.endswith(('.pdf', '.jpg', '.png'))):
                             
                             result_links.append({
                                 'url': href,
@@ -248,15 +194,12 @@ class SienaResearchScraper:
     def scrape_page_content(self, link_info):
         """Scrape content from a result page"""
         try:
-            # Wait for page to load
             WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
             
-            # Get page title
             page_title = self.driver.title
             
-            # Try different content selectors
             content_selectors = [
                 ".entry-content",
                 ".post-content", 
@@ -280,7 +223,6 @@ class SienaResearchScraper:
                 except:
                     continue
             
-            # If no main content found, get body text
             if not main_content:
                 try:
                     body = self.driver.find_element(By.TAG_NAME, "body")
@@ -288,7 +230,6 @@ class SienaResearchScraper:
                 except:
                     main_content = "Could not extract content"
             
-            # Look for any data tables or specific content
             tables_content = ""
             try:
                 tables = self.driver.find_elements(By.TAG_NAME, "table")
@@ -299,7 +240,6 @@ class SienaResearchScraper:
             except:
                 pass
             
-            # Get meta description if available
             meta_description = ""
             try:
                 meta_desc = self.driver.find_element(By.XPATH, "//meta[@name='description']")
@@ -313,7 +253,8 @@ class SienaResearchScraper:
                 'page_title': page_title,
                 'url': link_info['url'],
                 'meta_description': meta_description,
-                'main_content': main_content[:8000],  # Limit content length
+                'main_content': main_content[:8000],
+                'embedded_content': main_content[:8000],  # Same as main_content for consistency
                 'tables_content': tables_content[:2000],
                 'scraped_at': time.strftime('%Y-%m-%d %H:%M:%S')
             }
@@ -327,37 +268,10 @@ class SienaResearchScraper:
                 'url': link_info['url'],
                 'meta_description': '',
                 'main_content': f'Error scraping content: {str(e)}',
+                'embedded_content': f'Error scraping content: {str(e)}',
                 'tables_content': '',
                 'scraped_at': time.strftime('%Y-%m-%d %H:%M:%S')
             }
-    
-    def save_results_json(self, keyword, output_file):
-        """Save results in JSON format for integration"""
-        output_data = {
-            'keyword': keyword,
-            'scraped_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'total_results': len(self.results),
-            'surveys': []
-        }
-        
-        for result in self.results:
-            survey_data = {
-                'survey_code': result.get('survey_code', result.get('original_title', 'Unknown')),
-                'survey_date': result.get('survey_date', result.get('original_date', 'Unknown')),
-                'survey_question': result.get('survey_question', result.get('main_content', '')[:500]),
-                'embedded_content': result.get('embedded_content', result.get('main_content', '')),
-                'url': result.get('url', ''),
-                'extracted_questions': self.extract_questions_from_result(result)
-            }
-            output_data['surveys'].append(survey_data)
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(output_data, f, indent=2, ensure_ascii=False)
-
-    def extract_questions_from_result(self, result):
-        """Extract questions from a single result"""
-        content = result.get('embedded_content', result.get('main_content', ''))
-        return extract_questions_from_content(content)
     
     def cleanup(self):
         """Close browser"""
@@ -367,20 +281,19 @@ class SienaResearchScraper:
 
 def main():
     """Run the scraper with command line arguments"""
-    parser = argparse.ArgumentParser(description='Poll scraper')
+    parser = argparse.ArgumentParser(description='Siena Poll scraper')
     parser.add_argument('--keyword', required=True, help='Search keyword')
     parser.add_argument('--max-results', type=int, default=5, help='Maximum results to scrape')
     parser.add_argument('--output', required=True, help='Output JSON file path')
     parser.add_argument('--headless', default='true', help='Run in headless mode')
     
     args = parser.parse_args()
-    
     headless = args.headless.lower() == 'true'
     
     scraper = SienaResearchScraper(headless=headless)
     
     try:
-        results = scraper.search_and_scrape(args.keyword, args.max_results)
+        scraper.search_and_scrape(args.keyword, args.max_results)
         
         # Convert results to the expected format and save as JSON
         output_data = {
@@ -390,30 +303,15 @@ def main():
             'surveys': []
         }
         
-        # Process results with ENHANCED question extraction
-        for result in results:
-            # Get the embedded content
-            embedded_content = result.get('embedded_content', result.get('main_content', ''))
-            
-            # Try enhanced extraction first (with LLM fallback)
-            try:
-                # Note: In individual scrapers, you won't have LLM access
-                # So use the synchronous pattern-based extraction
-                extracted_questions = extract_questions_from_content(embedded_content, max_questions=15)
-                
-                print(f"Extracted {len(extracted_questions)} questions from survey")
-                
-            except Exception as e:
-                print(f"Question extraction failed: {e}")
-                extracted_questions = []
-            
+        # Process results WITHOUT question extraction (LLM will handle this)
+        for result in scraper.results:
             survey_data = {
                 'survey_code': result.get('survey_code', 'Unknown'),
                 'survey_date': result.get('survey_date', 'Unknown'),
                 'survey_question': result.get('survey_question', ''),
                 'url': result.get('url', ''),
-                'embedded_content': embedded_content,
-                'extracted_questions': extracted_questions
+                'embedded_content': result.get('embedded_content', ''),
+                # NO extracted_questions field - LLM will handle this
             }
             output_data['surveys'].append(survey_data)
         
@@ -425,9 +323,6 @@ def main():
         
     finally:
         scraper.cleanup()
-
-# Use the enhanced question extraction from the shared module
-# The extract_questions_from_content function is now imported from question_extractor
 
 if __name__ == "__main__":
     main()

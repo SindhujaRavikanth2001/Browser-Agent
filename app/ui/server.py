@@ -166,7 +166,7 @@ class PollingScraper:
     
     def __init__(self, ui_instance=None, browser_tool=None):
         self.max_workers = 3
-        self.timeout = 600
+        self.timeout = 1000
         self.ui_instance = ui_instance
         self.browser_tool = browser_tool  # ADD: Browser tool for screenshots
         

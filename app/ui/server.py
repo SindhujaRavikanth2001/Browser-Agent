@@ -65,12 +65,15 @@ class PollingSiteConfig:
         'siena': 'https://scri.siena.edu/',
         'quinnipiac': 'https://poll.qu.edu/',
         'marquette': 'https://www.marquette.edu/law/poll/',
-        'morning_consult': 'https://morningconsult.com/',
         'gallup': 'https://www.gallup.com/',
         'pew': 'https://www.pewresearch.org/',
         'suffolk': 'https://www.suffolk.edu/academics/research-at-suffolk/political-research-center',
         'monmouth': 'https://www.monmouth.edu/polling-institute/',
-        'cbs': 'https://www.cbsnews.com/news/polls/'
+        'cbs': 'https://www.cbsnews.com/news/polls/',
+        'ipsos': 'https://www.ipsos.com/',
+        'emerson': 'https://emersoncollegepolling.com/',
+        'yougov': 'https://today.yougov.com/',
+        'kff': 'https://www.kff.org/'
     }
     
     AVAILABLE_POLLS = {
@@ -102,33 +105,55 @@ class PollingSiteConfig:
             'base_url': POLLING_SITE_BASE_URLS['marquette'],
             'active': True
         },
-        'morning_consult': {
-            'name': 'Morning Consult',
-            'description': 'Morning Consult - Brand intelligence and insights',
-            'scraper_file': 'scrapers/morning_consult_scraper.py',
-            'base_url': POLLING_SITE_BASE_URLS['morning_consult'],
-            'active': False  # Not implemented yet
-        },
         'gallup': {
             'name': 'Gallup',
             'description': 'Gallup - Public opinion polling and research',
             'scraper_file': 'scrapers/gallup_scraper.py',
             'base_url': POLLING_SITE_BASE_URLS['gallup'],
-            'active': False
+            'active': True
         },
         'pew': {
             'name': 'Pew Research Center',
             'description': 'Pew Research - Social trends and public opinion',
             'scraper_file': 'scrapers/pew_scraper.py',
             'base_url': POLLING_SITE_BASE_URLS['pew'],
-            'active': False
+            'active': True
         },
         'suffolk': {
             'name': 'Suffolk University',
             'description': 'Suffolk University Political Research Center',
             'scraper_file': 'scrapers/suffolk_scraper.py',
             'base_url': POLLING_SITE_BASE_URLS['suffolk'],
-            'active': False
+            'active': True
+        },
+        'ipsos': {  
+            'name': 'Ipsos',
+            'description': 'Ipsos - Global market research and public opinion polling',
+            'scraper_file': 'scrapers/ipsos_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['ipsos'],
+            'active': True
+        },
+        'emerson': {  
+            'name': 'Emerson College',
+            'description': 'Emerson College Polling - Political and public opinion research',
+            'scraper_file': 'scrapers/emerson_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['emerson'],
+            'active': True
+        },
+        'yougov': {  
+            'name': 'YouGov',
+            'description': 'YouGov - International internet-based market research and data analytics',
+            'scraper_file': 'scrapers/yougov_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['yougov'],
+            'active': True
+        },
+        'kff': { 
+            'name': 'Kaiser Family Foundation',
+            'description': 'KFF - Healthcare policy and public opinion research (healthcare topics only)',
+            'scraper_file': 'scrapers/kff_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['kff'],
+            'active': True,
+            'topic_filter': 'healthcare'
         },
         'monmouth': {
             'name': 'Monmouth University',
@@ -152,9 +177,36 @@ class PollingSiteConfig:
         return cls.POLLING_SITE_BASE_URLS.get(poll_id)
     
     @classmethod
-    def get_active_polls(cls):
-        """Get only the polls that are currently implemented"""
-        return {k: v for k, v in cls.AVAILABLE_POLLS.items() if v['active']}
+    def get_active_polls(cls, research_topic: str = None):
+        """Get only the polls that are currently implemented, with topic filtering"""
+        active_polls = {k: v for k, v in cls.AVAILABLE_POLLS.items() if v['active']}
+        
+        # If research topic is provided, filter topic-specific polls
+        if research_topic:
+            topic_lower = research_topic.lower()
+            
+            # Check if topic is healthcare-related
+            healthcare_terms = [
+                'health', 'healthcare', 'medical', 'medicine', 'doctor', 'physician',
+                'hospital', 'clinic', 'patient', 'treatment', 'therapy', 'drug',
+                'medication', 'pharmacy', 'insurance', 'medicare', 'medicaid',
+                'obamacare', 'aca', 'affordable care act', 'covid', 'coronavirus',
+                'pandemic', 'vaccine', 'vaccination', 'mental health', 'depression',
+                'anxiety', 'surgery', 'cancer', 'diabetes', 'heart disease',
+                'prescription', 'copay', 'deductible', 'premium', 'coverage',
+                'public health', 'epidemic', 'wellness', 'preventive care',
+                'emergency room', 'urgent care', 'telehealth', 'telemedicine',
+                'nursing', 'nurse', 'medical device', 'fda', 'cdc', 'nih', 'abortion'
+            ]
+            
+            is_healthcare_topic = any(term in topic_lower for term in healthcare_terms)
+            
+            # If not healthcare-related, exclude KFF
+            if not is_healthcare_topic and 'kff' in active_polls:
+                active_polls = {k: v for k, v in active_polls.items() if k != 'kff'}
+                logger.info(f"Filtered out KFF for non-healthcare topic: {research_topic}")
+        
+        return active_polls
     
     @classmethod
     def get_all_polls(cls):
@@ -178,7 +230,7 @@ class PollingScraper:
         self.polling_site_screenshots = {}
     
     async def _extract_questions_with_llm(self, content: str, url: str, survey_name: str, poll_name: str) -> List[str]:
-        """Extract questions using LLM - fast and accurate"""
+        """Extract the original survey questions that were asked to respondents"""
         
         # Get LLM instance from the main app
         llm_instance = None
@@ -193,25 +245,26 @@ class PollingScraper:
         # Limit content for faster processing
         content_sample = content[:4000] if len(content) > 4000 else content
         
-        prompt = f"""Extract EXISTING survey questions from this {poll_name} poll content.
+        prompt = f"""Extract the ORIGINAL survey questions that were asked to respondents to generate this poll data.
 
-    POLL: {poll_name}
-    SURVEY: {survey_name}
     CONTENT: {content_sample}
 
+    IMPORTANT: I want the actual questions that were asked to survey respondents, NOT questions about the poll results.
+
     RULES:
-    1. Find questions that already exist in the content
-    2. Return actual survey questions only (not instructions or explanations)
-    3. Each question must end with "?"
-    4. Maximum 10 questions
-    5. If no questions found, return "NO_QUESTIONS"
+    1. Extract only the questions that were actually asked to survey participants
+    2. Look for the questionnaire items that would generate the data shown
+    3. DO NOT mention poll names or organizations in the questions
+    4. Each question must end with "?"
+    5. Maximum 8 questions
+    6. If no original survey questions found, return "NO_QUESTIONS"
 
     FORMAT: One question per line, no numbering
 
-    QUESTIONS:"""
+    ORIGINAL SURVEY QUESTIONS:"""
         
         try:
-            response = await llm_instance.ask(prompt, temperature=0.2)
+            response = await llm_instance.ask(prompt, temperature=0.1)
             response_text = str(response).strip()
             
             if "NO_QUESTIONS" in response_text.upper():
@@ -231,18 +284,30 @@ class PollingScraper:
                 line = re.sub(r'^[-•*]\s*', '', line)
                 line = line.strip()
                 
+                # Skip if it looks like a question about poll results
+                skip_phrases = [
+                    'according to', 'poll shows', 'survey found', 'poll results',
+                    'what is the current', 'who is in first', 'who is in second',
+                    'how much support does', 'what percentage', 'poll indicates',
+                    'emerson college', 'marist', 'quinnipiac', 'gallup'
+                ]
+                
+                if any(phrase in line.lower() for phrase in skip_phrases):
+                    print(f"⚠️ Skipping results-based question: {line}")
+                    continue
+                
                 # Must be a proper question
                 if line.endswith('?') and len(line) > 15 and len(line) < 300:
                     questions.append(line)
                     
-                    if len(questions) >= 10:  # Limit to 10
+                    if len(questions) >= 8:
                         break
             
-            print(f"✅ LLM extracted {len(questions)} questions from {poll_name}")
+            print(f"✅ LLM extracted {len(questions)} original survey questions")
             return questions
             
         except Exception as e:
-            print(f"❌ LLM extraction failed for {poll_name}: {e}")
+            print(f"❌ LLM extraction failed: {e}")
             return []
 
     async def _capture_polling_site_screenshot(self, poll_id: str, poll_config: dict) -> Optional[str]:
@@ -269,7 +334,7 @@ class PollingScraper:
             screenshot_base64 = await capture_url_screenshot(base_url, self.browser_tool)
             
             if screenshot_base64:
-                # Validate the screenshot
+                # ADDED: Validate the screenshot to detect security checks, errors, etc.
                 is_valid = await self.validate_screenshot(screenshot_base64, base_url)
                 if is_valid:
                     # Cache the screenshot
@@ -277,7 +342,8 @@ class PollingScraper:
                     logger.info(f"✅ Screenshot captured and cached for {poll_config['name']}")
                     return screenshot_base64
                 else:
-                    logger.warning(f"⚠️ Invalid screenshot for {poll_config['name']}")
+                    logger.warning(f"⚠️ Invalid screenshot for {poll_config['name']} - likely security check or error page")
+                    return None
             else:
                 logger.warning(f"❌ No screenshot captured for {poll_config['name']}")
             
@@ -1605,8 +1671,8 @@ class ResearchWorkflow:
             logger.error(f"Error collecting internet search URLs: {e}")
             return []
 
-    async def _show_poll_selection(self, session: ResearchDesign) -> str:
-        active_polls = PollingSiteConfig.get_active_polls()
+    async def _show_poll_selection(self, session: ResearchDesign, research_topic) -> str:
+        active_polls = PollingSiteConfig.get_active_polls(session.research_topic)
         
         if not active_polls:
             return """❌ **No Polling Sites Available**
@@ -3484,7 +3550,7 @@ GENERATE {num_needed} SURVEY QUESTIONS:
             logger.info("🔍 DEBUG: User approved design, setting up poll selection")
             session.stage = ResearchStage.DATABASE_SEARCH
             # Set poll selection flags BEFORE returning
-            active_polls = PollingSiteConfig.get_active_polls()
+            active_polls = PollingSiteConfig.get_active_polls(session.research_topic)
             session.__dict__['available_polls'] = active_polls
             session.__dict__['show_poll_selection'] = True
             session.__dict__['awaiting_poll_selection'] = True
@@ -4354,7 +4420,7 @@ Please enter question numbers separated by spaces.
             session.__dict__['show_poll_selection'] = True
             
             # Get available polls for selection
-            active_polls = PollingSiteConfig.get_active_polls()
+            active_polls = PollingSiteConfig.get_active_polls(session.research_topic)
             session.__dict__['available_polls'] = active_polls
             
             if not active_polls:
@@ -6822,7 +6888,7 @@ class OpenManusUI:
                     # CRITICAL: Check if response indicates poll selection is needed
                     if response_content == "POLL_SELECTION_NEEDED":
                         logger.info("HTTP: Poll selection needed - returning poll selection response")
-                        available_polls = session.__dict__.get('available_polls', {})
+                        available_polls = PollingSiteConfig.get_active_polls(session.research_topic)
                         if available_polls:
                             # Check if this is a rebrowse situation
                             is_rebrowse = session.rebrowse_count > 0

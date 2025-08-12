@@ -979,9 +979,18 @@ function App() {
         });
         
         // Only show poll selection if we haven't already handled it
+        // Only show poll selection if we haven't already handled it
         if (data.available_polls && Object.keys(data.available_polls).length > 0 && !showPollSelection && !pollSelectionCompleted) {
           console.log('🔍 DEBUG: Poll selection data received, setting UI state');
           setAvailablePolls(data.available_polls);
+          
+          // AUTO-SELECT ALL ACTIVE POLLS BY DEFAULT
+          const activePollIds = Object.keys(data.available_polls).filter(
+            pollId => data.available_polls[pollId].active
+          );
+          setSelectedPollIds(new Set(activePollIds));
+          console.log('🔍 DEBUG: Auto-selected all active polls:', activePollIds);
+          
           setShowPollSelection(true);
           setPollSelectionLoading(false);
           console.log('🔍 DEBUG: showPollSelection set to true');
@@ -1267,6 +1276,14 @@ function App() {
           if (data.available_polls) {
             console.log('Received available polls data from HTTP API');
             setAvailablePolls(data.available_polls);
+            
+            // AUTO-SELECT ALL ACTIVE POLLS BY DEFAULT
+            const activePollIds = Object.keys(data.available_polls).filter(
+              pollId => data.available_polls[pollId].active
+            );
+            setSelectedPollIds(new Set(activePollIds));
+            console.log('HTTP API: Auto-selected all active polls:', activePollIds);
+            
             setShowPollSelection(true);
             setPollSelectionLoading(false);
           }
@@ -1384,6 +1401,28 @@ function App() {
             sx={{ textTransform: 'none' }}
           >
             Start Polling Search ({selectedPollIds.size} sites)
+          </Button>
+          <Button
+            variant="outlined"
+            onClick={() => {
+              // Select all active polls
+              const activePollIds = Object.keys(availablePolls).filter(
+                pollId => availablePolls[pollId].active
+              );
+              setSelectedPollIds(new Set(activePollIds));
+            }}
+            disabled={pollSelectionLoading}
+            sx={{ textTransform: 'none' }}
+          >
+            Select All
+          </Button>
+          <Button
+            variant="outlined"
+            onClick={() => setSelectedPollIds(new Set())}
+            disabled={pollSelectionLoading}
+            sx={{ textTransform: 'none' }}
+          >
+            Deselect All
           </Button>
           <Button
             variant="outlined"

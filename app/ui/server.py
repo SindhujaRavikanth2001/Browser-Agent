@@ -73,7 +73,16 @@ class PollingSiteConfig:
         'ipsos': 'https://www.ipsos.com/',
         'emerson': 'https://emersoncollegepolling.com/',
         'yougov': 'https://today.yougov.com/',
-        'kff': 'https://www.kff.org/'
+        'kff': 'https://www.kff.org/',
+        'beacon': 'https://beaconresearch.com/',
+        'researchco': 'https://researchco.ca/',
+        'dataforprogress': 'https://www.dataforprogress.org/',
+        'harris': 'https://theharrispoll.com/',
+        'monmouth': 'https://www.monmouth.edu/polling-institute/',
+        'ppp': 'https://www.publicpolicypolling.com/',
+        'ssrs': 'https://ssrs.com/',
+        'ballotpedia': 'https://ballotpedia.org/',
+        'apnorc': 'https://apnorc.org/',
     }
     
     AVAILABLE_POLLS = {
@@ -155,12 +164,68 @@ class PollingSiteConfig:
             'active': True,
             'topic_filter': 'healthcare'
         },
+        'beacon': {  
+            'name': 'Beacon Research',
+            'description': 'Beacon Research - Public opinion and market research',
+            'scraper_file': 'scrapers/beacon_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['beacon'],
+            'active': True
+        },
+        'researchco': {
+            'name': 'Research Co.',
+            'description': 'Research Co. - Canadian public opinion and market research',
+            'scraper_file': 'scrapers/researchco_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['researchco'],
+            'active': True
+        },
+        'dataforprogress': {
+            'name': 'Data for Progress',
+            'description': 'Data for Progress - Progressive polling and research organization',
+            'scraper_file': 'scrapers/dataforprogress_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['dataforprogress'],
+            'active': True
+        },
+        'harris': {
+            'name': 'Harris Poll',
+            'description': 'Harris Poll - Market research and public opinion polling',
+            'scraper_file': 'scrapers/harrispoll_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['harris'],
+            'active': True
+        },
         'monmouth': {
             'name': 'Monmouth University',
             'description': 'Monmouth University Polling Institute',
             'scraper_file': 'scrapers/monmouth_scraper.py',
             'base_url': POLLING_SITE_BASE_URLS['monmouth'],
-            'active': False
+            'active': True
+        },
+        'ppp': {
+            'name': 'Public Policy Polling',
+            'description': 'Public Policy Polling - Democratic polling firm',
+            'scraper_file': 'scrapers/ppp_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['ppp'],
+            'active': True
+        },
+        'ssrs': {
+            'name': 'SSRS',
+            'description': 'SSRS - Survey research and data collection',
+            'scraper_file': 'scrapers/ssrs_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['ssrs'],
+            'active': True
+        },
+        'ballotpedia': {
+            'name': 'Ballotpedia',
+            'description': 'Ballotpedia - Comprehensive polling data and election information',
+            'scraper_file': 'scrapers/ballotpedia_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['ballotpedia'],
+            'active': True
+        },
+        'apnorc': {
+            'name': 'AP-NORC Center',
+            'description': 'AP-NORC Center for Public Affairs Research - High-quality public opinion polling',
+            'scraper_file': 'scrapers/apnorc_scraper.py',
+            'base_url': POLLING_SITE_BASE_URLS['apnorc'],
+            'active': True
         },
         'cbs': {
             'name': 'CBS News Poll',

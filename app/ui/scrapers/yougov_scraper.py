@@ -1,6 +1,6 @@
 """
-YouGov Poll Scraper - GENERIC VERSION
-Scrapes polls from today.yougov.com tracker pages for any keyword
+YouGov Poll Scraper - SINGLE URL VERSION
+Scrapes polls from today.yougov.com for any keyword using only one search URL
 """
 
 import time
@@ -26,6 +26,10 @@ def create_fallback_data(keyword, max_results):
         }]
     }
 
+def get_single_search_url(keyword):
+    """Get the main search URL for YouGov"""
+    return f"https://today.yougov.com/search?q={urllib.parse.quote(keyword)}"
+
 def is_relevant_content(url, title, content, keyword):
     """Check if content is relevant to the search keyword"""
     text_to_check = f"{url} {title} {content}".lower()
@@ -41,14 +45,14 @@ def is_relevant_content(url, title, content, keyword):
     # Check for polling/survey indicators
     poll_indicators = [
         'poll', 'survey', 'study', 'research', 'economist/yougov', 'economist', 
-        'yougov poll', 'approval', 'disapproval', 'rating', 'opinion', 
-        'favorability', 'unfavorability', 'popularity', 'tracking'
+        'yougov poll', 'rating', 'opinion', 'favorability', 'unfavorability', 
+        'popularity', 'tracking', 'data', 'findings', 'analysis'
     ]
     has_poll_indicator = any(indicator in text_to_check for indicator in poll_indicators)
     
     # Check for article indicators
     article_indicators = [
-        '/politics/articles/', '/topics/', '/articles/', 
+        '/articles/', '/topics/', '/insights/', '/polls/',
         'economist', 'yougov.com', 'poll', 'survey'
     ]
     is_article = any(indicator in text_to_check for indicator in article_indicators)
@@ -66,46 +70,6 @@ def is_relevant_content(url, title, content, keyword):
     # Return true if has keyword match and is either a poll or an article, and not excluded
     return (has_keyword_match and (has_poll_indicator or is_article) and not is_excluded)
 
-def build_tracker_urls(keyword):
-    """Build potential tracker URLs based on keyword"""
-    keyword_lower = keyword.lower()
-    tracker_urls = []
-    
-    # Specific tracker patterns
-    if 'trump' in keyword_lower and 'approval' in keyword_lower:
-        tracker_urls.append("https://today.yougov.com/topics/politics/trackers/donald-trump-approval")
-    elif 'biden' in keyword_lower and 'approval' in keyword_lower:
-        tracker_urls.append("https://today.yougov.com/topics/politics/trackers/joe-biden-approval")
-    elif 'approval' in keyword_lower:
-        # Generic approval trackers
-        tracker_urls.extend([
-            "https://today.yougov.com/topics/politics/trackers",
-            "https://today.yougov.com/topics/politics/trackers/donald-trump-approval",
-            "https://today.yougov.com/topics/politics/trackers/joe-biden-approval"
-        ])
-    
-    # Topic-based URLs
-    if any(term in keyword_lower for term in ['politic', 'election', 'president', 'congress', 'approval']):
-        tracker_urls.append("https://today.yougov.com/topics/politics")
-    if any(term in keyword_lower for term in ['economy', 'economic', 'inflation']):
-        tracker_urls.append("https://today.yougov.com/topics/economy")
-    if any(term in keyword_lower for term in ['society', 'social', 'culture']):
-        tracker_urls.append("https://today.yougov.com/topics/society")
-    if any(term in keyword_lower for term in ['international', 'foreign', 'world']):
-        tracker_urls.append("https://today.yougov.com/topics/international")
-    if any(term in keyword_lower for term in ['consumer', 'brand', 'business']):
-        tracker_urls.append("https://today.yougov.com/topics/consumer")
-    
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_urls = []
-    for url in tracker_urls:
-        if url not in seen:
-            seen.add(url)
-            unique_urls.append(url)
-    
-    return unique_urls
-
 def attempt_real_scraping(keyword, max_results):
     """Attempt real scraping with selenium - returns None if fails"""
     try:
@@ -116,7 +80,7 @@ def attempt_real_scraping(keyword, max_results):
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
         
-        print(f"Attempting to scrape YouGov tracker pages for: {keyword}")
+        print(f"Attempting to scrape YouGov pages for: {keyword}")
         
         # Set up chrome options
         chrome_options = Options()
@@ -140,95 +104,91 @@ def attempt_real_scraping(keyword, max_results):
             return None
         
         try:
-            # Build tracker URLs based on keyword
-            tracker_urls = build_tracker_urls(keyword)
-            print(f"Will try {len(tracker_urls)} tracker/topic pages")
+            # Use single search URL
+            search_url = get_single_search_url(keyword)
+            print(f"Using single search URL: {search_url}")
             
             poll_links = []
             
-            # Try each tracker/topic page
-            for tracker_url in tracker_urls:
-                if len(poll_links) >= max_results:
-                    break
+            try:
+                print(f"Accessing search page: {search_url}")
+                driver.get(search_url)
+                time.sleep(8)
+                
+                # Check if page loaded successfully
+                page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+                if len(page_text) > 1000:
+                    print(f"✅ Page loaded successfully ({len(page_text)} chars)")
                     
-                try:
-                    print(f"Trying tracker page: {tracker_url}")
-                    driver.get(tracker_url)
-                    time.sleep(8)
-                    
-                    # Check if page loaded successfully
-                    page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-                    if len(page_text) > 1000:
-                        print(f"✅ Tracker page loaded successfully ({len(page_text)} chars)")
+                    # Look for links to polls/articles
+                    try:
+                        # Enhanced selectors for finding poll articles
+                        link_selectors = [
+                            # YouGov-specific selectors
+                            "a[href*='/articles/']", 
+                            "a[href*='/topics/']",
+                            "a[href*='/insights/']",
+                            "a[href*='/polls/']",
+                            ".article a", 
+                            ".poll a", 
+                            ".survey a",
+                            ".content-item a",
+                            ".poll-item a",
+                            ".survey-item a",
+                            "yg-results-item a",  # YouGov Angular component
+                            ".search-result a",
+                            ".search-results a",
+                            # Generic content selectors
+                            "h1 a",
+                            "h2 a", 
+                            "h3 a", 
+                            ".title a", 
+                            ".headline a",
+                            ".entry-title a",
+                            ".post-title a"
+                        ]
                         
-                        # Look for links to recent polls from the tracker
-                        try:
-                            # Enhanced selectors for finding poll articles
-                            link_selectors = [
-                                "a[href*='/politics/articles/']",
-                                "a[href*='/articles/']", 
-                                "a[href*='/topics/']",
-                                ".article a", 
-                                ".poll a", 
-                                ".survey a",
-                                ".content-item a",
-                                ".poll-item a",
-                                ".survey-item a",
-                                "yg-results-item a",  # YouGov Angular component
-                                "h2 a", 
-                                "h3 a", 
-                                ".title a", 
-                                ".headline a"
-                            ]
-                            
-                            found_links = []
-                            for selector in link_selectors:
-                                try:
-                                    links = driver.find_elements(By.CSS_SELECTOR, selector)
-                                    for link in links:
-                                        try:
-                                            href = link.get_attribute('href')
-                                            title = link.text.strip()
-                                            
-                                            if href and title and is_relevant_content(href, title, "", keyword):
-                                                # Avoid duplicates
-                                                if not any(existing['href'] == href for existing in found_links):
-                                                    found_links.append({'href': href, 'title': title})
-                                                    print(f"Found relevant link: {title[:60]}")
-                                                    
-                                                    if len(found_links) >= max_results * 2:  # Get extras to filter
-                                                        break
-                                        except:
-                                            continue
-                                    
-                                    if len(found_links) >= max_results * 2:
-                                        break
-                                except:
-                                    continue
-                            
-                            # Add unique links to main poll_links list
-                            for link in found_links:
-                                if not any(existing['href'] == link['href'] for existing in poll_links):
-                                    poll_links.append(link)
-                                    
-                            if found_links:
-                                print(f"Found {len(found_links)} relevant articles from this tracker page")
-                                # Don't break - continue to other pages to get more results
+                        found_links = []
+                        for selector in link_selectors:
+                            try:
+                                links = driver.find_elements(By.CSS_SELECTOR, selector)
+                                for link in links:
+                                    try:
+                                        href = link.get_attribute('href')
+                                        title = link.text.strip()
+                                        
+                                        if href and title and 'yougov.com' in href and is_relevant_content(href, title, "", keyword):
+                                            # Avoid duplicates
+                                            if not any(existing['href'] == href for existing in found_links):
+                                                found_links.append({'href': href, 'title': title})
+                                                print(f"Found relevant link: {title[:60]}")
+                                                
+                                                if len(found_links) >= max_results:
+                                                    break
+                                    except:
+                                        continue
                                 
-                        except Exception as e:
-                            print(f"Error finding links on tracker page: {e}")
-                    else:
-                        print(f"❌ Tracker page load failed or no content: {tracker_url}")
+                                if len(found_links) >= max_results:
+                                    break
+                            except:
+                                continue
                         
-                except Exception as e:
-                    print(f"❌ Tracker page error: {tracker_url} - {e}")
-                    continue
-            
-            # Filter and limit results
-            poll_links = poll_links[:max_results]
+                        # Add found links to poll_links
+                        poll_links = found_links[:max_results]
+                        
+                        if found_links:
+                            print(f"Found {len(found_links)} relevant articles")
+                            
+                    except Exception as e:
+                        print(f"Error finding links: {e}")
+                else:
+                    print(f"❌ Page load failed or no content")
+                    
+            except Exception as e:
+                print(f"❌ Page error: {e}")
             
             if not poll_links:
-                print("❌ No relevant poll links found on any tracker pages")
+                print("❌ No relevant poll links found")
                 return None
             
             print(f"Processing {len(poll_links)} poll articles...")
@@ -256,6 +216,7 @@ def attempt_real_scraping(keyword, max_results):
                         ".content-body",
                         ".article-body",
                         ".poll-content",
+                        ".entry-content",
                         # Generic content selectors
                         "main",
                         "article",
@@ -346,7 +307,7 @@ def attempt_real_scraping(keyword, max_results):
 
 def main():
     """Main function with guaranteed JSON output"""
-    parser = argparse.ArgumentParser(description='YouGov poll scraper')
+    parser = argparse.ArgumentParser(description='YouGov poll scraper - Single URL version')
     parser.add_argument('--keyword', required=True, help='Search keyword')
     parser.add_argument('--max-results', type=int, default=5, help='Maximum results to scrape')
     parser.add_argument('--output', required=True, help='Output JSON file path')
@@ -354,7 +315,7 @@ def main():
     
     args = parser.parse_args()
     
-    print(f"YouGov poll scraper starting...")
+    print(f"YouGov poll scraper starting (Single URL version)...")
     print(f"Keyword: {args.keyword}")
     print(f"Output: {args.output}")
     
